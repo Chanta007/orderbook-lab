@@ -1,0 +1,9 @@
+.env
+.env.local
+.env.*.local
+.DS_Store
+node_modules/
+__pycache__/
+.mindcoachlabs-migration-backup/
+.claude/session-state.json
+.claude/worktrees/
