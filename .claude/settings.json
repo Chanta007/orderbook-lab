@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Users/chantelmager/.grok/installed-plugins/current/scripts/pre-tool-guard.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Users/chantelmager/.grok/installed-plugins/current/scripts/stop.py"
+          }
+        ]
+      }
+    ]
+  }
+}
