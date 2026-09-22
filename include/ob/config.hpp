@@ -7,6 +7,9 @@
 
 namespace ob {
 
+// Tiny JSON reader for the flat config files. It is not a general parser.
+// Prod will not load unless ORDERBOOK_ALLOW_PROD=1. Dev will not load if
+// allow_orders is true. Those two checks are the whole safety policy.
 struct Config {
   std::string env{"dev"};
   std::string bus_path{"var/dev/bus"};

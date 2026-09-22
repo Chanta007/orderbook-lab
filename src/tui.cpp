@@ -1,3 +1,7 @@
+// Draws the book ten times a second. The cursor starts at the ring's write
+// sequence, so this window shows messages that arrive after it starts, not
+// the history already in the ring. Red is the bid price. Green is the ask.
+// feed=stalled means nothing new for about two seconds.
 #include "ob/book.hpp"
 #include "ob/config.hpp"
 #include "ob/ring.hpp"

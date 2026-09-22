@@ -1,3 +1,6 @@
+// Listens for 72-byte messages and publishes each valid one to the ring and
+// the WAL. Opening the ring with create=true resets the ring. The WAL file
+// is opened append-only, so old records stay. One thread per TCP client.
 #include "ob/config.hpp"
 #include "ob/ring.hpp"
 #include "ob/trace.hpp"

@@ -1,3 +1,6 @@
+// Same ring and book as the TUI, no screen. Used by make e2e. Cursor starts
+// at 0 so it replays the ring. Exit 0 only when both sides and the WAL are
+// non-empty. It does not check exact prices.
 #include "ob/book.hpp"
 #include "ob/config.hpp"
 #include "ob/ring.hpp"

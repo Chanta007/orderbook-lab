@@ -11,6 +11,10 @@
 
 namespace ob {
 
+// Shared file, not a private buffer. MAP_SHARED so feedd, the TUI, and
+// headless see the same slots. Capacity is a power of two so the slot
+// index is seq & (cap - 1). create=true truncates and zeros wseq, which
+// drops whatever was in the ring. The WAL is the copy that survives that.
 inline constexpr uint32_t kCap = 4096; // power of two
 
 struct RingHeader {
@@ -58,6 +62,7 @@ class Ring {
     uint64_t seq = file_->hdr.wseq;
     m.seq = seq;
     file_->slots[seq & (kCap - 1)] = m;
+    // Publish the slot before advancing wseq, or a reader can observe a stale slot.
     __sync_synchronize();
     file_->hdr.wseq = seq + 1;
     return seq;
@@ -67,7 +72,8 @@ class Ring {
   bool consume(uint64_t& cursor, Msg& out) {
     uint64_t w = file_->hdr.wseq;
     if (cursor >= w) return false;
-    if (w - cursor > kCap) cursor = w - kCap; // overrun
+    // The writer has lapped this cursor. Skip to the oldest slot still present.
+    if (w - cursor > kCap) cursor = w - kCap;
     out = file_->slots[cursor & (kCap - 1)];
     if (out.seq != cursor) {
       cursor = w;

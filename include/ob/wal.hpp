@@ -8,6 +8,9 @@
 
 namespace ob {
 
+// Append-only copy of every published Msg. The ring is overwritten after
+// 4096 records. Replay reads this file. fsync every 32 appends so a crash
+// loses at most that many records. macOS has no fdatasync.
 class Wal {
  public:
   explicit Wal(const std::string& path, bool create) {

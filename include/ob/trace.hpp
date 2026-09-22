@@ -28,7 +28,9 @@ inline void fill_ids(Msg& m) {
   std::memcpy(m.span_id, &n, 8);
 }
 
-// Off-hot-path logger: enqueue POD, format on a side thread.
+// Off the publish thread. push() drops when the queue is over 10000 so a
+// slow disk cannot stall feedd. Ids are 16 and 8 bytes, the W3C sizes,
+// filled locally. Nothing here talks to an OpenTelemetry collector.
 class AsyncLog {
  public:
   explicit AsyncLog(std::string path) : path_(std::move(path)), run_(true) {
