@@ -17,6 +17,9 @@ inline uint64_t now_ns() {
   return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+// Local ids only. The first 8 bytes of the trace id are a clock. The next
+// 8 are a counter. The span id repeats the counter. Say "correlation id",
+// not "we export traces". Nothing leaves the process.
 inline void fill_ids(Msg& m) {
   static std::atomic<uint64_t> ctr{1};
   uint64_t n = ctr.fetch_add(1, std::memory_order_relaxed);

@@ -19,6 +19,8 @@
 static std::atomic<bool> g_run{true};
 static void on_sig(int) { g_run = false; }
 
+// TCP does not preserve our 72-byte writes as 72-byte reads. Loop until
+// the whole record is here. r <= 0 means the adapter hung up.
 static bool recv_all(int fd, char* p, size_t n) {
   size_t got = 0;
   while (got < n) {
@@ -55,7 +57,10 @@ int main(int argc, char** argv) {
   ::listen(srv, 4);
   std::cerr << "feedd listen " << cfg.listen_host << ":" << cfg.listen_port << " env=" << cfg.env << "\n";
 
-  // accept loop in a thread so we can stop
+  // select with a short timeout so this loop notices g_run == false.
+  // Each accepted socket gets its own thread. That thread ends when the
+  // client closes. It is detached. Process exit ends any thread still blocked
+  // in recv. The ring and the WAL belong to main and outlive the clients.
   std::thread acc([&] {
     while (g_run) {
       fd_set rfds;
@@ -70,7 +75,7 @@ int main(int argc, char** argv) {
         while (g_run) {
           ob::Msg m{};
           if (!recv_all(c, reinterpret_cast<char*>(&m), sizeof(m))) break;
-          if (!ob::valid(m)) continue;
+          if (!ob::valid(m)) continue; // bad magic or wrong size: skip, do not kill the client
           if (m.symbol[0] == 0) {
             std::strncpy(m.symbol, cfg.symbol.c_str(), 7);
           }

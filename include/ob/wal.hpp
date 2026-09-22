@@ -25,6 +25,8 @@ class Wal {
       ::close(fd_);
     }
   }
+  // One record per write. A short write is a hard error, not a retry.
+  // Sync every 32 so a crash loses a bounded tail, not the whole file.
   void append(const Msg& m) {
     const char* p = reinterpret_cast<const char*>(&m);
     ssize_t n = ::write(fd_, p, sizeof(Msg));
@@ -48,6 +50,8 @@ class Wal {
     since_sync_ = 0;
   }
 
+  // Read every valid record. A torn tail (short read) stops the loop.
+  // Missing file is an empty vector, not an exception. headless uses that.
   static std::vector<Msg> replay(const std::string& path) {
     std::vector<Msg> out;
     int fd = ::open(path.c_str(), O_RDONLY);

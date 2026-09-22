@@ -17,6 +17,7 @@ int main(int argc, char** argv) {
   }
   auto cfg = ob::load_config(argv[1]);
   int wait_ms = std::atoi(argv[2]);
+  // create=false: attach to the ring feedd already made. Do not zero it.
   ob::Ring ring(cfg.bus_path, false);
   ob::Book book;
   uint64_t cursor = 0;

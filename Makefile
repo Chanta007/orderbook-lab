@@ -1,5 +1,11 @@
-# CI and the README use this file, not CMake. test is offline. e2e replays
-# e2e/fixture.jsonl through feedd and checks headless counts.
+# WALKTHROUGH
+# CI and the README use this file, not CMake.
+# `make test` builds test_core and runs it, then the Python frame tests.
+# Neither opens a socket.
+# `make e2e` builds every binary, starts feedd and the adapter on the
+# fixture file, waits one second, and runs headless. headless exits 0
+# only when both sides of the book and the WAL are non-empty.
+# `make start` is the live window. It needs a network and a terminal.
 CXX ?= c++
 CXXFLAGS ?= -std=c++17 -O2 -pthread -Iinclude -Wall -Wextra
 LDFLAGS ?= -pthread

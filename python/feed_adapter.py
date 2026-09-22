@@ -37,6 +37,11 @@ DEPTH_RESET = 4
 
 
 def pack_msg(side: int, px: float, qty: float, symbol: str, msg_type: int = DEPTH) -> bytes:
+    """Float prices become e8 integers here. seq and trace id stay zero.
+
+    feedd fills the trace id and the timestamp. The ring fills seq when it
+    publishes. Do not invent those fields in Python.
+    """
     sym = symbol.encode("ascii")[:8].ljust(8, b"\0")
     return struct.pack(
         MSG_FMT,
@@ -88,7 +93,15 @@ def close_code_text(payload: bytes) -> str:
 
 
 def client_frame(opcode: int, payload: bytes) -> bytes:
-    """RFC 6455 client frame. The mask bit is always set."""
+    """One client-to-server websocket frame.
+
+    The high bit of the first byte is FIN. The low 4 bits are the opcode.
+    Opcode 0xA is pong. Opcode 0x8 is close. The high bit of the second
+    byte is the mask bit. RFC 6455 says a client must set it on every
+    frame, and the server must close the connection if it is missing.
+    The next 4 bytes are the mask key. Each payload byte is XORed with
+    that key. A pong must use the ping's payload, not an empty body.
+    """
     mask = os.urandom(4)
     ln = len(payload)
     head = bytearray([0x80 | (opcode & 0x0F)])
@@ -114,7 +127,13 @@ def _side_levels(obj: dict, long_key: str, short_key: str) -> list | None:
 
 
 def parse_depth5(obj: dict, symbol: str) -> list[bytes]:
-    """One Binance top-of-book picture replaces that side. It is not a diff."""
+    """Turn one JSON picture into the bytes feedd expects.
+
+    Binance sends bids and asks, or the short keys b and a. If a side is
+    present, even as an empty list, the first message is DepthReset so the
+    book drops prices from the previous picture. A zero size inside the
+    picture is skipped. The reset already cleared the side.
+    """
     out: list[bytes] = []
     for side, levels in (
         (0, _side_levels(obj, "bids", "b")),
@@ -131,7 +150,14 @@ def parse_depth5(obj: dict, symbol: str) -> list[bytes]:
 
 
 def ws_frames(url: str):
-    """Minimal RFC6455 client. Text frames only."""
+    """Connect, yield text payloads, and always close the socket.
+
+    Server frames are not masked. Opcode 9 is a ping: answer with a masked
+    pong that copies the payload, then keep reading. Opcode 8 is close:
+    answer, log the code, and return so run_live can reconnect. Bytes that
+    arrived in the same TCP read as the HTTP 101 headers are kept. Dropping
+    them loses the first book update.
+    """
     u = urlparse(url)
     host = u.hostname or "data-stream.binance.vision"
     port = u.port or (443 if u.scheme == "wss" else 80)
@@ -219,6 +245,13 @@ def _ws_after_connect(sock: socket.socket, host: str, path: str):
 
 
 def run_live(cfg: dict, sock: socket.socket | None = None) -> None:
+    """Stay up. The websocket and the TCP connection to feedd fail separately.
+
+    A dead feedd is redialed. A closed websocket sleeps and tries again.
+    The sleep doubles up to 30 seconds so a down exchange is not a tight loop.
+    This function does not return on a normal close. That is what stopped
+    the old adapter from exiting and leaving the TUI on a frozen book.
+    """
     url = cfg.get("ws_url") or "wss://data-stream.binance.vision:443/ws/btcusdt@depth5@100ms"
     symbol = cfg.get("symbol", "BTCUSDT")
     delay = 1
@@ -264,6 +297,11 @@ def run_live(cfg: dict, sock: socket.socket | None = None) -> None:
 
 
 def run_fixture(path: str, sock: socket.socket, symbol: str) -> None:
+    """Same parse_depth5 path as the live feed, from a file. make e2e uses this.
+
+    A short sleep between lines gives headless time to be scheduled. The
+    function returns when the file ends. It does not reconnect.
+    """
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()

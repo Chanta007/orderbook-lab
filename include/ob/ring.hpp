@@ -56,6 +56,9 @@ class Ring {
   Ring(const Ring&) = delete;
   Ring& operator=(const Ring&) = delete;
 
+  // Copy the message into the slot, then publish the new sequence.
+  // A reader that sees the new wseq must already see the bytes in the slot.
+  // The barrier is that ordering. There is one writer. Readers do not lock.
   uint64_t publish(Msg m) {
     m.magic = kMagic;
     m.nbytes = sizeof(Msg);
@@ -68,7 +71,10 @@ class Ring {
     return seq;
   }
 
-  // returns false if no new message
+  // cursor is owned by the reader. Pass the same integer every call.
+  // false means "nothing new" or "this slot was overwritten, resync".
+  // The seq check catches a torn slot: the index matches but the record
+  // is from an older lap of the ring.
   bool consume(uint64_t& cursor, Msg& out) {
     uint64_t w = file_->hdr.wseq;
     if (cursor >= w) return false;

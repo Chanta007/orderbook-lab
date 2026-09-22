@@ -1,9 +1,27 @@
 #pragma once
-// One record on the TCP socket, the ring, and the WAL. Layout is fixed at
-// 72 bytes so Python and C++ can share it without a schema library.
-// Prices and sizes are integers scaled by 1e8 (px_e8, qty_e8).
-// Depth updates one price. DepthReset clears a whole side first, because a
-// Binance depth5 message is a fresh top-of-book picture, not a diff.
+// WALKTHROUGH, msg.hpp
+//
+// This is the only data type that crosses a process boundary. Python packs
+// these bytes. feedd writes the same bytes into the ring and the WAL. The
+// TUI reads them back. If you change a field, change python/feed_adapter.py
+// MSG_FMT in the same commit. static_assert locks the size at 72.
+//
+// How to explain one record:
+//   magic    ASCII "OBLB". A reader rejects anything else.
+//   nbytes   always 72. Guards against a short read.
+//   type     Depth updates one price. DepthReset clears one whole side
+//            before the new prices of a Binance top-of-book picture.
+//            Heartbeat and Cmd are reserved and ignored by the book.
+//   side     0 bid, 1 ask. Both exists so a later command can name a side
+//            without overloading bid/ask.
+//   seq      filled by the ring when the message is published, not by Python.
+//   ts_ns    filled by feedd. Not exchange time.
+//   trace_id 16 bytes, span_id 8 bytes. Same widths as W3C trace context.
+//            Filled locally. No collector.
+//   px_e8    price times 100,000,000. 65000.10 dollars is 6500010000000.
+//            Integers so two prices compare without floating point.
+//   qty_e8   size, same scale. Zero on a Depth message deletes that price.
+//   symbol   8 bytes, not a C string you can trust past 7 characters plus NUL.
 #include <cstdint>
 #include <cstring>
 
