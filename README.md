@@ -71,17 +71,54 @@ There is no API key. That host cannot place an order. `make e2e` does not open i
 
 ## How the pieces connect
 
+One picture of the whole path. GitHub draws this diagram. Read it from the left. Nothing in the diagram can place an order.
+
+```mermaid
+flowchart LR
+  subgraph in ["What comes in"]
+    BN["Binance public websocket<br/>btcusdt@depth5@100ms<br/>market data only, no API key"]
+    FX["e2e/fixture.jsonl<br/>same pictures, no network"]
+  end
+
+  CFG["config/dev.json or config/prod.json<br/>ports, paths, symbol, allow_orders"]
+  CTL["python/obctl.py<br/>setup, start, stop"]
+
+  ADP["python/feed_adapter.py<br/>stdlib websocket client<br/>mask every client frame<br/>pong copies the ping<br/>reconnect on drop<br/>each picture starts with DepthReset"]
+
+  TCP["TCP 127.0.0.1<br/>dev :9001 or prod :9101<br/>packed 72-byte Msg"]
+
+  subgraph feedd ["src/feedd.cpp"]
+    ACC["accept loop"]
+    PUB["publish on the hot path"]
+    WAL["WAL append<br/>replay later"]
+    LOG["async log thread<br/>trace id and span id"]
+  end
+
+  RING["mmap ring file<br/>var/dev/bus or var/prod/bus<br/>each reader has its own cursor"]
+
+  subgraph out ["Who reads the ring"]
+    TUI["src/tui.cpp<br/>the window above<br/>red bids, green asks<br/>quit and levels N"]
+    HEAD["src/headless.cpp<br/>make e2e counts"]
+  end
+
+  UNIT["tests/test_core.cpp<br/>and python/test_ws_frames.py<br/>no socket, no exchange"]
+
+  BN --> ADP
+  FX --> ADP
+  CFG --> CTL
+  CTL --> ADP
+  CTL --> ACC
+  ADP --> TCP --> ACC --> PUB
+  PUB --> RING
+  PUB --> WAL
+  PUB --> LOG
+  RING --> TUI
+  RING --> HEAD
+  UNIT -.-> RING
+  UNIT -.-> ADP
 ```
-Binance public websocket, or e2e/fixture.jsonl
-        |
-  python/feed_adapter.py     stdlib only, no pip
-        |  TCP, 72-byte Msg
-  src/feedd.cpp              accept loop, mmap ring, WAL, async log
-        |
-  src/tui.cpp                the window in the picture
-  src/headless.cpp           counts for make e2e
-  tests/test_core.cpp        ring, book, WAL, snapshot replace
-```
+
+Follow one BTCUSDT update. Binance sends the current top 5 bids and top 5 asks. The adapter turns that picture into `Msg` values and writes them to `feedd`. `feedd` appends the same bytes to the write-ahead log and publishes them on the ring. The terminal and `headless` each walk the ring from their own cursor and apply the messages to a book. A `DepthReset` clears one side before the new prices, so an old bid cannot stay above the new asks. If the websocket closes, the adapter reconnects. The terminal keeps the last book and the top line changes to `feed=stalled` until the next picture arrives.
 
 | Path | Role |
 |------|------|
