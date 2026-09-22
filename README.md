@@ -10,6 +10,20 @@ It is a learning project for systems and low-level programming. It is not a prod
 
 The picture is the dev window on a Mac, fed by Binance's public BTCUSDT top-of-book stream. Bid prices are red. Ask prices are green. The top line shows the environment, the symbol, the sequence, and whether the feed is `live` or `stalled`. This still was taken while an older build was still keeping prices from earlier pictures, so some bids sit above the asks. The current code replaces each picture, so those old prices do not remain. The layout, the colors, and the on-screen commands are what the window shows.
 
+## Quick overview
+
+Read the code in this order. Each line is the thing to say about that file.
+
+1. [`include/ob/msg.hpp`](include/ob/msg.hpp) is the 72-byte record shared by Python and C++. Prices are integers scaled by 100 million. `Depth` updates one price. `DepthReset` clears a whole side.
+2. [`include/ob/ring.hpp`](include/ob/ring.hpp) is the shared-memory queue. One writer. Each reader keeps its own cursor. The slot is written before the sequence advances.
+3. [`include/ob/wal.hpp`](include/ob/wal.hpp) is the copy that survives after the ring wraps. It syncs every 32 records.
+4. [`include/ob/book.hpp`](include/ob/book.hpp) is the in-memory book. Highest bid first, lowest ask first.
+5. [`python/feed_adapter.py`](python/feed_adapter.py) turns a Binance top-of-book picture into those records, masks every client websocket frame, and reconnects when the socket drops.
+6. [`src/feedd.cpp`](src/feedd.cpp) reads 72 bytes at a time, because TCP does not keep your writes whole, and publishes each valid record.
+7. [`src/tui.cpp`](src/tui.cpp) draws ten times a second. It starts at the live end of the ring. `feed=stalled` means nothing new for about two seconds.
+8. [`python/obctl.py`](python/obctl.py) is setup, start, and stop. The terminal replaces that process, so `stop` cannot kill the window. Type `quit` there.
+9. [`tests/test_core.cpp`](tests/test_core.cpp) and [`python/test_ws_frames.py`](python/test_ws_frames.py) are the offline checks. The [`Makefile`](Makefile) says which target runs which.
+
 ## What this is for
 
 I built this to show the kind of work I want to do in an internship: take a real data feed, put a clear boundary between processes, and make the failure modes visible.
