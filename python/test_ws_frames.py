@@ -103,6 +103,15 @@ class AfterConnectTest(unittest.TestCase):
         self.assertEqual(opcode, 0x8)
         self.assertEqual(data[:2], payload[:2])
 
+    def test_handshake_keeps_bytes_after_101(self) -> None:
+        payload = b"coalesced-ping"
+        sock = StubSocket([HTTP_101 + server_frame(0x9, payload)])
+        list(feed_adapter._ws_after_connect(sock, "host", "/ws"))
+        self.assertGreaterEqual(len(sock.sent), 2)
+        opcode, data = decode_client_frame(sock.sent[1])
+        self.assertEqual(opcode, 0xA)
+        self.assertEqual(data, payload)
+
 
 class StopTest(BaseException):
     """Breaks run_live's retry loop without being swallowed as ws error."""
@@ -132,7 +141,36 @@ class RedialFeeddTest(unittest.TestCase):
         cfg = {"listen_host": "127.0.0.1", "listen_port": 9, "symbol": "BTCUSDT", "ws_url": "ws://x"}
         with mock.patch.object(feed_adapter, "connect_feedd", fake_connect), mock.patch.object(
             feed_adapter, "ws_frames", fake_ws
-        ), mock.patch.object(feed_adapter.time, "sleep"):
+        ), mock.patch.object(feed_adapter.time, "sleep") as sleep:
+            sleep.side_effect = [None] * 8 + [RuntimeError("run_live did not redial")]
+            with self.assertRaises(StopTest):
+                feed_adapter.run_live(cfg)
+        self.assertEqual(len(dials), 1)
+
+    def test_ws_oserror_keeps_feedd_sink(self) -> None:
+        dials: list[object] = []
+
+        class KeepSink:
+            def sendall(self, _data: bytes) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        def fake_connect(_cfg: dict) -> KeepSink:
+            sock = KeepSink()
+            dials.append(sock)
+            return sock
+
+        def fake_ws(_url: str):
+            raise TimeoutError("binance stall")
+            yield  # generator so ws_frames is iterated
+
+        cfg = {"listen_host": "127.0.0.1", "listen_port": 9, "symbol": "BTCUSDT", "ws_url": "ws://x"}
+        with mock.patch.object(feed_adapter, "connect_feedd", fake_connect), mock.patch.object(
+            feed_adapter, "ws_frames", fake_ws
+        ), mock.patch.object(feed_adapter.time, "sleep") as sleep:
+            sleep.side_effect = [None, StopTest("bounded")]
             with self.assertRaises(StopTest):
                 feed_adapter.run_live(cfg)
         self.assertEqual(len(dials), 1)

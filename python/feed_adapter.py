@@ -151,12 +151,8 @@ def _ws_after_connect(sock: socket.socket, host: str, path: str):
     if b"101" not in hdr.split(b"\r\n", 1)[0]:
         raise RuntimeError("ws handshake failed: " + hdr[:200].decode("latin1", "replace"))
     sock.settimeout(30)
-    buf = b""
+    buf = hdr.split(b"\r\n\r\n", 1)[1]
     while True:
-        data = sock.recv(65536)
-        if not data:
-            break
-        buf += data
         while True:
             if len(buf) < 2:
                 break
@@ -193,6 +189,10 @@ def _ws_after_connect(sock: socket.socket, host: str, path: str):
                 continue
             if opcode in (0x1, 0x0):
                 yield payload.decode("utf-8", "replace")
+        data = sock.recv(65536)
+        if not data:
+            break
+        buf += data
 
 
 def run_live(cfg: dict, sock: socket.socket | None = None) -> None:
@@ -203,21 +203,35 @@ def run_live(cfg: dict, sock: socket.socket | None = None) -> None:
         while True:
             try:
                 if sock is None:
-                    sock = connect_feedd(cfg)
-                for raw in ws_frames(url):
-                    delay = 1
                     try:
-                        obj = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    data = obj.get("data", obj)
-                    for msg in parse_depth5(data, symbol):
-                        send_all(sock, msg)
-                log("ws closed; reconnecting")
-            except OSError as exc:
-                log(f"feedd error: {exc}; redialing")
-                close_quietly(sock)
-                sock = None
+                        sock = connect_feedd(cfg)
+                    except OSError as exc:
+                        log(f"feedd error: {exc}; redialing")
+                        close_quietly(sock)
+                        sock = None
+                if sock is not None:
+                    sink = sock
+                    sink_dead = False
+                    for raw in ws_frames(url):
+                        delay = 1
+                        try:
+                            obj = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        data = obj.get("data", obj)
+                        for msg in parse_depth5(data, symbol):
+                            try:
+                                send_all(sink, msg)
+                            except OSError as exc:
+                                log(f"feedd error: {exc}; redialing")
+                                close_quietly(sink)
+                                sock = None
+                                sink_dead = True
+                                break
+                        if sink_dead:
+                            break
+                    else:
+                        log("ws closed; reconnecting")
             except Exception as exc:
                 log(f"ws error: {exc}; reconnecting")
             time.sleep(delay)
