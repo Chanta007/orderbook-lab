@@ -17,8 +17,12 @@ class Book {
  public:
   void apply(const Msg& m) {
     std::lock_guard<std::mutex> g(mu_);
-    if (m.type != Type::Depth) return;
     auto& side = (m.side == Side::Bid) ? bids_ : asks_;
+    if (m.type == Type::DepthReset) {
+      side.clear();
+      return;
+    }
+    if (m.type != Type::Depth) return;
     if (m.qty_e8 == 0) side.erase(m.px_e8);
     else side[m.px_e8] = m.qty_e8;
     last_seq_ = m.seq;

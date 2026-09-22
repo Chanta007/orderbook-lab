@@ -13,7 +13,7 @@ Each line of `docs/telemetry/runs.jsonl` is one JSON object. The file is append-
 | `run_id` | `string` (UUID4) | No | Stable run identity. Generated fresh per write via `uuid.uuid4()`. Used as the natural join key for deduplication and cross-record analysis. Beats implicit composite key (timestamp + task_slug) which is unstable across re-runs and clock skew. |
 | `ts` | `string` (ISO 8601 UTC) | No | Write timestamp. `datetime.now(timezone.utc).isoformat()`. |
 | `model_id` | `string` | No | The actual session model, normalized. Provider prefixes stripped by `router.py` before write. Examples: `claude-opus-4-7` (unchanged), `kimi-k2p6` (from `accounts/fireworks/models/kimi-k2p6`), `gemini-2.5-pro` (from `models/gemini-2.5-pro`). Analyzers must treat this as a flat identifier, not assume Anthropic-only patterns. |
-| `model_id_source` | `string` | No | One of: `"prompt_hook"` (captured from UserPromptSubmit payload), `"self_report"` (LLM self-identified, fallback), `"unknown"` (field absent or empty). |
+| `model_id_source` | `string` | No | One of: `"prompt_hook"` (captured from UserPromptSubmit payload), `"settings"` (session / CLI settings), `"transcript"` (session transcript), `"self_report"` (LLM self-identified, fallback), `"unknown"` (field absent or empty). The harness writer (`telemetry.py` `MODEL_ID_SOURCES`) is the live allowlist; `"settings"` and `"transcript"` were added there without a `v: 2` bump because they are extra enum values, not new required fields. |
 | `task_slug` | `string` | No | From `.claude/session-state.json` `task_slug`. Empty string if absent. |
 | `skill` | `string` | No | Skill that triggered the write. `"verify"`, `"build"`, `"do"`, etc. |
 | `plan_archive` | `string \| null` | Yes | Path to archived plan, e.g. `docs/plans/archive/2026-04-25-foo.md`. `null` when no plan archive exists (e.g. `do` skill or aborted plan). |
@@ -24,14 +24,14 @@ Each line of `docs/telemetry/runs.jsonl` is one JSON object. The file is append-
 | `commit_hash` | `string` | No | `git rev-parse HEAD` at write time. Links record to specific repo state for replaying analyses against historical archive contents. `"unknown"` if unresolvable. |
 | `constraints_referenced` | `array<string>` | No | Deduplicated `§X.Y` citations found in the active plan markdown via regex `§[A-Za-z0-9.]+`. Empty array if no plan or none found. This is the denominator for "earns its keep" analysis. |
 | `constraints_violated` | `array<string>` | No | Deduplicated `§X.Y:check-name` strings for checks that failed during verify. Empty array if all passed or not a verify run. |
-| `verify_steps_run` | `array<object>` | Yes | Per-step results from verify. Each object: `{id: string, status: "pass"|"fail"|"skip", duration_ms: integer}`. `null` when not a verify run or data unavailable. |
+| `verify_steps_run` | `array<object>` | Yes | Per-step results from verify. Each object has `id` (string) and `status` (string). Test/build steps use `status: "pass"|"fail"|"skip"` and include `duration_ms` (integer). Harness pre-flight / claims steps may use `clean`, `behind`, `rebased`, `offline`, or `skipped`, and may carry extra diagnostic keys (`behind_count`, `scanned`) without `duration_ms`. `null` when not a verify run or data unavailable. Analyzers computing `pass_rate` MUST treat `clean` as pass-equivalent, count only `fail` as failure, and ignore unknown keys so a pre-fetch row is not rejected. |
 | `fixes_count` | `object` | Yes | `{minor: integer, major: integer}` from build phase. `null` when not a build/verify run or unrecorded. |
 | `duration_ms` | `integer` | No | Wall-clock milliseconds for the phase that wrote this record (verify, build, etc.). `-1` if unmeasurable. |
 | `tokens` | `object` | Yes | `{input: integer|null, output: integer|null}`. `null` when unavailable (CLI telemetry has no token access). |
 
 ## Field inclusion rationale for deep-mode queries
 
-- **`model_id` + `model_id_source`**: Segment all analyses by actual session model. Source distinguishes reliable (`prompt_hook`) from degraded (`unknown`) data.
+- **`model_id` + `model_id_source`**: Segment all analyses by actual session model. Source distinguishes reliable (`prompt_hook`) from settings-captured (`settings`) from degraded (`unknown`) data.
 - **`constraints_referenced` vs `constraints_violated`**: Compute "referenced but never violated" per model → prune candidates.
 - **`verify_steps_run` + `duration_ms`**: Identify slow steps that never fail (`pass_rate == 1.0`, high mean duration).
 - **`plan_type` / `plan_size` / `plan_risk`**: Correlate violation patterns with plan characteristics.

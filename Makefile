@@ -24,6 +24,7 @@ $(BUILD)/test_core: tests/test_core.cpp include/ob/*.hpp | $(BUILD)
 
 test: $(BUILD)/test_core
 	$(BUILD)/test_core
+	python3 -m unittest discover -s python -p 'test_*.py'
 
 e2e: all
 	python3 python/obctl.py setup --config config/dev.json
