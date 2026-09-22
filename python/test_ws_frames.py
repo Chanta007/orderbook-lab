@@ -1,9 +1,47 @@
-"""Stdlib checks for the masked client pong. No network."""
+"""Stdlib checks for masked client frames and the live retry path. No network."""
 from __future__ import annotations
 
+import json
 import unittest
+from unittest import mock
 
 import feed_adapter
+
+
+HTTP_101 = b"HTTP/1.1 101 Switching Protocols\r\n\r\n"
+
+
+def server_frame(opcode: int, payload: bytes) -> bytes:
+    """Unmasked server frame (RFC 6455 §5.3: servers MUST NOT mask)."""
+    head = bytearray([0x80 | (opcode & 0x0F)])
+    ln = len(payload)
+    if ln < 126:
+        head.append(ln)
+    elif ln < 65536:
+        head.append(126)
+        head += ln.to_bytes(2, "big")
+    else:
+        head.append(127)
+        head += ln.to_bytes(8, "big")
+    return bytes(head) + payload
+
+
+class StubSocket:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+        self.sent: list[bytes] = []
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.append(bytes(data))
+
+    def recv(self, n: int) -> bytes:
+        if not self._chunks:
+            return b""
+        chunk = self._chunks.pop(0)
+        return chunk[:n]
+
+    def settimeout(self, _t: float) -> None:
+        return None
 
 
 def decode_client_frame(frame: bytes) -> tuple[int, bytes]:
@@ -41,6 +79,63 @@ class ClientFrameTest(unittest.TestCase):
         opcode, data = decode_client_frame(frame)
         self.assertEqual(opcode, 0xA)
         self.assertEqual(data, b"")
+
+
+class AfterConnectTest(unittest.TestCase):
+    def test_ping_path_sends_masked_pong_with_payload(self) -> None:
+        payload = b"binance-ping"
+        sock = StubSocket([HTTP_101, server_frame(0x9, payload)])
+        list(feed_adapter._ws_after_connect(sock, "host", "/ws"))
+        self.assertGreaterEqual(len(sock.sent), 2)
+        pong = sock.sent[1]
+        self.assertNotEqual(pong, bytes([0x8A, 0x00]))
+        opcode, data = decode_client_frame(pong)
+        self.assertEqual(opcode, 0xA)
+        self.assertEqual(data, payload)
+
+    def test_close_path_replies_with_masked_close_and_code(self) -> None:
+        payload = (1000).to_bytes(2, "big") + b"bye"
+        sock = StubSocket([HTTP_101, server_frame(0x8, payload)])
+        list(feed_adapter._ws_after_connect(sock, "host", "/ws"))
+        self.assertGreaterEqual(len(sock.sent), 2)
+        close = sock.sent[1]
+        opcode, data = decode_client_frame(close)
+        self.assertEqual(opcode, 0x8)
+        self.assertEqual(data[:2], payload[:2])
+
+
+class StopTest(BaseException):
+    """Breaks run_live's retry loop without being swallowed as ws error."""
+
+
+class RedialFeeddTest(unittest.TestCase):
+    def test_send_failure_redials_feedd(self) -> None:
+        dials: list[object] = []
+
+        class FailThenStop:
+            def sendall(self, _data: bytes) -> None:
+                raise BrokenPipeError("feedd gone")
+
+            def close(self) -> None:
+                return None
+
+        def fake_connect(_cfg: dict) -> FailThenStop:
+            if len(dials) >= 1:
+                raise StopTest("redialed")
+            sock = FailThenStop()
+            dials.append(sock)
+            return sock
+
+        def fake_ws(_url: str):
+            yield json.dumps({"bids": [["1", "1"]], "asks": []})
+
+        cfg = {"listen_host": "127.0.0.1", "listen_port": 9, "symbol": "BTCUSDT", "ws_url": "ws://x"}
+        with mock.patch.object(feed_adapter, "connect_feedd", fake_connect), mock.patch.object(
+            feed_adapter, "ws_frames", fake_ws
+        ), mock.patch.object(feed_adapter.time, "sleep"):
+            with self.assertRaises(StopTest):
+                feed_adapter.run_live(cfg)
+        self.assertEqual(len(dials), 1)
 
 
 if __name__ == "__main__":

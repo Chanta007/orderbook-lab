@@ -81,3 +81,35 @@ created: 2026-09-22
 ---
 
 Replace stdlib websocket client
+
+---
+id: 11a931c35554a9
+title: Non-blocking stdin so Ctrl-C cannot stick
+source-path: docs/research/2026-09-21-tui-red-bids.md
+source-section: Parked Future Angles
+status: open
+priority: medium
+i: 3
+c: 3
+e: 3
+revisit-when: a SIGINT leaves the tui process alive after the feed has stopped
+created: 2026-09-22
+---
+
+Non-blocking stdin so Ctrl-C cannot stick
+
+---
+id: 5cc8259902d1ab
+title: Move the TUI to FTXUI
+source-path: docs/research/2026-09-21-tui-red-bids.md
+source-section: Parked Future Angles
+status: open
+priority: medium
+i: 3
+c: 3
+e: 3
+revisit-when: one macOS Terminal window cannot show the book and the command list with ANSI alone
+created: 2026-09-22
+---
+
+Move the TUI to FTXUI

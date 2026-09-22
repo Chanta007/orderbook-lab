@@ -53,6 +53,31 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def connect_feedd(cfg: dict) -> socket.socket:
+    host = cfg.get("listen_host", "127.0.0.1")
+    port = int(cfg.get("listen_port", 9001))
+    return socket.create_connection((host, port), timeout=5)
+
+
+def close_quietly(sock: socket.socket | None) -> None:
+    if sock is None:
+        return
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def close_code_text(payload: bytes) -> str:
+    if len(payload) < 2:
+        return "none"
+    code = int.from_bytes(payload[:2], "big")
+    reason = payload[2:].decode("utf-8", "replace")
+    if reason:
+        return f"{code} reason={reason!r}"
+    return str(code)
+
+
 def client_frame(opcode: int, payload: bytes) -> bytes:
     """RFC 6455 client frame. The mask bit is always set."""
     mask = os.urandom(4)
@@ -157,6 +182,11 @@ def _ws_after_connect(sock: socket.socket, host: str, path: str):
             payload = buf[i : i + ln]
             buf = buf[i + ln :]
             if opcode == 0x8:
+                try:
+                    sock.sendall(client_frame(0x8, payload[:125]))
+                except OSError:
+                    pass
+                log(f"ws close code={close_code_text(payload)}")
                 return
             if opcode == 0x9:
                 sock.sendall(client_frame(0xA, payload))
@@ -165,26 +195,35 @@ def _ws_after_connect(sock: socket.socket, host: str, path: str):
                 yield payload.decode("utf-8", "replace")
 
 
-def run_live(cfg: dict, sock: socket.socket) -> None:
+def run_live(cfg: dict, sock: socket.socket | None = None) -> None:
     url = cfg.get("ws_url") or "wss://data-stream.binance.vision:443/ws/btcusdt@depth5@100ms"
     symbol = cfg.get("symbol", "BTCUSDT")
     delay = 1
-    while True:
-        try:
-            for raw in ws_frames(url):
-                delay = 1
-                try:
-                    obj = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                data = obj.get("data", obj)
-                for msg in parse_depth5(data, symbol):
-                    send_all(sock, msg)
-            log("ws closed; reconnecting")
-        except Exception as exc:
-            log(f"ws error: {exc}; reconnecting")
-        time.sleep(delay)
-        delay = min(delay * 2, 30)
+    try:
+        while True:
+            try:
+                if sock is None:
+                    sock = connect_feedd(cfg)
+                for raw in ws_frames(url):
+                    delay = 1
+                    try:
+                        obj = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    data = obj.get("data", obj)
+                    for msg in parse_depth5(data, symbol):
+                        send_all(sock, msg)
+                log("ws closed; reconnecting")
+            except OSError as exc:
+                log(f"feedd error: {exc}; redialing")
+                close_quietly(sock)
+                sock = None
+            except Exception as exc:
+                log(f"ws error: {exc}; reconnecting")
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+    finally:
+        close_quietly(sock)
 
 
 def run_fixture(path: str, sock: socket.socket, symbol: str) -> None:
@@ -211,17 +250,15 @@ def main() -> int:
     if cfg.get("allow_orders"):
         print("adapter refuses allow_orders", file=sys.stderr)
         return 2
-    host = cfg.get("listen_host", "127.0.0.1")
-    port = int(cfg.get("listen_port", 9001))
-    sock = socket.create_connection((host, port), timeout=5)
-    try:
-        if args.fixture:
+    if args.fixture:
+        sock = connect_feedd(cfg)
+        try:
             run_fixture(args.fixture, sock, cfg.get("symbol", "BTCUSDT"))
             time.sleep(0.2)
-        else:
-            run_live(cfg, sock)
-    finally:
-        sock.close()
+        finally:
+            close_quietly(sock)
+    else:
+        run_live(cfg)
     return 0
 
 
