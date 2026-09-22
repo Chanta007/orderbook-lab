@@ -49,6 +49,28 @@ def send_all(sock: socket.socket, data: bytes) -> None:
     sock.sendall(data)
 
 
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def client_frame(opcode: int, payload: bytes) -> bytes:
+    """RFC 6455 client frame. The mask bit is always set."""
+    mask = os.urandom(4)
+    ln = len(payload)
+    head = bytearray([0x80 | (opcode & 0x0F)])
+    if ln < 126:
+        head.append(0x80 | ln)
+    elif ln < 65536:
+        head.append(0x80 | 126)
+        head += ln.to_bytes(2, "big")
+    else:
+        head.append(0x80 | 127)
+        head += ln.to_bytes(8, "big")
+    head += mask
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return bytes(head) + masked
+
+
 def parse_depth5(obj: dict, symbol: str) -> list[bytes]:
     out: list[bytes] = []
     bids = obj.get("bids") or obj.get("b") or []
@@ -74,6 +96,16 @@ def ws_frames(url: str):
         sock = ctx.wrap_socket(raw, server_hostname=host)
     else:
         sock = raw
+    try:
+        yield from _ws_after_connect(sock, host, path)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _ws_after_connect(sock: socket.socket, host: str, path: str):
     key = os.urandom(16).hex()[:24]
     req = (
         f"GET {path} HTTP/1.1\r\n"
@@ -127,7 +159,7 @@ def ws_frames(url: str):
             if opcode == 0x8:
                 return
             if opcode == 0x9:
-                sock.sendall(bytes([0x8A, 0x00]))
+                sock.sendall(client_frame(0xA, payload))
                 continue
             if opcode in (0x1, 0x0):
                 yield payload.decode("utf-8", "replace")
@@ -136,14 +168,23 @@ def ws_frames(url: str):
 def run_live(cfg: dict, sock: socket.socket) -> None:
     url = cfg.get("ws_url") or "wss://data-stream.binance.vision:443/ws/btcusdt@depth5@100ms"
     symbol = cfg.get("symbol", "BTCUSDT")
-    for raw in ws_frames(url):
+    delay = 1
+    while True:
         try:
-            obj = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        data = obj.get("data", obj)
-        for msg in parse_depth5(data, symbol):
-            send_all(sock, msg)
+            for raw in ws_frames(url):
+                delay = 1
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                data = obj.get("data", obj)
+                for msg in parse_depth5(data, symbol):
+                    send_all(sock, msg)
+            log("ws closed; reconnecting")
+        except Exception as exc:
+            log(f"ws error: {exc}; reconnecting")
+        time.sleep(delay)
+        delay = min(delay * 2, 30)
 
 
 def run_fixture(path: str, sock: socket.socket, symbol: str) -> None:
