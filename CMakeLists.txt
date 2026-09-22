@@ -1,6 +1,7 @@
-# Optional second build of the same four programs. GitHub Actions and the
-# README run `make`, which also runs the Python frame tests. ctest here
-# only runs test_core.
+# Optional second build of the same four programs.
+# Say this if asked why both exist: Make is what CI runs, including the
+# Python tests. This file is only the C++ binaries plus one ctest named
+# core. It does not run test_ws_frames.py and it does not run the fixture.
 cmake_minimum_required(VERSION 3.16)
 project(orderbook-lab LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)

@@ -24,6 +24,12 @@ def load(path: Path) -> dict:
 
 
 def guard(cfg: dict) -> None:
+    """Same policy as the C++ loader, checked again before any process starts.
+
+    Two gates, both fatal. Prod needs the environment variable. Dev must
+    not set allow_orders. Say this out loud: the lab cannot place an order
+    by accident because the start path refuses that config.
+    """
     if cfg.get("env") == "prod" and os.environ.get("ORDERBOOK_ALLOW_PROD") != "1":
         raise SystemExit("refusing prod (ORDERBOOK_ALLOW_PROD=1 required)")
     if cfg.get("env") == "dev" and cfg.get("allow_orders"):
@@ -36,6 +42,7 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
 
 
 def setup(cfg_path: Path) -> None:
+    """Create the data directories and compile. Does not start processes."""
     cfg = load(cfg_path)
     guard(cfg)
     for key in ("bus_path", "wal_path", "log_path"):
@@ -50,6 +57,11 @@ def pid_file(name: str) -> Path:
 
 
 def spawn(name: str, cmd: list[str]) -> None:
+    """Background process, new session, pid file under var/run.
+
+    start_new_session means the child is not killed when this script execs
+    the TUI. stop reads the pid file later.
+    """
     pid_file(name).parent.mkdir(parents=True, exist_ok=True)
     log = open(ROOT / "var" / "run" / f"{name}.log", "ab")
     proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=log, stderr=log, start_new_session=True)

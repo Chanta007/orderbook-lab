@@ -1,5 +1,12 @@
-// No network. Publishes two messages through a ring and a WAL, then checks
-// that a DepthReset drops the old price so the best bid stays below the ask.
+// WALKTHROUGH, test_core.cpp
+//
+// Two checks, no sockets.
+// 1. Publish a bid and an ask through a real ring and WAL in /tmp.
+//    Read them back. The counts must be 1 and 1, and the WAL must hold
+//    both records. This is the path feedd uses, without TCP.
+// 2. Put a high bid in the book, reset both sides, then insert a lower
+//    bid and a higher ask. The old price must be gone, and the best bid
+//    must be strictly below the best ask. That is the depth5 rule.
 #include "ob/book.hpp"
 #include "ob/msg.hpp"
 #include "ob/ring.hpp"

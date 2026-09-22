@@ -22,6 +22,9 @@ struct Config {
   int levels{5};
 };
 
+// Find "key" then the value after the colon. Strings are quoted. Numbers
+// and true/false are read up to a comma or brace. Nested objects would break
+// this. The config files are flat on purpose.
 inline std::string json_str(const std::string& body, const std::string& key, const std::string& def) {
   auto needle = "\"" + key + "\"";
   auto p = body.find(needle);

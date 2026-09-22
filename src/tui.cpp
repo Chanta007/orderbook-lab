@@ -20,6 +20,8 @@
 static std::atomic<bool> g_run{true};
 static void on_sig(int) { g_run = false; }
 
+// Prices are shown to the cent. Sizes use up to 8 decimals so a real
+// quantity under 0.005 does not print as 0.00.
 static std::string fmt_px(int64_t e8) {
   char buf[64];
   std::snprintf(buf, sizeof(buf), "%.2f", static_cast<double>(e8) / 1e8);
@@ -49,6 +51,9 @@ int main(int argc, char** argv) {
   uint64_t cursor = ring.wseq();
   std::atomic<int> levels{cfg.levels};
 
+  // Input is a second thread because getline blocks. The draw loop must
+  // keep running while the user is not typing. levels is atomic so the
+  // draw loop can read it without a lock. Unknown lines are ignored.
   std::thread input([&] {
     while (g_run) {
       std::string line;
@@ -83,6 +88,10 @@ int main(int argc, char** argv) {
                    std::chrono::steady_clock::now() - last_msg)
                    .count();
     const char* feed = (saw && age < 2) ? "live" : "stalled";
+    // Home the cursor and erase the screen, then draw the whole frame again.
+    // That is why a help line printed once would vanish. The commands are
+    // part of this frame. The refresh also erases the characters the user
+    // is typing. They still reach getline when Enter is pressed.
     std::printf("\033[H\033[2J");
     std::printf("orderbook-lab  env=%s  symbol=%s  seq=%llu  feed=%s\n",
                 cfg.env.c_str(), cfg.symbol.c_str(),

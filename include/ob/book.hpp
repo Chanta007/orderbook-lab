@@ -8,6 +8,25 @@
 
 namespace ob {
 
+// WALKTHROUGH, book.hpp
+//
+// In-memory book. One map per side, price to size. Not on the wire.
+//
+// apply is the whole state machine:
+//   DepthReset clears that side and returns. It does not change last_seq,
+//   because a clear is not a trade or a new top price.
+//   Depth with qty 0 erases that price. This is how a diff feed deletes.
+//   Depth with qty > 0 inserts or replaces that price.
+//   Anything else is ignored.
+//
+// top_bids walks the map backwards so the first row is the highest bid.
+// top_asks walks forward so the first row is the lowest ask. The inside
+// of the book is those two first rows. If a bid is above an ask, an old
+// price was not cleared. That is a feed bug, not a sort bug.
+//
+// The mutex is here because the TUI applies on one thread and could later
+// read from another. feedd does not touch Book.
+
 struct Level {
   int64_t px_e8{0};
   int64_t qty_e8{0};
