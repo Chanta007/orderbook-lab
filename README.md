@@ -17,7 +17,7 @@ python3 python/obctl.py stop  --config config/dev.json
 
 Or `make setup`, `make start`, `make stop`.
 
-`start --tui` shows a live book. Bid prices are red. Ask prices are green. The window lists the commands: type `quit` to leave, `levels N` (1 to 20) to change depth, then Enter. `help` is already on screen. If the feed line says `stalled`, the book is the last update and the adapter is reconnecting.
+`start --tui` shows a live book. Bid prices are red. Ask prices are green. Each Binance top-of-book picture replaces the previous prices, so an old bid cannot stay above the asks. Sizes are not rounded to `0.00`. The window lists the commands: type `quit` to leave, `levels N` (1 to 20) to change depth, then Enter. `help` is already on screen. If the feed line says `stalled`, the book is the last update and the adapter is reconnecting.
 
 Live feed uses Binance **market-data-only**  
 `wss://data-stream.binance.vision/ws/btcusdt@depth5@100ms`  

@@ -56,6 +56,42 @@ int main() {
   assert(replay.size() == 2);
   ::unlink(rp.c_str());
   ::unlink(wp.c_str());
+
+  ob::Book snap;
+  ob::Msg s{};
+  ob::clear_msg(s);
+  s.magic = ob::kMagic;
+  s.nbytes = sizeof(ob::Msg);
+  s.type = ob::Type::Depth;
+  s.side = ob::Side::Bid;
+  s.px_e8 = 8584500000000LL;
+  s.qty_e8 = 404000000LL;
+  snap.apply(s);
+  s.side = ob::Side::Ask;
+  s.px_e8 = 8584600000000LL;
+  s.qty_e8 = 10000000LL;
+  snap.apply(s);
+  s.type = ob::Type::DepthReset;
+  s.side = ob::Side::Bid;
+  s.px_e8 = 0;
+  s.qty_e8 = 0;
+  snap.apply(s);
+  s.type = ob::Type::DepthReset;
+  s.side = ob::Side::Ask;
+  snap.apply(s);
+  s.type = ob::Type::Depth;
+  s.side = ob::Side::Bid;
+  s.px_e8 = 8564000000000LL;
+  s.qty_e8 = 25000000LL;
+  snap.apply(s);
+  s.side = ob::Side::Ask;
+  s.px_e8 = 8564401000000LL;
+  s.qty_e8 = 6000000LL;
+  snap.apply(s);
+  assert(snap.bid_count() == 1);
+  assert(snap.ask_count() == 1);
+  assert(snap.top_bids(1)[0].px_e8 < snap.top_asks(1)[0].px_e8);
+
   std::puts("ok");
   return 0;
 }

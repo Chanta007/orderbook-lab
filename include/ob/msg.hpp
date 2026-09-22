@@ -6,7 +6,7 @@ namespace ob {
 
 inline constexpr uint32_t kMagic = 0x4F424C42u; // OBLB
 
-enum class Type : uint8_t { Depth = 1, Heartbeat = 2, Cmd = 3 };
+enum class Type : uint8_t { Depth = 1, Heartbeat = 2, Cmd = 3, DepthReset = 4 };
 enum class Side : uint8_t { Bid = 0, Ask = 1, Both = 2 };
 
 #pragma pack(push, 1)

@@ -27,13 +27,17 @@ def load_cfg(path: str) -> dict:
         return json.load(f)
 
 
-def pack_msg(side: int, px: float, qty: float, symbol: str) -> bytes:
+DEPTH = 1
+DEPTH_RESET = 4
+
+
+def pack_msg(side: int, px: float, qty: float, symbol: str, msg_type: int = DEPTH) -> bytes:
     sym = symbol.encode("ascii")[:8].ljust(8, b"\0")
     return struct.pack(
         MSG_FMT,
         MAGIC,
         MSG_SIZE,
-        1,  # Depth
+        msg_type,
         side,
         0,
         0,
@@ -96,14 +100,28 @@ def client_frame(opcode: int, payload: bytes) -> bytes:
     return bytes(head) + masked
 
 
+def _side_levels(obj: dict, long_key: str, short_key: str) -> list | None:
+    if long_key in obj:
+        return obj.get(long_key) or []
+    if short_key in obj:
+        return obj.get(short_key) or []
+    return None
+
+
 def parse_depth5(obj: dict, symbol: str) -> list[bytes]:
+    """One Binance top-of-book picture replaces that side. It is not a diff."""
     out: list[bytes] = []
-    bids = obj.get("bids") or obj.get("b") or []
-    asks = obj.get("asks") or obj.get("a") or []
-    for px, qty in bids:
-        out.append(pack_msg(0, float(px), float(qty), symbol))
-    for px, qty in asks:
-        out.append(pack_msg(1, float(px), float(qty), symbol))
+    for side, levels in (
+        (0, _side_levels(obj, "bids", "b")),
+        (1, _side_levels(obj, "asks", "a")),
+    ):
+        if levels is None:
+            continue
+        out.append(pack_msg(side, 0.0, 0.0, symbol, DEPTH_RESET))
+        for px, qty in levels:
+            if float(qty) == 0.0:
+                continue
+            out.append(pack_msg(side, float(px), float(qty), symbol))
     return out
 
 

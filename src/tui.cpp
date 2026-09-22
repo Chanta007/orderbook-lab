@@ -22,6 +22,16 @@ static std::string fmt_px(int64_t e8) {
   return buf;
 }
 
+static std::string fmt_qty(int64_t e8) {
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%.8f", static_cast<double>(e8) / 1e8);
+  std::string s(buf);
+  while (!s.empty() && s.back() == '0') s.pop_back();
+  if (!s.empty() && s.back() == '.') s.pop_back();
+  if (s.empty() || s == "-") return "0";
+  return s;
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage: tui <config.json>\n";
@@ -86,9 +96,9 @@ int main(int argc, char** argv) {
     size_t rows = std::max(bids.size(), asks.size());
     for (size_t i = 0; i < rows; ++i) {
       std::string bp = i < bids.size() ? fmt_px(bids[i].px_e8) : "";
-      std::string bq = i < bids.size() ? fmt_px(bids[i].qty_e8) : "";
+      std::string bq = i < bids.size() ? fmt_qty(bids[i].qty_e8) : "";
       std::string ap = i < asks.size() ? fmt_px(asks[i].px_e8) : "";
-      std::string aq = i < asks.size() ? fmt_px(asks[i].qty_e8) : "";
+      std::string aq = i < asks.size() ? fmt_qty(asks[i].qty_e8) : "";
       std::printf("%s%12s %12s%s    %s%12s %12s%s\n", red, bp.c_str(), bq.c_str(), reset,
                   green, ap.c_str(), aq.c_str(), reset);
     }

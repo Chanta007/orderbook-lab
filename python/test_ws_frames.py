@@ -63,6 +63,19 @@ def decode_client_frame(frame: bytes) -> tuple[int, bytes]:
     return opcode, data
 
 
+class SnapshotTest(unittest.TestCase):
+    def test_each_side_starts_with_a_reset(self) -> None:
+        raw = feed_adapter.parse_depth5(
+            {"bids": [["100", "1"]], "asks": [["101", "2"]]},
+            "BTCUSDT",
+        )
+        kinds = [(frame[6], frame[7]) for frame in raw]
+        self.assertEqual(kinds[0], (feed_adapter.DEPTH_RESET, 0))
+        self.assertEqual(kinds[1][0], feed_adapter.DEPTH)
+        self.assertEqual(kinds[2], (feed_adapter.DEPTH_RESET, 1))
+        self.assertEqual(kinds[3][0], feed_adapter.DEPTH)
+
+
 class ClientFrameTest(unittest.TestCase):
     def test_pong_copies_ping_payload_and_is_masked(self) -> None:
         payload = b"\x01\x02ping-body"
