@@ -1,3 +1,5 @@
+# CI and the README use this file, not CMake. test is offline. e2e replays
+# e2e/fixture.jsonl through feedd and checks headless counts.
 CXX ?= c++
 CXXFLAGS ?= -std=c++17 -O2 -pthread -Iinclude -Wall -Wextra
 LDFLAGS ?= -pthread

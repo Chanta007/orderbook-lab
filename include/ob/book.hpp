@@ -18,6 +18,7 @@ class Book {
   void apply(const Msg& m) {
     std::lock_guard<std::mutex> g(mu_);
     auto& side = (m.side == Side::Bid) ? bids_ : asks_;
+    // Reset does not touch last_seq. A clear is not a new price.
     if (m.type == Type::DepthReset) {
       side.clear();
       return;
@@ -30,6 +31,7 @@ class Book {
   std::vector<Level> top_bids(size_t n) const {
     std::lock_guard<std::mutex> g(mu_);
     std::vector<Level> v;
+    // Highest bid first. Asks below walk lowest first, so the top row is the inside.
     for (auto it = bids_.rbegin(); it != bids_.rend() && v.size() < n; ++it)
       v.push_back({it->first, it->second});
     return v;

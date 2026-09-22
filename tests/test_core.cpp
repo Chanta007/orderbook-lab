@@ -1,3 +1,5 @@
+// No network. Publishes two messages through a ring and a WAL, then checks
+// that a DepthReset drops the old price so the best bid stays below the ask.
 #include "ob/book.hpp"
 #include "ob/msg.hpp"
 #include "ob/ring.hpp"

@@ -1,3 +1,6 @@
+# Optional second build of the same four programs. GitHub Actions and the
+# README run `make`, which also runs the Python frame tests. ctest here
+# only runs test_core.
 cmake_minimum_required(VERSION 3.16)
 project(orderbook-lab LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)

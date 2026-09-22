@@ -1,6 +1,11 @@
 """Market-data adapter: Binance public WS or fixture → binary Msg on TCP.
 
 Never talks to TRADE endpoints. Dev-only public market data.
+
+depth5 is a fresh top-of-book picture. parse_depth5 sends DepthReset for a
+side before that side's prices, or old prices stay in the book forever.
+Client websocket frames are masked. A pong copies the ping payload. Binance
+closes the socket if that pong does not come back. run_live reconnects.
 """
 from __future__ import annotations
 

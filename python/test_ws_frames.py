@@ -1,4 +1,8 @@
-"""Stdlib checks for masked client frames and the live retry path. No network."""
+"""Stdlib checks for masked client frames and the live retry path. No network.
+
+A client frame must have the mask bit set, and a pong must carry the ping
+payload. A depth5 picture must start each side with DepthReset.
+"""
 from __future__ import annotations
 
 import json

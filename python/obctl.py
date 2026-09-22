@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""One-command setup / start / stop driven by config/*.json."""
+"""One-command setup / start / stop driven by config/*.json.
+
+feedd and the adapter are background processes with pid files. The TUI is
+not. On a real terminal, start replaces this process with the TUI, so
+`stop` cannot find a tui pid. Type quit in that window.
+"""
 from __future__ import annotations
 
 import argparse
@@ -63,6 +68,7 @@ def start(cfg_path: Path, fixture: str, with_tui: bool) -> None:
     if fixture:
         adapter += ["--fixture", str(Path(fixture).resolve())]
     spawn("adapter", adapter)
+    # exec only when stdin is a terminal. make e2e is not, so it stays headless.
     if with_tui and sys.stdin.isatty():
         os.execv(str(ROOT / "build" / "tui"), [str(ROOT / "build" / "tui"), cfg_abs])
     print("start ok (no tui)")

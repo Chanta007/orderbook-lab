@@ -1,4 +1,9 @@
 #pragma once
+// One record on the TCP socket, the ring, and the WAL. Layout is fixed at
+// 72 bytes so Python and C++ can share it without a schema library.
+// Prices and sizes are integers scaled by 1e8 (px_e8, qty_e8).
+// Depth updates one price. DepthReset clears a whole side first, because a
+// Binance depth5 message is a fresh top-of-book picture, not a diff.
 #include <cstdint>
 #include <cstring>
 
