@@ -235,6 +235,11 @@ class AwaitStartedTest(unittest.TestCase):
         self.quiet.__enter__()
         self.addCleanup(self.quiet.__exit__, None, None, None)
 
+    def reap(self, proc: subprocess.Popen) -> None:
+        """Kill and collect, so no child is left unreaped."""
+        proc.kill()
+        proc.wait(timeout=5)
+
     def test_a_child_that_exits_at_once_is_not_reported_as_started(self) -> None:
         offset = obctl.log_offset("feedd")
         proc = obctl.spawn(
@@ -259,7 +264,7 @@ class AwaitStartedTest(unittest.TestCase):
                 " sys.stderr.flush(); time.sleep(30)",
             ],
         )
-        self.addCleanup(proc.kill)
+        self.addCleanup(self.reap, proc)
 
         obctl.await_started("feedd", proc, offset, "feedd listen", 1.0)
 
@@ -270,7 +275,7 @@ class AwaitStartedTest(unittest.TestCase):
         proc = obctl.spawn(
             "feedd", [sys.executable, "-c", "import time; time.sleep(30)"]
         )
-        self.addCleanup(proc.kill)
+        self.addCleanup(self.reap, proc)
 
         with self.assertRaises(SystemExit):
             obctl.await_started("feedd", proc, offset, "feedd listen", 0.3)

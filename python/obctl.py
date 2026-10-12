@@ -131,21 +131,45 @@ def proc_command(pid: int) -> str | None:
 ZOMBIE_COMMAND = "<defunct>"
 
 
+def proc_state(pid: int) -> str | None:
+    """The ps state letter: R or S for a live process, Z for a zombie that has
+    not been collected, "" when the pid is gone, None when ps could not be
+    asked.
+
+    The letter is the portable signal. BSD ps and procps both report Z, while
+    the text ps puts in place of the command for a zombie differs: macOS prints
+    `<defunct>`, procps prints the command with a marker in front of it.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "state="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip()
+
+
 def proc_running(pid: int) -> bool | None:
     """True when a process is running at this pid, False when none is, None
     when ps could not be asked.
 
-    A process that has exited but not been collected answers with <defunct>:
-    only its exit status is left, and its pid is still valid. That is not
-    running. A stop that waits for it would wait the whole grace period and
-    then report a failure that is not one.
+    A process that has exited but not been collected is a zombie: only its exit
+    status is left, its pid is still valid, and signal 0 succeeds for it. That
+    is not running, and a stop that waits for it waits the whole grace period
+    and then reports a failure that is not one.
     """
     command = proc_command(pid)
     if command is None:
         return None
-    if not command or command == ZOMBIE_COMMAND:
+    if not command:
         return False
-    return True
+    state = proc_state(pid)
+    if state is None:
+        return ZOMBIE_COMMAND not in command
+    return bool(state) and not state.startswith("Z")
 
 
 def owns(pid: int, name: str) -> bool:
@@ -366,16 +390,17 @@ def kill_pid(name: str) -> int | None:
     if pid is None:
         path.unlink(missing_ok=True)
         return None
-    command = proc_command(pid)
-    if command is None:
-        print(f"cannot read the command line for {name} pid={pid}; leaving its pid file in place")
+    running = proc_running(pid)
+    if running is None:
+        print(f"cannot read the state of {name} pid={pid}; leaving its pid file in place")
         return pid
-    if not command or command == ZOMBIE_COMMAND:
+    if not running:
         path.unlink(missing_ok=True)
         return None
+    command = proc_command(pid) or ""
     marker = PROC_MARKERS.get(name)
     if not marker or marker not in command:
-        print(f"left alone: {name} pid={pid} is not this lab ({command})")
+        print(f"left alone: {name} pid={pid} is not this lab ({command or 'no command line'})")
         path.unlink(missing_ok=True)
         return None
     try:
