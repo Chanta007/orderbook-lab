@@ -145,3 +145,19 @@ created: 2026-10-12
 ---
 
 Cross-worktree port message: when the port is held by a feedd from another checkout, the refusal names the address but not the other worktree. Revisit when two worktrees are worked at once.
+
+---
+id: b0095323eccb6e
+title: Add a product-path OTKP pack for the order book run path
+source-path: inline:adhoc
+source-section: inline capture 2026-10-12
+status: open
+priority: medium
+i: 3
+c: 3
+e: 3
+revisit-when: when a second macOS/Linux run-path regression appears, or when the OTKP engine accepts consumer packs
+created: 2026-10-12
+---
+
+Add a product-path OTKP pack for the order book run path

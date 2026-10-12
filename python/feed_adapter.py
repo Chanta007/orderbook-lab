@@ -68,9 +68,18 @@ def log(msg: str) -> None:
 
 
 def connect_feedd(cfg: dict) -> socket.socket:
+    """Connect to feedd, and say so on stderr.
+
+    obctl waits for this line before it calls the start good. The adapter has
+    no other ready signal: with no feedd it can sit in the redial loop for a
+    long time without failing, and a start that cannot tell the difference
+    reports success over a book that will never fill.
+    """
     host = cfg.get("listen_host", "127.0.0.1")
     port = int(cfg.get("listen_port", 9001))
-    return socket.create_connection((host, port), timeout=5)
+    sock = socket.create_connection((host, port), timeout=5)
+    log("adapter connected")
+    return sock
 
 
 def close_quietly(sock: socket.socket | None) -> None:
