@@ -14,6 +14,8 @@
 
 The mmap ring is the generic backend. Every consumer has its own cursor.
 
+On a terminal, `obctl start --tui` replaces the control process with the TUI. That is why the window needs a terminal, and why `stop` has no tui pid to find: leave the window with `quit`, then run `obctl stop` for the feed.
+
 ## Isolation
 
 - `config/dev.json` vs `config/prod.json` (different dirs and ports).

@@ -161,3 +161,83 @@ created: 2026-10-12
 ---
 
 Add a product-path OTKP pack for the order book run path
+
+---
+id: 4b53f8d03b1084
+title: A `docs/runbooks/running-it.md` when the README `Run it` section passes rough...
+source-path: docs/plans/archive/2026-10-12-run-docs-gaps.md
+source-section: ## Deferred (NOT in this plan)
+status: open
+priority: medium
+i: 3
+c: 2
+e: 2
+revisit-when: manual review
+created: 2026-10-12
+---
+
+A `docs/runbooks/running-it.md` when the README `Run it` section passes roughly 40 lines.
+
+---
+id: 5fb6d85c14fb86
+title: ship-merge-guard misses a leading heredoc, so a later cd is not applied and the git verb is classified against the wrong checkout
+source-path: inline:adhoc
+source-section: inline capture 2026-10-12
+status: open
+priority: medium
+i: 3
+c: 3
+e: 3
+revisit-when: when a commit is blocked on a protected checkout while the command does cd into a feature worktree
+created: 2026-10-12
+---
+
+ship-merge-guard misses a leading heredoc, so a later cd is not applied and the git verb is classified against the wrong checkout
+
+---
+id: c0bdd282db0205
+title: Documenting the `obctl` exit codes (`0`, `1` on a refusal, `1` from `stop` wh...
+source-path: docs/plans/archive/2026-10-12-run-docs-gaps.md
+source-section: ## Deferred (NOT in this plan)
+status: open
+priority: medium
+i: 3
+c: 2
+e: 2
+revisit-when: manual review
+created: 2026-10-12
+---
+
+Documenting the `obctl` exit codes (`0`, `1` on a refusal, `1` from `stop` when a process survives).
+
+---
+id: cc4e1affa462e1
+title: ship-merge-guard resolves telemetry from the hook cwd, so a worktree branch's review2fix rows are invisible to it
+source-path: inline:adhoc
+source-section: inline capture 2026-10-12
+status: open
+priority: medium
+i: 3
+c: 3
+e: 3
+revisit-when: when a worktree delivery is blocked for missing review evidence that exists on its own branch
+created: 2026-10-12
+---
+
+ship-merge-guard resolves telemetry from the hook cwd, so a worktree branch's review2fix rows are invisible to it
+
+---
+id: d0705e552a0fe6
+title: smartdeploy.py accepts only result=pass while ship-merge-guard and the drive/review2fix skills treat skipped-unprovisioned as ship-OK
+source-path: inline:adhoc
+source-section: inline capture 2026-10-12
+status: open
+priority: medium
+i: 3
+c: 3
+e: 3
+revisit-when: when the next unprovisioned-reviewer delivery is blocked at the smartdeploy gate
+created: 2026-10-12
+---
+
+smartdeploy.py accepts only result=pass while ship-merge-guard and the drive/review2fix skills treat skipped-unprovisioned as ship-OK

@@ -52,7 +52,9 @@ python3 python/obctl.py start --config config/dev.json --tui
 python3 python/obctl.py stop  --config config/dev.json
 ```
 
-`make setup`, `make start`, and `make stop` are the same three commands. Run them from the repository root. `make` looks for `./Makefile`, so a shell sitting in `config/` will not find it.
+`make setup`, `make start`, and `make stop` are the same three commands. Run them from the repository root. `make` looks for `./Makefile`, so a shell sitting in `config/` will not find it. `scripts/ob` is the same program under a shorter path, so `python3 scripts/ob stop --config config/dev.json` is `make stop`.
+
+`--tui` opens the window only when stdin is a terminal. From a pipe, a background job, or a script it prints `start ok (no tui)` and leaves feedd and the adapter running, which is what `make e2e` relies on. To read the book without a window, give the checker a millisecond budget: `./build/headless config/dev.json 1200` prints a line like `bids=5 asks=5 seq=647 wal=3284` and exits.
 
 `start` refuses when an instance is already running. It names the pid, or the address when something else holds the port. The refusal is deliberate: a second `start` used to overwrite the pid files of the instance already running, which left a feedd holding the port with nothing pointing at it. `stop` signals only a process whose command line still looks like this lab's, waits for it to exit, and reports any that did not. If a bind failure is reported, see [`docs/runbooks/port-already-in-use.md`](docs/runbooks/port-already-in-use.md).
 
@@ -81,7 +83,13 @@ There is no API key. That host cannot place an order. `make e2e` does not open i
 | Listen | `127.0.0.1:9001` | `127.0.0.1:9101` |
 | Orders | `allow_orders` must be false | still false unless you change the file and set `ORDERBOOK_ALLOW_PROD=1` |
 
-`obctl` refuses to start prod without that environment variable. The dev file is rejected if `allow_orders` is true.
+`obctl` refuses to start prod without that environment variable. The dev file is rejected if `allow_orders` is true. The prod window is the same three commands with the gate in front:
+
+```bash
+ORDERBOOK_ALLOW_PROD=1 python3 python/obctl.py start --config config/prod.json --tui
+```
+
+Runtime state lives under the directory its config names: pid files and `feedd.log` / `adapter.log` in `var/run/`, and the mmap ring and the WAL in `var/dev/` or `var/prod/`. `make clean` removes `build/`, `var/dev`, `var/prod`, and `var/run`.
 
 `dev` on GitHub is the integration branch. `main` is the release branch. Feature work belongs on `feature/*`.
 
