@@ -16,3 +16,11 @@ docs/plans/.active-execution.md
 
 # Rust build output and the runtime scratch the soak and the daemon create.
 rust/target/
+
+# Harness session and run artifacts. These describe one machine's session, not
+# the repository, and they were committed once by accident: `git add -A` in a
+# worktree swept them in because nothing ignored them.
+.claude/mcl-chrome.txt
+.claude/session-state.json
+.claude/otkp/
+.otkp/
