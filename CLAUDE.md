@@ -26,13 +26,13 @@ make rust-e2e    # replay the same e2e/fixture.jsonl through the Rust binaries
 # The cargo commands behind the Rust targets
 cargo build --release --manifest-path rust/Cargo.toml
 cargo test --manifest-path rust/Cargo.toml
-cargo fmt --manifest-path rust/Cargo.toml --check
+cargo fmt --all --manifest-path rust/Cargo.toml --check
 cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
 ```
 
 **Before Committing**:
 1. Run tests: `make test` and `cargo test --manifest-path rust/Cargo.toml`
-2. Run the Rust format check: `cargo fmt --manifest-path rust/Cargo.toml --check`
+2. Run the Rust format check: `cargo fmt --all --manifest-path rust/Cargo.toml --check`
 3. Run the linter: `cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings`
 4. Run the build: `make` and `cargo build --release --manifest-path rust/Cargo.toml`
 5. Update relevant `docs/design/*.md` if architecture/data models/flows changed

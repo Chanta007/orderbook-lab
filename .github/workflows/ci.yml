@@ -22,13 +22,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: format
-        run: cargo fmt --manifest-path rust/Cargo.toml --check
-      - name: clippy
-        run: cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
-      - name: test
-        run: cargo test --manifest-path rust/Cargo.toml
-      - name: build
-        run: cargo build --release --manifest-path rust/Cargo.toml
+      # The commands live in the Makefile and are called from here, not repeated.
+      # They were repeated once, and the copy drifted: CI ran
+      # `cargo fmt --manifest-path rust/Cargo.toml --check`, which fails with
+      # "Failed to find targets" because `cargo fmt` needs `--all` to resolve
+      # targets from a manifest path. `make rust-test` had the working form, so
+      # every local check was green while the rust job failed on every run.
+      #
+      # One definition, called from both places, is what stops that happening
+      # again. See docs/optimization/ledger.jsonl OPT-027.
+      - name: test, format and lint
+        run: make rust-test
       - name: e2e
         run: make rust-e2e
+      - name: vectorization audit
+        run: make rust-vec-audit

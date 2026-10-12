@@ -40,9 +40,31 @@ echo "vec-audit: emitting LLVM IR for the ob library"
 # vectorized. The shipped binaries are still built with LTO; what is being
 # checked here is the vectorizer's decision on each kernel, and that decision is
 # made per-crate before LTO merges anything.
-cargo rustc --release --lib -p ob --config 'profile.release.lto="off"' -- --emit=llvm-ir >/dev/null
+# The target is named, and on x86-64 it is raised, because vectorization here is
+# target-dependent and the difference is large. Measured on the same source:
+#
+#   aarch64 (default)      mids_into 12 vector ops   top 8
+#   x86-64  (baseline)     mids_into  0              top 0
+#   x86-64-v2 (SSE4.2)     mids_into 12              top 0
+#   x86-64-v3 (AVX2)       mids_into 12              top 8
+#
+# So the code has the shape the vectorizer accepts, and the baseline x86-64 cost
+# model declines to use it. Auditing at the baseline would report a failure of
+# the code when what failed is the target, so the audit raises the level on
+# x86-64 and says which level it used. Ledger OPT-028 has the measurement.
+target_triple=$(rustc -vV | sed -n 's/^host: //p')
+case "$target_triple" in
+    x86_64-*) audit_cpu="-Ctarget-cpu=x86-64-v3" ;;
+    *)        audit_cpu="" ;;
+esac
+echo "vec-audit: target $target_triple ${audit_cpu:-at its default cpu level}"
 
-# Newest IR file for the library. `cargo rustc` writes one per invocation.
+# shellcheck disable=SC2086  # audit_cpu is a deliberate single-flag word split
+RUSTFLAGS="$audit_cpu" \
+    cargo rustc --release --lib -p ob --config 'profile.release.lto="off"' -- --emit=llvm-ir >/dev/null
+
+# Newest IR file for the library. `cargo rustc` writes one per invocation, and a
+# raised `-Ctarget-cpu` writes under a different path, so both are searched.
 ir=$(ls -t target/release/deps/ob-*.ll 2>/dev/null | head -1)
 if [ -z "$ir" ] || [ ! -f "$ir" ]; then
     echo "vec-audit: FAIL no LLVM IR found under target/release/deps" >&2

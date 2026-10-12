@@ -147,7 +147,33 @@ and neither was sufficient alone:
 The lesson is in the ordering: measured after the layout change alone, the result
 looked like a 6% win and a wasted afternoon. Measured after both, it is 14.1x.
 
-### 4.4 The suspected blocker that was not
+### 4.4 Vectorization is target-dependent
+
+The audit passed on Apple silicon and failed in CI with **0** vector operations for
+both required kernels. Cross-emitting x86-64 IR on the same source reproduced it
+locally, so it was not a CI quirk. Sweeping the x86-64 baseline level shows where
+the threshold is:
+
+| Target | `mids_into` | `top` |
+|--------|------------|-------|
+| aarch64, default | 12 | 8 |
+| x86-64, baseline | **0** | **0** |
+| x86-64-v2 (SSE4.2) | 12 | **0** |
+| x86-64-v3 (AVX2) | 12 | 8 |
+
+The code is identical in every row. What differs is the instruction set the cost
+model is allowed to use, and on baseline x86-64 it declines. `mids_into` needs
+SSE4.2; `top` needs AVX2.
+
+The audit now prints the target triple it compiled for and raises the level to
+`x86-64-v3` on x86-64, saying so, because auditing at the baseline would report a
+defect in the code when the difference is in the target. The shipped build stays
+at the default, so a reader on any x86-64 machine gets a binary that runs.
+
+The lesson generalises past this repository: **a machine-specific measurement is
+not a portable claim.** An oracle has to name what it measured.
+
+### 4.5 The suspected blocker that was not
 
 The `sdiv` in that same loop was the obvious second suspect, since vectorized
 signed division has a high cost-model price. Replacing `/ 2` with `>> 1` changed
@@ -203,7 +229,8 @@ See §4.2. Measured cost of the shipped sequential form: **7.5 ns**.
 | Setting | Status | Why |
 |---------|--------|-----|
 | `lto = "fat"`, `codegen-units = 1` | **on** | Cross-crate inlining across the workspace; costs build time, buys nothing measurable in these kernels but nothing else either. |
-| `-C target-cpu=native` | **not used** | The binaries are meant to run on the machine that built them, but a benchmark that only means something on one CPU is not a benchmark. Revisit if a deployment target is pinned. |
+| `-C target-cpu=native` | **not used in the shipped build** | The binaries are meant to run on the machine that built them, but a benchmark that only means something on one CPU is not a benchmark. The audit raises the level on x86-64 to `x86-64-v3`, and says so, because the baseline cost model declines to vectorize both kernels. |
+| Baseline `x86-64` as the shipped default | **kept, with the cost understood** | On a baseline x86-64 target neither required kernel vectorizes: `mids_into` needs SSE4.2 and `top` needs AVX2. That is a property of the target, not of the code — the same source vectorizes on aarch64 at its default. Ledger OPT-028 has the sweep. A deployment that cares can raise the level; the lab does not, because it has to run on whatever the reader has. |
 | Profile-guided optimization | **measured, no effect** | `rust/scripts/pgo.sh` runs the full procedure: instrument, drive with `obsoak`, merge with `llvm-profdata`, rebuild with `-Cprofile-use`. On the kernels that matter it moved nothing measurable (ledger OPT-018). What it did do was expose a bug in the benchmark: the trained build reported a 1000-symbol snapshot at 16 ns, because batching made the call loop-invariant and the optimizer hoisted it. The script stays so the test is repeatable when a kernel is added that PGO might help. |
 | BOLT | **not used** | Not available for macOS. Relevant only if the Linux path becomes a deployment target. |
 | `std::simd` | **not used** | Nightly only. The one kernel where it would pay is the prefix sum in §4.2, and the sequential form already runs at one instruction per element. |
