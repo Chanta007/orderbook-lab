@@ -95,6 +95,7 @@ Every line in `ledger.jsonl` is one JSON object with these fields:
 | OPT-008 | Checking the last record first, instead of scanning every record, made the ingest torn-tail check about **100x faster** (2018 ns to 19.8 ns) because the common case is one comparison. | Before vectorizing a scan, ask whether the scan is needed at all. Constant-time beats wide. |
 | OPT-009 | The constant-time fast path was applied to a general-purpose function whose contract allowed a damaged record anywhere, and a test caught it returning 3 instead of 1. It was split into two functions: a scanning one for arbitrary buffers, and a precondition-carrying one for stream buffers. | An optimisation that narrows a function's contract belongs in a differently named function. Same name, new precondition is how a fast path becomes a bug. |
 | OPT-014 | The CLI stored flag names with the leading dashes stripped and every call site looked them up with the dashes still on, so `--json`, `--levels`, `--symbols` and `--ticks` were silently ignored and every binary ran on its defaults. The tool ran, the numbers were plausible, and the option was never applied. | A lookup returning `Option` makes a name mismatch indistinguishable from an absent flag, and an optional flag's default hides it. Test that an option *changes the behaviour*, not that it parses. |
+| OPT-026 | Three review attempts on one 56-file, ~14,000-line change failed for capacity reasons: an agent turn limit, a provider balance error, and a `max_tokens` truncation after 383K input tokens. A scoped review of one surface completed in 24 minutes and found seven real defects. | A review that fails for capacity reasons is not a review, and a gate that cannot tell the difference reports a clean pass on unreviewed code. Size the review to the diff, and when a reviewer cannot complete, record that rather than a pass. |
 
 ### Correctness found by independent review
 
@@ -129,6 +130,34 @@ same `decode` kernel has measured 14.6 µs and 20.3 µs for the same input. A ra
 taken inside one `vecbench` run is meaningful; a nanosecond value quoted from a
 different run is not. Where a `before` and an `after` were measured in separate
 runs, the entry says so.
+
+## Reviewing a change this size
+
+The ledger's findings came from two sources: measurements taken while writing the
+code, and one independent review pass. The review is worth its own note because
+the harness's own review gate did not produce it.
+
+Three attempts failed on this change, in three different ways:
+
+| Attempt | Failure |
+|---------|---------|
+| `review2fix` external reviewer | `Error: max turns reached` after 35 minutes |
+| A claims-versus-code reviewer, first run | `429 Too Many Requests: Insufficient balance` on the provider account |
+| The same reviewer, second run | `response truncated by max_tokens` after 383,195 input tokens across 11 model calls |
+
+The first and third share a root cause: a 56-file, ~14,000-line diff is too large
+for one agent review pass. The second is a billing problem that happens to look
+like a review result.
+
+What worked was a **scoped** review: one agent, one surface (the Rust library), a
+bounded output budget, and an explicit instruction to report what it checked as
+well as what it found. It completed in 24 minutes and returned ten issues, seven
+of them real defects, all recorded as OPT-019 to OPT-025.
+
+The rule this suggests, and the reason it is written down here: **a review that
+fails for capacity reasons is not a review.** A gate that cannot tell the
+difference reports a clean pass on unreviewed code. When a reviewer cannot
+complete, the honest record says so.
 
 ## The oracle
 
