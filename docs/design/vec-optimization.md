@@ -73,22 +73,36 @@ Each row is a kernel that was reshaped, the shape it had, and what the change
 measured. Numbers are from `vecbench` on an Apple silicon machine with a warm
 cache, `--iters 4000 --levels 32` unless noted.
 
-| Kernel | What changed | Before | After | Verdict | Ledger |
-|--------|--------------|--------|-------|---------|--------|
-| `codec::stream_records` | check the last record first instead of scanning | 1979 ns | 16.4 ns | kept, **121x** | OPT-008 |
-| `cache::Publisher::mids_into` | flat side tables + a mask instead of an `if` | 3676.7 ns | 260.7 ns | kept, **14.1x** | OPT-002, OPT-013 |
-| `book::Levels::cumulative` | blocked three-pass prefix sum | 6.9 ns | 38.3 ns | **reverted**, the block was 5.5x slower | OPT-004 |
-| `book::Levels::top` | `zip` instead of an index loop | 13.3 ns | 13.2 ns | no effect, kept for readability | OPT-011 |
-| `codec::decode_batch` | none | 14586 ns / 4096 records | — | scalar, memory-bound | §5.1 |
-| `flow::Producer::push` | none | 3.6 ns | — | scalar, one record per call | §5.3 |
+| Kernel | What changed | Shipped | Compared with | Ratio | Verdict | Ledger |
+|--------|--------------|---------|---------------|-------|---------|--------|
+| `codec::stream_records` | check the last record first instead of scanning | 19.8 ns | 2018 ns | **102x faster** | kept | OPT-008 |
+| `cache::Publisher::mids_into` | flat side tables **and** a mask instead of an `if` | 246.6 ns | 3370 ns | **13.7x faster** | kept | OPT-002, OPT-005, OPT-013 |
+| `book::Levels::cumulative` | sequential loop, not a blocked three-pass prefix sum | 7.5 ns | 36.8 ns | **4.9x faster than the blocked form** | reverted | OPT-004 |
+| `book::Levels::top` | `zip` instead of an index loop | 13.3 ns | 13.9 ns | 1.04x, i.e. no difference | no effect | OPT-011 |
+| `codec::decode_batch` | none | 16581 ns / 4096 records | — | — | scalar, memory-bound | §5.1 |
+| `flow::Producer::push` | none | 4.1 ns | — | — | scalar, one record per call | §5.3 |
+
+**Read the ratio, not the nanosecond value.** Absolute timings on this machine
+drift by tens of percent with system load — `decode` has been measured at 14.6 µs
+and 20.3 µs for the same input on the same machine. A comparison taken in one
+`vecbench` run is meaningful; a nanosecond value quoted from a different run is
+not. The ratios above come from a single run of
+`rust/target/release/vecbench --iters 4000 --levels 32`.
+
+Reproduce any row with:
+
+```bash
+cargo build --release --manifest-path rust/Cargo.toml
+rust/target/release/vecbench --iters 4000 --levels 32
+```
 
 ### 4.1 The constant-time win that beat every vector version
 
 `codec::stream_records` answers "how many whole records does this buffer hold".
-The scan version walked all 4096 records of a 64 KiB read: 1979 ns. A buffer read
+The scan version walked all 4096 records of a 64 KiB read: 2018 ns. A buffer read
 from a socket cannot have a hole in the middle, so the only defect possible is a
 torn tail, and checking the **last** record answers the question in the common
-case. 16.4 ns.
+case. 19.8 ns.
 
 No amount of SIMD gets a scan to 121x. This is the finding worth carrying into any
 codebase: **before vectorizing a scan, ask whether the scan is needed.**
@@ -128,7 +142,7 @@ and neither was sufficient alone:
    put the two arms in different basic blocks. The loop vectorizer skipped it
    entirely. A mask — `-i64::from(bid != 0 && ask != 0)` combined with `and` —
    keeps the body in one block. Forty vector operations, and the measurement went
-   to 260.7 ns.
+   from 3676.7 ns to 260.7 ns.
 
 The lesson is in the ordering: measured after the layout change alone, the result
 looked like a 6% win and a wasted afternoon. Measured after both, it is 14.1x.
@@ -178,7 +192,7 @@ Measured cost: **3.6 ns** per push.
 
 ### 5.4 `book::Levels::cumulative` — a loop-carried dependency
 
-See §4.2. Measured cost of the shipped sequential form: **6.9 ns**.
+See §4.2. Measured cost of the shipped sequential form: **7.5 ns**.
 
 ## 6. Build settings that were considered
 
@@ -186,16 +200,22 @@ See §4.2. Measured cost of the shipped sequential form: **6.9 ns**.
 |---------|--------|-----|
 | `lto = "fat"`, `codegen-units = 1` | **on** | Cross-crate inlining across the workspace; costs build time, buys nothing measurable in these kernels but nothing else either. |
 | `-C target-cpu=native` | **not used** | The binaries are meant to run on the machine that built them, but a benchmark that only means something on one CPU is not a benchmark. Revisit if a deployment target is pinned. |
-| Profile-guided optimization | **not used** | `rust/scripts/pgo.sh` exists and documents the procedure. It needs `llvm-profdata` from `llvm-tools-preview` and a representative workload; `obsoak` is the obvious profile source. Parked until a kernel is identified that PGO would move. |
+| Profile-guided optimization | **measured, no effect** | `rust/scripts/pgo.sh` runs the full procedure: instrument, drive with `obsoak`, merge with `llvm-profdata`, rebuild with `-Cprofile-use`. On the kernels that matter it moved nothing measurable (ledger OPT-018). What it did do was expose a bug in the benchmark: the trained build reported a 1000-symbol snapshot at 16 ns, because batching made the call loop-invariant and the optimizer hoisted it. The script stays so the test is repeatable when a kernel is added that PGO might help. |
 | BOLT | **not used** | Not available for macOS. Relevant only if the Linux path becomes a deployment target. |
 | `std::simd` | **not used** | Nightly only. The one kernel where it would pay is the prefix sum in §4.2, and the sequential form already runs at one instruction per element. |
 
 ## 7. How to re-run everything
 
 ```bash
-make rust-vec-audit     # the oracle: which kernels emitted vector ops
-make rust-bench         # the kernel measurements
+make rust-vec-audit                      # the oracle: which kernels emitted vector ops
 sh rust/scripts/vec-audit.sh --verbose   # and show the vector instructions
+
+cargo build --release --manifest-path rust/Cargo.toml
+rust/target/release/vecbench --iters 4000 --levels 32   # the kernel measurements
+rust/target/release/vecbench --json                     # the same, machine-readable
+
+sh rust/scripts/opt-record.sh mids "a hypothesis"       # append a measurement to the ledger
+sh rust/scripts/pgo.sh --symbols 500 --ticks 50         # the profile-guided build
 ```
 
 ## 8. Cross-references

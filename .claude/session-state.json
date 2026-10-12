@@ -2,5 +2,7 @@
   "last_skill": "drive",
   "task_slug": "rust-rewrite",
   "task_status": "planning",
-  "project_slug": "rust-rewrite"
+  "project_slug": "rust-rewrite",
+  "delivery_id": "cce6977a-d538-4d81-9694-f4d5bd1c6f57",
+  "delivery_id_skill": "review2fix"
 }

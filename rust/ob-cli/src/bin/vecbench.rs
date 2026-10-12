@@ -25,7 +25,6 @@
 //! | Kernel | What it does | Where it runs |
 //! |--------|--------------|---------------|
 //! | `decode` | 72-byte records to `Msg` | every byte read from a socket |
-//! | `validate` | how many whole valid records a buffer holds | every socket read |
 //! | `top` | copy the best `n` levels of a side | every terminal frame, every snapshot |
 //! | `cumulative` | prefix sum of sizes | every depth-weighted price |
 //! | `walk` | take `size` from the levels | every simulated execution |
@@ -121,9 +120,6 @@ fn run() -> CliResult {
     if wanted(&only, "decode") {
         results.push(bench_decode(&wire, iters));
     }
-    if wanted(&only, "validate") {
-        results.push(bench_validate(&wire, iters));
-    }
     if wanted(&only, "top") {
         results.push(bench_top(&side, &prices, &sizes, levels, iters));
     }
@@ -203,6 +199,20 @@ fn consume_levels(values: &[Level]) -> u64 {
 /// resolution, which is the only way a difference between two fast kernels is
 /// real rather than noise.
 ///
+/// # Why the caller must also black-box the input
+///
+/// Batching introduces a failure the single-call form cannot have. A kernel
+/// whose input does not change between the calls in a batch is a loop-invariant
+/// computation, and an optimizer may hoist it out of the batch and reuse the
+/// result — the call is still made, because the result is passed through
+/// `black_box`, but it is made *once*. A profile-guided build did exactly that
+/// and reported a 1000-symbol snapshot at 16 nanoseconds, which is 0.016
+/// nanoseconds per symbol and impossible.
+///
+/// So every batched caller passes its input through
+/// [`std::hint::black_box`] inside the closure, which tells the optimizer the
+/// input is opaque and may differ on each call. Ledger: OPT-017.
+///
 /// A batch of one is exactly [`time`](time) and is what the slow kernels use.
 fn time_batched<T>(iters: u64, batch: u64, mut f: impl FnMut() -> T) -> (Histogram, T) {
     let batch = batch.max(1);
@@ -219,6 +229,16 @@ fn time_batched<T>(iters: u64, batch: u64, mut f: impl FnMut() -> T) -> (Histogr
         hist.record(clock::now_ns().saturating_sub(start) / batch);
     }
     (hist, last)
+}
+
+/// Mark an input opaque, so a batched call cannot be hoisted out of its batch.
+///
+/// See [`time_batched`]. Named rather than written inline because the reason is
+/// not obvious at the call site and this is the second thing a reader needs to
+/// know about the batched timer.
+#[inline]
+fn opaque<T>(value: T) -> T {
+    std::hint::black_box(value)
 }
 
 /// Time `iters` calls of `f`, returning the per-iteration distribution.
@@ -277,23 +297,10 @@ fn bench_decode(wire: &[u8], iters: u64) -> Result_ {
     summarise("decode", &hist, iters, Some((base, iters)), n ^ bn)
 }
 
-/// Count whole valid records at the start of a buffer.
-fn bench_validate(wire: &[u8], iters: u64) -> Result_ {
-    let (hist, n) = time(iters, || codec::valid_prefix_len(wire));
-    let (base, bn) = time(iters, || baseline_validate(wire));
-    summarise(
-        "validate",
-        &hist,
-        iters,
-        Some((base, iters)),
-        n as u64 + bn as u64,
-    )
-}
-
 fn bench_top(side: &Levels, prices: &[i64], sizes: &[i64], levels: usize, iters: u64) -> Result_ {
     let mut out = vec![Level::EMPTY; levels];
     let (hist, n) = time_batched(iters, FAST_BATCH, || {
-        let written = side.top(levels, &mut out);
+        let written = opaque(side).top(levels, opaque(&mut out));
         (written as u64) ^ consume_levels(&out[..written])
     });
     let (base, bn) = time_batched(iters, FAST_BATCH, || {
@@ -306,7 +313,7 @@ fn bench_top(side: &Levels, prices: &[i64], sizes: &[i64], levels: usize, iters:
 fn bench_cumulative(side: &Levels, sizes: &[i64], levels: usize, iters: u64) -> Result_ {
     let mut out = vec![0i64; levels];
     let (hist, n) = time_batched(iters, FAST_BATCH, || {
-        let written = side.cumulative(levels, &mut out);
+        let written = opaque(side).cumulative(levels, opaque(&mut out));
         (written as u64) ^ consume(&out[..written])
     });
     let (base, bn) = time_batched(iters, FAST_BATCH, || {
@@ -319,7 +326,8 @@ fn bench_cumulative(side: &Levels, sizes: &[i64], levels: usize, iters: u64) -> 
 fn bench_walk(side: &Levels, iters: u64) -> Result_ {
     let request = E8;
     let (hist, n) = time_batched(iters, FAST_BATCH, || {
-        side.fill(request)
+        opaque(side)
+            .fill(opaque(request))
             .map(|f| (f.filled as u64) ^ (f.notional_e8 as u64) ^ (f.levels_used as u64))
             .unwrap_or(0)
     });

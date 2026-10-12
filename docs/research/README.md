@@ -110,3 +110,22 @@ Append-only. Once a research file is written and referenced from a plan archive'
 Stale-research detection (research file >90 days old, never referenced by any `docs/plans/archive/*.md`) is surfaced by `/mindcoachlabs:health-check` for review — never auto-archived.
 
 See `docs/HARNESS.md` §2.7 for governance.
+
+## Records in this directory
+
+| File | Question |
+|------|----------|
+| `2026-09-21-orderbook-lab.md` | How to build the C++/Python lab: bus, WAL, feed, TUI, without a broker or the OTel SDK on the hot path. |
+| `2026-09-21-book-snapshot.md` | How a depth5 picture should replace the book rather than merge into it. |
+| `2026-09-21-tui-red-bids.md` | The terminal's colour and refresh behaviour. |
+| `2026-10-11-mac-run-path.md` | Making the lab run on macOS. |
+| `2026-10-12-run-docs-audit.md` | Closing the run-path documentation gaps. |
+| `2026-10-12-rust-cache-architecture.md` | Per-symbol book structures, sharding and interning at a thousand symbols, lock-free queues for a cross-process mmap ring, and how backpressure is represented in industry practice. |
+| `2026-10-12-latency-slippage-measurement.md` | Clock sources on Apple silicon and Linux, tail quantiles and coordinated omission, the standard slippage and markout definitions, and the pitfalls that invalidate a latency number. |
+| `2026-10-12-rust-vectorization.md` | How to observe LLVM's vectorization decisions on stable rustc, what defeats auto-vectorization in safe Rust, and what LLVM will and will not vectorize. |
+
+The three `2026-10-12-rust-*` records were produced by three parallel deep-research
+runs (15 agents) and each is a cross-checked report with its sources. Their
+findings are applied in `docs/design/ticker-cache.md` and
+`docs/design/vec-optimization.md`, and the measurements that came out of applying
+them are in `docs/optimization/ledger.jsonl`.

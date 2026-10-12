@@ -1,25 +1,59 @@
 # Verify Step Registry
 
-> Status: stub — populate after the first verify run or copy from a working project
+> Last updated: October 2026
 
-## Intended Structure
+The checks that must pass before a change to this repository is committed. Each
+entry is one command with an expected result, so a verify run is a list of
+outcomes rather than a judgement.
 
-Each verify step will be one entry with these fields:
+Run everything with:
 
-- `id`: short-kebab unique identifier (e.g., `tests-run`, `lint-clean`).
-- `description`: one-line human-readable summary.
-- `type`: one of `shell-command`, `file-diff`, `data-check`, `compliance-rule`.
-- `applies_when`: predicate for whether this step runs (e.g., `always`, `python_changed`, `plugin_changed`, `skill_modified`).
+```bash
+make test && make rust-test && make rust-vec-audit && make e2e && make rust-e2e
+```
 
-### Type-specific contracts
+## Steps
 
-| Type | Fields | Example |
-|------|--------|---------|
-| `shell-command` | `command`, `expected_exit`, `output_regex`, `timeout_s` | Run `npm test`, expect exit 0 |
-| `file-diff` | `pattern`, `scope`, `must_match` | Grep changed files for `console.log`, must NOT match |
-| `data-check` | `predicate`, `args` | Named function in `verify_runner.py` |
-| `compliance-rule` | `constraint_section`, `assertion`, `evidence_check` | Link a CONSTRAINTS §X.Y to a programmatic check |
+| id | description | type | applies_when | command | expected |
+|----|-------------|------|--------------|---------|----------|
+| `cpp-core-tests` | The C++ book, ring and WAL checks | shell-command | always | `make test` | exit 0; prints `ok` then `OK` |
+| `rust-unit-tests` | The Rust library and CLI tests | shell-command | always | `cargo test --manifest-path rust/Cargo.toml` | exit 0; 161 + 12 tests pass |
+| `rust-format` | Formatting is normalized | shell-command | rust changed | `cargo fmt --all --manifest-path rust/Cargo.toml --check` | exit 0 |
+| `rust-lint` | Clippy with warnings denied | shell-command | rust changed | `cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings` | exit 0 |
+| `cpp-e2e` | The fixture reaches the C++ book and the log | shell-command | always | `make e2e` | exit 0; `bids=` and `asks=` non-zero |
+| `rust-e2e` | The fixture reaches the Rust book and the log | shell-command | rust changed | `make rust-e2e` | exit 0; `bids=` and `asks=` non-zero |
+| `interop` | Each implementation reads the other's ring and log | shell-command | wire format or bus changed | `make rust-interop` | exit 0; two `PASS:` lines |
+| `vec-audit` | The kernels that should vectorize still do | shell-command | hot kernel changed | `make rust-vec-audit` | exit 0; `PASS every required kernel emitted vector operations` |
+| `soak` | The cache holds a thousand symbols without loss | data-check | cache changed | `make rust-soak` | exit 0; `dropped=0` and `evicted=0` |
+| `wire-format` | The 72-byte layout matches the Python packer | shell-command | wire format changed | `cargo test --manifest-path rust/Cargo.toml codec::` | exit 0 |
+| `prod-gate` | A prod config is refused without the environment variable | shell-command | config changed | `cargo test --manifest-path rust/Cargo.toml config::tests::a_prod_config_is_refused` | exit 0 |
+| `dev-gate` | A dev config claiming orders are possible is refused | shell-command | config changed | `cargo test --manifest-path rust/Cargo.toml config::tests::a_dev_config_that_claims_orders` | exit 0 |
+| `ledger-schema` | Every ledger line carries the documented fields | data-check | ledger changed | `python3 -c "import json,pathlib; [json.loads(l) for l in pathlib.Path('docs/optimization/ledger.jsonl').read_text().splitlines() if l.strip()]"` | exit 0 |
+| `docs-links` | No design doc references a file that does not exist | file-diff | docs changed | `grep -oE '`(docs|rust|python)/[A-Za-z0-9_./-]+`' docs/design/*.md \| sort -u` | every path exists |
+
+## Rules
+
+1. **A performance claim carries its command.** Any change that reports a number
+   adds a `docs/optimization/ledger.jsonl` line whose `evidence` field is the
+   command that produced it. See `docs/optimization/README.md`.
+2. **The wire format is one commit.** A change to `include/ob/msg.hpp`,
+   `python/feed_adapter.py`'s `MSG_FMT` or `rust/ob/src/codec.rs` changes all
+   three, and `make rust-interop` proves they still agree.
+3. **The audit is the oracle for vectorization.** "It should vectorize now" is not
+   a result; `make rust-vec-audit` is. A kernel that is expected to stay scalar is
+   listed in the audit's output with its reason.
+4. **A measured regression is a valid outcome.** Two ledger entries are
+   `reverted` and two are `no-effect`. Recording them is part of the check.
 
 ## Dispatch order
 
-Steps run in declared order. The orchestrator collects `{id, status: pass|fail|skip, duration_ms, output_excerpt}` per step and prints a JSON summary to stdout.
+Steps run in the order above. A failure at `rust-e2e` does not stop `interop` from
+being reported, because the two diagnose different things: one is the pipeline,
+the other is the format.
+
+## Cross-references
+
+- `docs/CONSTRAINTS.md` §8 — testing conventions
+- `docs/design/vec-optimization.md` — the kernel measurements and the oracle
+- `docs/optimization/README.md` — the ledger schema
+- `docs/runbooks/rust-build-failures.md` — what to do when a step fails
