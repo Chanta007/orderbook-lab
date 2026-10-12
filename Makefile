@@ -1,11 +1,15 @@
 # WALKTHROUGH
 # CI and the README use this file, not CMake.
-# `make test` builds test_core and runs it, then the Python frame tests.
-# Neither opens a socket.
+# `make test` builds test_core and runs it, then the Python tests.
+# Nothing in it opens a network connection. The process tests bind
+# 127.0.0.1 on an ephemeral port to check the port guard.
 # `make e2e` builds every binary, starts feedd and the adapter on the
 # fixture file, waits one second, and runs headless. headless exits 0
 # only when both sides of the book and the WAL are non-empty.
 # `make start` is the live window. It needs a network and a terminal.
+# start refuses when an instance is already running, and stop waits for
+# each process to exit and reports any that did not. See
+# docs/runbooks/port-already-in-use.md when a bind failure is reported.
 CXX ?= c++
 CXXFLAGS ?= -std=c++17 -O2 -pthread -Iinclude -Wall -Wextra
 LDFLAGS ?= -pthread
@@ -52,4 +56,4 @@ stop:
 	python3 python/obctl.py stop --config config/dev.json
 
 clean:
-	rm -rf $(BUILD) var/dev var/run
+	rm -rf $(BUILD) var/dev var/prod var/run
