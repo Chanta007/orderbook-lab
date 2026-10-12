@@ -211,6 +211,13 @@ impl Histogram {
         for (i, &c) in self.counts.iter().enumerate() {
             seen += c;
             if seen >= target {
+                // The overflow bucket holds everything at or above
+                // `MAX_TRACKED_NS`, so its reported upper bound would be below
+                // the samples in it. The exact maximum is the honest answer
+                // there, and it is the one value the bucket cannot estimate.
+                if i == BUCKETS - 1 && self.overflow() > 0 {
+                    return self.max;
+                }
                 return bucket_upper(i);
             }
         }
@@ -336,6 +343,14 @@ impl Stages {
     }
 }
 
+/// The most samples one record's coordinated-omission backfill will insert.
+///
+/// A bound exists because the correction's loop is otherwise proportional to the
+/// observed duration divided by the expected interval, and an input that is not a
+/// duration at all makes that ratio enormous. 4096 samples is far more than any
+/// real stall needs and small enough that the work is bounded by a constant.
+pub const MAX_BACKFILL_SAMPLES: u64 = 4096;
+
 /// A stage-1 reading larger than this is treated as a bad stamp, not latency.
 ///
 /// The sender and the daemon read the same clock on the same host, so a
@@ -363,6 +378,10 @@ pub struct LatencyTracker {
     stamped: u64,
     unstamped: u64,
     implausible: u64,
+    /// The total `record` last accepted, for the coordinated-omission backfill.
+    last_classified_total: u64,
+    /// Records whose backfill hit [`MAX_BACKFILL_SAMPLES`].
+    backfill_truncated: u64,
 }
 
 impl LatencyTracker {
@@ -389,11 +408,13 @@ impl LatencyTracker {
             }
             None => 0,
         };
-        self.total.record(
-            stage_one
-                .saturating_add(stages.recv_to_publish_ns)
-                .saturating_add(stages.publish_to_seen_ns),
-        );
+        let classified = stage_one
+            .saturating_add(stages.recv_to_publish_ns)
+            .saturating_add(stages.publish_to_seen_ns);
+        self.total.record(classified);
+        // Remembered so `record_with_expected_interval` backfills from the same
+        // figure. See the note there.
+        self.last_classified_total = classified;
     }
 
     /// Record what the **publishing** side sees: the sender's stamp, and how
@@ -411,8 +432,10 @@ impl LatencyTracker {
             }
             None => 0,
         };
-        self.total
-            .record(ingress.saturating_add(recv_to_publish_ns));
+        let classified = ingress.saturating_add(recv_to_publish_ns);
+        self.total.record(classified);
+        // Remembered so `backfill` starts from the same figure this call used.
+        self.last_classified_total = classified;
     }
 
     /// Record what a **subscribing** side sees: how long the event waited, and
@@ -481,18 +504,65 @@ impl LatencyTracker {
     /// [`LatencyTracker::record`].
     pub fn record_with_expected_interval(&mut self, stages: Stages, expected_interval_ns: u64) {
         self.record(stages);
+        self.backfill(expected_interval_ns);
+    }
+
+    /// [`LatencyTracker::record_source`] with the coordinated-omission
+    /// correction applied.
+    ///
+    /// The publisher's entry point when a record interval is configured. It
+    /// records the same stages `record_source` does and then charges the samples
+    /// a stall swallowed.
+    pub fn record_source_with_expected_interval(
+        &mut self,
+        send_to_recv_ns: Option<u64>,
+        recv_to_publish_ns: u64,
+        expected_interval_ns: u64,
+    ) {
+        self.record_source(send_to_recv_ns, recv_to_publish_ns);
+        self.backfill(expected_interval_ns);
+    }
+
+    /// Charge the samples a stall swallowed.
+    ///
+    /// Starts from the total the last `record_source`, `record_sink` or `record`
+    /// accepted, and never from the raw sum of the arguments: backfilling from
+    /// the raw sum would add a stage 1 that was just rejected as implausible, and
+    /// one two-second bad stamp would insert tens of thousands of multi-second
+    /// samples and set the maximum to that stamp.
+    fn backfill(&mut self, expected_interval_ns: u64) {
         if expected_interval_ns == 0 {
             return;
         }
-        let observed = stages.total_ns();
+        let observed = self.last_classified_total;
         if observed <= expected_interval_ns {
             return;
         }
         let mut missing = observed - expected_interval_ns;
-        while missing >= expected_interval_ns {
+        let mut inserted = 0u64;
+        while missing >= expected_interval_ns && inserted < MAX_BACKFILL_SAMPLES {
             self.total.record(missing);
             missing -= expected_interval_ns;
+            inserted += 1;
         }
+        // The loop is bounded on purpose. An unbounded one turns a nonsense
+        // duration into a hang: a caller that passes 0 where a timestamp belongs
+        // makes the observed total the whole monotonic clock, and at a 100 us
+        // interval that is ten billion iterations inside a publish call. The
+        // truncation is counted rather than hidden, so a caller can tell that its
+        // input was absurd.
+        if inserted >= MAX_BACKFILL_SAMPLES {
+            self.backfill_truncated += 1;
+        }
+    }
+
+    /// How many records had their coordinated-omission backfill truncated.
+    ///
+    /// Non-zero means a caller handed this tracker a duration far larger than
+    /// any stall it should have seen, which is a bug in the caller or a clock
+    /// that jumped. Either way the number says so instead of the process hanging.
+    pub fn backfill_truncated(&self) -> u64 {
+        self.backfill_truncated
     }
 
     /// The stage-1 distribution.
@@ -542,6 +612,8 @@ impl LatencyTracker {
         self.stamped = 0;
         self.unstamped = 0;
         self.implausible = 0;
+        self.last_classified_total = 0;
+        self.backfill_truncated = 0;
     }
 }
 
@@ -811,6 +883,25 @@ mod tests {
             100_000,
         );
         assert_eq!(t.total().count(), 1, "no samples were missing");
+    }
+
+    #[test]
+    fn an_absurd_duration_truncates_instead_of_hanging() {
+        // The regression: a caller that passed 0 where a timestamp belongs made
+        // the observed total the whole monotonic clock, and the backfill loop
+        // tried ten billion iterations inside one publish call.
+        let mut t = LatencyTracker::new();
+        t.record_source_with_expected_interval(Some(0), 1_400_000_000_000_000, 100_000);
+        assert!(
+            t.backfill_truncated() > 0,
+            "the absurd input was not noticed"
+        );
+        // Bounded work: the one real sample plus the capped backfill.
+        assert!(
+            t.total().count() <= MAX_BACKFILL_SAMPLES + 1,
+            "count {} exceeded the bound",
+            t.total().count()
+        );
     }
 
     #[test]

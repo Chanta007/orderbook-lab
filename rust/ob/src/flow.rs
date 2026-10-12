@@ -102,8 +102,15 @@ struct Shared<T: Copy> {
     slots: UnsafeCell<Box<[MaybeUninit<T>]>>,
     /// Next position to write. Monotonic; the slot index is this masked.
     head: AtomicU64,
-    /// Next position to read.
+    /// Next position to read. The consumer claims a slot by advancing this.
     tail: AtomicU64,
+    /// Slot sequences. `seq[p & mask]` holds `p + 1` once position `p` has been
+    /// written, and an older lap's value until then.
+    ///
+    /// The consumer checks it before and after copying a slot, which is what
+    /// detects a slot the producer overwrote mid-copy. See the note on
+    /// [`Consumer::pop`].
+    seq: UnsafeCell<Box<[AtomicU64]>>,
     /// Records evicted to make room.
     evicted: AtomicU64,
     /// Records refused.
@@ -116,6 +123,8 @@ struct Shared<T: Copy> {
     credit: AtomicU32,
     /// The mask for the slot index.
     mask: u64,
+    /// Set once a push has ever had to reuse a slot. Used by the tests.
+    reused: AtomicU64,
 }
 
 // SAFETY: this is the SPSC contract. `Shared` is reachable from exactly two
@@ -163,6 +172,12 @@ pub fn ring<T: Copy>(capacity: usize, policy: DropPolicy) -> (Producer<T>, Consu
     slots.resize_with(capacity, || MaybeUninit::uninit());
     let shared = Arc::new(Shared {
         slots: UnsafeCell::new(slots.into_boxed_slice()),
+        seq: UnsafeCell::new(
+            (0..capacity)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
         head: AtomicU64::new(0),
         tail: AtomicU64::new(0),
         evicted: AtomicU64::new(0),
@@ -171,6 +186,7 @@ pub fn ring<T: Copy>(capacity: usize, policy: DropPolicy) -> (Producer<T>, Consu
         high_water: AtomicU64::new(0),
         credit: AtomicU32::new(0),
         mask: (capacity - 1) as u64,
+        reused: AtomicU64::new(0),
     });
     (
         Producer {
@@ -240,6 +256,15 @@ impl<T: Copy> Producer<T> {
         self.shared.refused.load(Ordering::Relaxed)
     }
 
+    /// How many pushes had to reuse a slot. Zero unless the queue filled.
+    ///
+    /// The eviction path is the one the slot sequence exists for, so a test that
+    /// claims to cover it has to show the path was reached.
+    #[inline]
+    pub fn reused(&self) -> u64 {
+        self.shared.reused.load(Ordering::Relaxed)
+    }
+
     /// Offer one record to the queue.
     ///
     /// Never blocks for longer than the policy allows, and always leaves the
@@ -291,11 +316,14 @@ impl<T: Copy> Producer<T> {
                     continue;
                 }
                 DropPolicy::DropOldest => {
-                    // Move the read position past the record being evicted
-                    // *before* overwriting its slot, so a consumer that loses
-                    // this race re-reads the tail and does not read a slot that
-                    // is being written. If the compare-and-exchange fails, the
-                    // consumer got there first: retry the whole decision.
+                    // Claim the oldest record for eviction. The compare-and-
+                    // exchange is what makes this safe against a consumer that
+                    // claimed the same slot first: if it fails, the consumer won
+                    // and this loop retries from the new tail. A consumer that is
+                    // mid-copy is handled by the slot sequence, not by waiting:
+                    // the producer must never be held up by a slow subscriber,
+                    // which is the whole point of this policy.
+                    self.shared.reused.fetch_add(1, Ordering::Relaxed);
                     if self
                         .shared
                         .tail
@@ -335,6 +363,14 @@ impl<T: Copy> Producer<T> {
             let base = (*self.shared.slots.get()).as_mut_ptr();
             base.add(index).write(MaybeUninit::new(value));
         }
+        // Publish the payload. A reader that copied a mix of two laps sees this
+        // change and rejects the copy. No invalidating store is needed first:
+        // the sequence for position `p` is `p + 1`, which no earlier write to
+        // this slot can have produced, so a stale slot never looks current.
+        unsafe {
+            let seq = (*self.shared.seq.get()).as_ptr();
+            (*seq.add(index)).store(position + 1, Ordering::Release);
+        }
     }
 }
 
@@ -371,16 +407,44 @@ impl<T: Copy> Consumer<T> {
                 return None;
             }
             let index = (tail & self.shared.mask) as usize;
-            // SAFETY: the acquire load of `head` above observed `head > tail`,
-            // and the producer release-stores `head` only after writing the
-            // slot for `tail`, so the slot is initialised and this read is
-            // ordered after that write. The compare-and-exchange below claims
-            // the slot; if it fails, another thread moved the tail and this
-            // value is discarded without being read out.
+            // The slot's own sequence is the guard. `seq == tail + 1` means this
+            // slot holds the record for `tail`. If the producer overwrites the
+            // slot while this copy is in flight, the sequence becomes a later
+            // position's and the second read below disagrees, so the copy is
+            // discarded. Without this the `DropOldest` path could hand back a mix
+            // of two laps' bytes, which is a data race and was undefined
+            // behaviour.
+            //
+            // SAFETY: `index` is masked to the capacity, and `self` is the only
+            // consumer, so the load of the sequence is ordered before the payload
+            // copy and the producer's release store is what makes the payload
+            // visible.
+            let before = unsafe {
+                let seq = (*self.shared.seq.get()).as_ptr();
+                (*seq.add(index)).load(Ordering::Acquire)
+            };
+            if before != tail + 1 {
+                // Either the producer is mid-write, or this is a stale slot from
+                // an earlier lap. Both mean "look again".
+                std::hint::spin_loop();
+                continue;
+            }
+            // SAFETY: the sequence above matched, so the payload for `tail` was
+            // written and released before this load.
             let value = unsafe {
                 let base = (*self.shared.slots.get()).as_ptr();
                 (*base.add(index)).assume_init()
             };
+            // SAFETY: as above.
+            let after = unsafe {
+                let seq = (*self.shared.seq.get()).as_ptr();
+                (*seq.add(index)).load(Ordering::Acquire)
+            };
+            if after != before {
+                // The producer overwrote the slot during the copy. The value just
+                // read is a mix of two records and is dropped.
+                continue;
+            }
             if self
                 .shared
                 .tail
@@ -571,6 +635,60 @@ mod tests {
         }
         assert_eq!(c.lag(), 5);
         assert_eq!(p.len(), 5);
+    }
+
+    #[test]
+    fn an_eviction_cannot_hand_back_a_mixed_record() {
+        // The regression the independent review found. A consumer copying a slot
+        // while the producer evicts it used to read a mix of two records: the
+        // sequence field of the old one and the payload of the new one. The
+        // slot's own sequence now catches it.
+        //
+        // The test drives the case that makes the race reachable — a full queue
+        // and a producer that keeps pushing while the consumer reads — and
+        // asserts the invariant that matters: every value returned is one that
+        // was pushed, and the values are non-decreasing.
+        let (mut producer, mut consumer) = ring::<(u64, u64, u64, u64)>(4, DropPolicy::DropOldest);
+        let writer = std::thread::spawn(move || {
+            for i in 0..200_000u64 {
+                // Four words so the copy spans several stores, which is what
+                // makes a torn read observable.
+                producer.push((i, i ^ 0xAAAA, i.wrapping_mul(3), i.wrapping_add(7)));
+            }
+            producer
+        });
+
+        let mut seen = 0u64;
+        let mut last: Option<u64> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match consumer.pop() {
+                Some((a, b, c, d)) => {
+                    // Every word must belong to the same push.
+                    assert_eq!(b, a ^ 0xAAAA, "torn record: first word {a}, second {b}");
+                    assert_eq!(c, a.wrapping_mul(3), "torn record at word three: {a}");
+                    assert_eq!(d, a.wrapping_add(7), "torn record at word four: {a}");
+                    if let Some(previous) = last {
+                        assert!(a > previous, "out of order: {previous} then {a}");
+                    }
+                    last = Some(a);
+                    seen += 1;
+                }
+                None => {
+                    if last.is_some_and(|v| v == 199_999) {
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "stalled at {seen}");
+                    std::thread::yield_now();
+                }
+            }
+        }
+        let producer = writer.join().expect("writer thread");
+        assert!(
+            producer.reused() > 0,
+            "the test never reached the eviction path"
+        );
+        assert!(seen > 0);
     }
 
     #[test]

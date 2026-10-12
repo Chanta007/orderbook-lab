@@ -184,8 +184,15 @@ pub struct Event {
     /// Carried so that a subscriber can report the **end-to-end** time without a
     /// second clock read or a second measurement of the same work.
     pub ingress_ns: u64,
-    /// The sender's stamp, when the sender wrote one.
-    pub sender_stamp_ns: Option<u64>,
+    /// Stage 1 as a **duration**: the sender's stamp to the daemon's read.
+    ///
+    /// A duration, not the stamp. The first version carried the raw monotonic
+    /// stamp and handed it to the subscriber's tracker, which treats its argument
+    /// as a duration and compares it against the plausibility ceiling. A stamp is
+    /// an absolute reading that passes one second of uptime immediately, so every
+    /// stamped event was counted as implausible, stage 1 was dropped, and the
+    /// end-to-end figure silently became stages 2 and 3.
+    pub stage1_ns: Option<u64>,
 }
 
 impl Event {
@@ -209,7 +216,7 @@ impl Event {
             top: TopOfBook::default(),
             published_ns: 0,
             ingress_ns: 0,
-            sender_stamp_ns: None,
+            stage1_ns: None,
         }
     }
 }
@@ -334,8 +341,16 @@ impl Publisher {
     }
 
     /// Intern a symbol that is not on the wire yet, such as a synthetic one.
+    ///
+    /// Grows the snapshot lane as well as the symbol table. The first version
+    /// grew only the table, so a caller that pre-registered symbols and then
+    /// asked for a snapshot sliced the side tables past their end and panicked.
+    /// Pre-registering is the documented use of this method, so the panic was
+    /// reachable from the documented path.
     pub fn intern(&mut self, symbol: &[u8; 8]) -> Result<SymbolId> {
-        self.symbols.intern(symbol)
+        let id = self.symbols.intern(symbol)?;
+        self.ensure_touch_capacity(id.index());
+        Ok(id)
     }
 
     /// Publish one record.
@@ -400,7 +415,7 @@ impl Publisher {
         // Stage 1 is a duration, so it is the read time minus the sender's
         // stamp. Recording the stamp itself would be an absolute time of day
         // masquerading as a latency, and every percentile would be nonsense.
-        let send_to_recv_ns = sender_stamp_ns.map(|s| t_recv_ns.saturating_sub(s));
+        let stage1_ns = sender_stamp_ns.map(|s| t_recv_ns.saturating_sub(s));
         let event = Event {
             symbol,
             seq: m.seq,
@@ -408,7 +423,7 @@ impl Publisher {
             top: TopOfBook::of(&books[slot]),
             published_ns,
             ingress_ns: published_ns.saturating_sub(t_recv_ns),
-            sender_stamp_ns,
+            stage1_ns,
         };
 
         // Fan out. The producer never waits: what happens when a queue is full
@@ -427,8 +442,20 @@ impl Publisher {
             // Stages 1 and 2 only: stage 3 belongs to each subscriber, and
             // measuring it here would report the publisher's own speed as if it
             // were the subscriber's.
-            self.latency
-                .record_source(send_to_recv_ns, published_ns.saturating_sub(t_recv_ns));
+            // The expected interval is passed through, so the configured
+            // coordinated-omission correction actually runs. It was read from
+            // the config, stored on the publisher, and never used: the option was
+            // documented and dead.
+            let ingress = published_ns.saturating_sub(t_recv_ns);
+            if self.cfg.expected_interval_ns == 0 {
+                self.latency.record_source(stage1_ns, ingress);
+            } else {
+                self.latency.record_source_with_expected_interval(
+                    stage1_ns,
+                    ingress,
+                    self.cfg.expected_interval_ns,
+                );
+            }
         }
         Outcome::Applied(applied)
     }
@@ -557,7 +584,11 @@ impl Publisher {
             // from it for a crossed book. `docs/optimization/ledger.jsonl` records
             // both the change that worked and the one that did not.
             let mask = -i64::from(bid != 0 && ask != 0);
-            *slot = mask & (bid + (ask - bid) / 2);
+            // The ordered form, the same one `Book::mid_e8` uses, so the
+            // snapshot lane and the per-book accessor cannot disagree by a unit
+            // on a crossed book.
+            let (lo, hi) = if bid <= ask { (bid, ask) } else { (ask, bid) };
+            *slot = mask & (lo + (hi - lo) / 2);
         }
         written
     }
@@ -676,7 +707,9 @@ impl Subscriber {
         // for every event: a subscriber that is being starved is exactly the one
         // whose numbers matter.
         self.latency
-            .record_sink(event.sender_stamp_ns, event.ingress_ns, waited);
+            // `event.stage1_ns` is already a duration. Passing the raw stamp
+            // here was the bug described on the field.
+            .record_sink(event.stage1_ns, event.ingress_ns, waited);
         self.pressure.sample(
             now,
             Sample {
@@ -1340,6 +1373,99 @@ mod tests {
         cache.publisher.publish(&mut m, 0);
         assert_eq!(cache.publisher.stats().refused, 1, "credit was enough");
         assert_eq!(cache.subscribers[0].pending(), 2);
+    }
+
+    #[test]
+    fn pre_registering_symbols_does_not_leave_the_snapshot_lane_short() {
+        // The regression: `intern` grew the symbol table and not the side
+        // tables, so a caller that pre-registered and then snapshotted sliced
+        // past the end and panicked. Pre-registering is `intern`'s documented
+        // use, so the panic was reachable from the documented path.
+        let mut cache = build(cfg(1));
+        for i in 0..64 {
+            let name = format!("P{i:06}");
+            let mut wire = [0u8; 8];
+            wire[..name.len()].copy_from_slice(name.as_bytes());
+            cache.publisher.intern(&wire).expect("intern");
+        }
+        let mut out = vec![0i64; 128];
+        let written = cache.publisher.mids_into(&mut out);
+        assert_eq!(written, 64, "the lane must cover every interned symbol");
+        assert!(out[..64].iter().all(|&v| v == 0), "nothing is priced yet");
+    }
+
+    #[test]
+    fn a_stamped_record_reports_stage_one_as_a_duration() {
+        // The regression: the subscriber's tracker was handed the raw monotonic
+        // stamp and compared it against the plausibility ceiling. A stamp passes
+        // one second of uptime immediately, so every stamped event was counted
+        // implausible, stage 1 was dropped, and the end-to-end figure silently
+        // became stages 2 and 3.
+        let mut cache = build(cfg(1));
+        let now = clock::now_ns();
+        let mut m = depth(Side::Bid, 100, 1);
+        m.set_symbol("BTCUSDT");
+        m.set_stamp_ns(now.saturating_sub(5_000));
+        cache.publisher.publish(&mut m, now);
+
+        let mut out = [Event::placeholder(); 1];
+        assert_eq!(cache.subscribers[0].drain(&mut out), 1);
+        let sink = cache.subscribers[0].latency();
+        assert_eq!(
+            sink.implausible(),
+            0,
+            "a stamp is not an implausible duration"
+        );
+        assert_eq!(sink.stamped(), 1);
+        // The event carries a duration, not a stamp.
+        assert!(out[0].stage1_ns.is_some_and(|d| d >= 5_000));
+        // And the end-to-end figure is larger than stage 2 alone.
+        assert!(sink.total().max() >= 5_000);
+    }
+
+    #[test]
+    fn the_snapshot_lane_agrees_with_the_per_book_accessor() {
+        // A crossed book with an odd spread is where the ordered and unordered
+        // midpoint differ by a unit.
+        let mut cache = build(cfg(1));
+        let mut bid = depth(Side::Bid, 100, 1);
+        bid.set_symbol("BTCUSDT");
+        cache.publisher.publish(&mut bid, 0);
+        let mut ask = depth(Side::Ask, 99, 1);
+        ask.set_symbol("BTCUSDT");
+        cache.publisher.publish(&mut ask, 0);
+
+        let id = cache.publisher.symbols().lookup(&sym("BTCUSDT")).unwrap();
+        let mut out = vec![0i64; 8];
+        cache.publisher.mids_into(&mut out);
+        assert_eq!(
+            out[id.index()],
+            cache.publisher.mid_e8(id).expect("mid"),
+            "the lane and the accessor must not disagree"
+        );
+    }
+
+    #[test]
+    fn a_configured_interval_actually_reaches_the_tracker() {
+        // The regression: `expected_interval_ns` was read from the config,
+        // stored, and never used, so the documented correction never ran.
+        let mut cache = build(CacheConfig {
+            expected_interval_ns: 1_000,
+            ..cfg(1)
+        });
+        let mut m = depth(Side::Bid, 100, 1);
+        m.set_symbol("BTCUSDT");
+        // A record whose ingress is far longer than the expected interval makes
+        // the correction insert the samples a stall swallowed.
+        let now = clock::now_ns();
+        cache
+            .publisher
+            .publish(&mut m, now.saturating_sub(1_000_000));
+        let total = cache.publisher.latency().total().count();
+        assert!(
+            total > 1,
+            "the correction added nothing: {total} samples for one record"
+        );
     }
 
     #[test]

@@ -371,7 +371,10 @@ fn bench_mids(iters: u64) -> Result_ {
         for (side, px) in [(Side::Bid, 100 * E8), (Side::Ask, 100 * E8 + 1_000_000)] {
             let mut m = Msg::depth(side, Price::from_e8(px), Qty::from_e8(E8), "");
             m.set_symbol_bytes(&name);
-            cache.publisher.publish(&mut m, 0);
+            // A real timestamp, not zero: the publisher measures stage 2 from
+            // this and the coordinated-omission correction scales with it. Zero
+            // made the correction treat the whole monotonic clock as a stall.
+            cache.publisher.publish(&mut m, ob::clock::now_ns());
         }
     }
     let mut out = vec![0i64; 2048];

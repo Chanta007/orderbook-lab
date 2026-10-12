@@ -75,12 +75,12 @@ cache, `--iters 4000 --levels 32` unless noted.
 
 | Kernel | What changed | Shipped | Compared with | Ratio | Verdict | Ledger |
 |--------|--------------|---------|---------------|-------|---------|--------|
-| `codec::stream_records` | check the last record first instead of scanning | 19.8 ns | 2018 ns | **102x faster** | kept | OPT-008 |
-| `cache::Publisher::mids_into` | flat side tables **and** a mask instead of an `if` | 246.6 ns | 3370 ns | **13.7x faster** | kept | OPT-002, OPT-005, OPT-013 |
-| `book::Levels::cumulative` | sequential loop, not a blocked three-pass prefix sum | 7.5 ns | 36.8 ns | **4.9x faster than the blocked form** | reverted | OPT-004 |
-| `book::Levels::top` | `zip` instead of an index loop | 13.3 ns | 13.9 ns | 1.04x, i.e. no difference | no effect | OPT-011 |
-| `codec::decode_batch` | none | 16581 ns / 4096 records | — | — | scalar, memory-bound | §5.1 |
-| `flow::Producer::push` | none | 4.1 ns | — | — | scalar, one record per call | §5.3 |
+| `codec::stream_records` | check the last record first instead of scanning | 16.3 ns | 2018 ns | **124x faster** | kept | OPT-008 |
+| `cache::Publisher::mids_into` | flat side tables **and** a mask instead of an `if` | 407.8 ns | 3315 ns | **8.1x faster** | kept | OPT-002, OPT-005, OPT-013 |
+| `book::Levels::cumulative` | sequential loop, not a blocked three-pass prefix sum | 7.6 ns | 36.7 ns | **4.8x faster than the blocked form** | reverted | OPT-004 |
+| `book::Levels::top` | `zip` instead of an index loop | 13.2 ns | 13.9 ns | 1.04x, i.e. no difference | no effect | OPT-011 |
+| `codec::decode_batch` | none | 17412 ns / 4096 records | — | — | scalar, memory-bound | §5.1 |
+| `flow::Producer::push` | a per-slot sequence, for soundness | 4.7 ns | — | — | scalar; the sequence cost about 0.6 ns | §5.3 |
 
 **Read the ratio, not the nanosecond value.** Absolute timings on this machine
 drift by tens of percent with system load — `decode` has been measured at 14.6 µs
@@ -186,9 +186,13 @@ Measured cost: **16.5 ns** for a one-unit fill over a 32-level side.
 ### 5.3 `flow::Producer::push` — one record per call
 
 There is no loop to vectorize. The cost is the release store that publishes the
-record, plus the compare-and-exchange on the drop path.
+record, the per-slot sequence store, and the compare-and-exchange on the drop
+path.
 
-Measured cost: **3.6 ns** per push.
+Measured cost: **4.7 ns** per push. The slot sequence is about 0.6 ns of that, and
+it is the price of removing a data race that an independent review found: the
+consumer used to copy a slot before claiming it, and the `DropOldest` path could
+overwrite the slot mid-copy. Ledger OPT-019.
 
 ### 5.4 `book::Levels::cumulative` — a loop-carried dependency
 
@@ -218,7 +222,30 @@ sh rust/scripts/opt-record.sh mids "a hypothesis"       # append a measurement t
 sh rust/scripts/pgo.sh --symbols 500 --ticks 50         # the profile-guided build
 ```
 
-## 8. Cross-references
+## 8. What an independent review found
+
+The harness's own review gate ran out of turns on a diff of this size, so a
+separate independent review was run over the Rust library. It found ten issues,
+seven of which were real defects in shipped code. Five of them were the same kind
+of mistake: **a value that is present and means something other than what the
+consumer assumes.**
+
+| Finding | What it was |
+|---------|-------------|
+| OPT-019 | A lock-free copy that raced with a write. No wrong value escaped, but the race was undefined behaviour. Fixed with a per-slot sequence, at 0.6 ns per push. |
+| OPT-020 | A correction loop whose cost scaled with a caller-supplied clock reading, which a benchmark turned into ten billion iterations. Bounded now, and the truncation is counted. |
+| OPT-021 | A snapshot that read past a side table the symbol table had outgrown. A panic on the documented path. |
+| OPT-022 | A subscriber handed a raw timestamp where it expected a duration, so every stamped event was counted implausible and the end-to-end figure was silently wrong. |
+| OPT-023 | A platform constant that differs between Darwin and Linux, where the wrong value fails silently. |
+| OPT-024, OPT-025 | Configuration and CLI options that were parsed and never applied. Four of them, each failing silently with a plausible default. |
+
+Each fix has a regression test that fails without it. The lesson that generalises:
+**the defects that survive a green test suite are the ones where a value is present
+and means something other than what the consumer assumes.** A test that exercises
+the happy path cannot see them; a test that asserts an option changes an observable
+number can.
+
+## 9. Cross-references
 
 - `docs/optimization/README.md` — the ledger schema and the findings grouped by lesson
 - `docs/optimization/ledger.jsonl` — the machine-readable record

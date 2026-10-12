@@ -96,6 +96,24 @@ Every line in `ledger.jsonl` is one JSON object with these fields:
 | OPT-009 | The constant-time fast path was applied to a general-purpose function whose contract allowed a damaged record anywhere, and a test caught it returning 3 instead of 1. It was split into two functions: a scanning one for arbitrary buffers, and a precondition-carrying one for stream buffers. | An optimisation that narrows a function's contract belongs in a differently named function. Same name, new precondition is how a fast path becomes a bug. |
 | OPT-014 | The CLI stored flag names with the leading dashes stripped and every call site looked them up with the dashes still on, so `--json`, `--levels`, `--symbols` and `--ticks` were silently ignored and every binary ran on its defaults. The tool ran, the numbers were plausible, and the option was never applied. | A lookup returning `Option` makes a name mismatch indistinguishable from an absent flag, and an optional flag's default hides it. Test that an option *changes the behaviour*, not that it parses. |
 
+### Correctness found by independent review
+
+Seven findings came from a single independent review pass, run because the
+harness's own review gate ran out of turns on a diff this size. They are grouped
+here because the lesson is shared: **the defects that survive a green test suite
+are the ones where a value is present and means something other than what the
+consumer assumes.**
+
+| id | Finding | Lesson |
+|----|---------|--------|
+| OPT-019 | The flow ring's consumer copied a slot and then claimed it. The `DropOldest` path advanced that same tail and overwrote the slot, so the copy raced with a write. The copy was discarded when the claim lost, so no wrong value escaped, but the race is undefined behaviour. | Discarding a torn value is not the same as not reading it. A lock-free queue needs a claim-before-copy discipline or a per-slot sequence. The sequence costs about 0.6 ns per push. |
+| OPT-020 | The coordinated-omission backfill loop is proportional to the observed duration, and a caller that passed `0` where a timestamp belongs made that duration the whole monotonic clock: ten billion iterations inside one publish. | A correction whose cost scales with its input needs a ceiling, because the input comes from a clock. An unbounded loop over a caller-supplied value is a denial of service with a plausible name. |
+| OPT-021 | `Publisher::intern` grew the symbol table and not the snapshot lane, so pre-registering symbols and then snapshotting panicked. Pre-registering is `intern`'s documented use. | When a method grows one structure it must grow every structure indexed by the same key. |
+| OPT-022 | The event carried the raw monotonic **stamp** and the subscriber's tracker treats its argument as a **duration**. A stamp passes the plausibility ceiling after one second of uptime, so every stamped event was counted implausible and the end-to-end figure silently became stages 2 and 3. | An absolute reading and a duration are not interchangeable, and a plausibility check written for one silently rejects the other. |
+| OPT-023 | `MS_SYNC` is `0x10` on Darwin and `4` on Linux. Passing Darwin's value to Linux's `msync` is `EINVAL`, so the flush silently did not happen. | Two platforms sharing a header's shape do not share its constants, and a flag whose wrong value is `EINVAL` fails silently. |
+| OPT-024 | `expected_interval_ns` was read from the config, stored on the publisher, and never used. The documented correction never ran. | A configuration key that is parsed, validated and never read is worse than a missing feature, because the docs say the behaviour is on. |
+| OPT-025 | The same shape as OPT-024, counted: three separate features were parsed and never applied, each failing silently with a plausible default. | Silent defaulting is the failure mode of every optional setting. A test that the option *changes an observable value* is the only thing that catches it. |
+
 ### Platform
 
 | id | Finding | Lesson |

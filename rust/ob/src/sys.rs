@@ -80,7 +80,16 @@ pub const PROT_WRITE: c_int = 0x2;
 /// Changes are shared with other processes mapping the same file.
 pub const MAP_SHARED: c_int = 0x0001;
 /// Flush changes to the backing file before returning.
+///
+/// The values differ and the difference is silent: passing Darwin's 0x10 to
+/// Linux's `msync` is `EINVAL`, so the flush does not happen and the call reports
+/// a failure that a caller ignoring the result would never see. They are **not**
+/// the same constant, which an earlier version of this file claimed.
+#[cfg(target_os = "macos")]
 pub const MS_SYNC: c_int = 0x0010;
+/// `MS_SYNC` on Linux. See the note on the macOS definition.
+#[cfg(not(target_os = "macos"))]
+pub const MS_SYNC: c_int = 4;
 /// Expect sequential access. Used for WAL replay, where it earns its keep.
 pub const MADV_SEQUENTIAL: c_int = 0x2;
 
