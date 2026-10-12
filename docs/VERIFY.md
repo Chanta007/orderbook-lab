@@ -29,7 +29,19 @@ make test && make rust-test && make rust-vec-audit && make e2e && make rust-e2e
 | `prod-gate` | A prod config is refused without the environment variable | shell-command | config changed | `cargo test --manifest-path rust/Cargo.toml config::tests::a_prod_config_is_refused` | exit 0 |
 | `dev-gate` | A dev config claiming orders are possible is refused | shell-command | config changed | `cargo test --manifest-path rust/Cargo.toml config::tests::a_dev_config_that_claims_orders` | exit 0 |
 | `ledger-schema` | Every ledger line carries the documented fields | data-check | ledger changed | `python3 -c "import json,pathlib; [json.loads(l) for l in pathlib.Path('docs/optimization/ledger.jsonl').read_text().splitlines() if l.strip()]"` | exit 0 |
-| `docs-links` | No design doc references a file that does not exist | file-diff | docs changed | `grep -oE '`(docs|rust|python)/[A-Za-z0-9_./-]+`' docs/design/*.md \| sort -u` | every path exists |
+| `docs-links` | No design doc references a **full path** that does not exist | shell-command | docs changed | `grep -ohE '`(docs|rust|python|include|config|e2e)/[A-Za-z0-9_./-]+`' docs/design/*.md \| tr -d '`' \| sort -u \| while read -r f; do [ -e "$f" ] \|\| echo "MISSING: $f"; done` | no `MISSING:` line |
+
+## A note on the link check
+
+`docs-links` checks **full paths** only, because that is what it can check
+honestly. A design doc may write a group of files the way a person reads them —
+`` `rust/ob/src/ring.rs`, `wal.rs` `` — where the second name is relative to the
+first. A checker that treats every backticked filename as a path reports six false
+positives on this repository's own docs, which is worse than not checking: a
+check that cries wolf is a check people learn to ignore.
+
+The row above says "full path" for that reason, and its command extracts only
+names that contain a directory separator.
 
 ## Rules
 
