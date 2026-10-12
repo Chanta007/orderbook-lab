@@ -1,0 +1,48 @@
+[package]
+name = "ob-cli"
+description = "orderbook-lab in Rust: the feed daemon, terminal book, headless checker, cache soak and kernel benchmarks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ob = { workspace = true }
+
+# Five binaries, each with one job. Named to match the C++ build so `make e2e`
+# and `python/obctl.py` can drive either implementation from one config file.
+[[bin]]
+name = "feedd"
+path = "src/bin/feedd.rs"
+
+[[bin]]
+name = "tui"
+path = "src/bin/tui.rs"
+
+[[bin]]
+name = "headless"
+path = "src/bin/headless.rs"
+
+[[bin]]
+name = "obsoak"
+path = "src/bin/obsoak.rs"
+
+[[bin]]
+name = "vecbench"
+path = "src/bin/vecbench.rs"
+
+[lib]
+name = "ob_cli"
+path = "src/lib.rs"
+
+[lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = "warn"
+
+[lints.clippy]
+all = "warn"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"

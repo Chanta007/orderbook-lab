@@ -9,6 +9,10 @@ second `start` overwrote the pid files of the instance already running, and
 
 The port tests bind loopback on an ephemeral port. Nothing here uses the
 network. Each test captures the module's stdout so `make test` stays readable.
+
+The `--impl` switch is pinned too: each build's marker must match only its own
+path, and a start must refuse a build that was never produced instead of
+exec'ing something else.
 """
 from __future__ import annotations
 
@@ -215,6 +219,125 @@ class BookkeepingTest(unittest.TestCase):
                 self.assertFalse(obctl.pid_file("feedd").exists())
 
 
+class ImplementationSwitchTest(unittest.TestCase):
+    """`--impl` picks the build, and each build's marker names only its path.
+
+    The marker is what proves a pid is still this lab's process before a
+    signal. Two builds install binaries with the same names under different
+    paths, so a marker keyed by implementation must not match the other
+    build's command line. Ownership itself accepts either, because the pid
+    file and the listen port are shared.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / "var" / "run").mkdir(parents=True)
+        (self.root / "config").mkdir(parents=True)
+        patcher = mock.patch.object(obctl, "ROOT", self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.quiet = contextlib.redirect_stdout(io.StringIO())
+        self.quiet.__enter__()
+        self.addCleanup(self.quiet.__exit__, None, None, None)
+
+    def write_pid(self, name: str, pid: int) -> None:
+        obctl.pid_file(name).write_text(str(pid))
+
+    def test_each_marker_matches_only_its_own_build(self) -> None:
+        for name in ("feedd", "tui"):
+            with self.subTest(name=name):
+                cpp = f"/repo/build/{name} /repo/config/dev.json"
+                rust = f"/repo/rust/target/release/{name} /repo/config/dev.json"
+                self.assertIn(obctl.marker(name, "cpp"), cpp)
+                self.assertNotIn(obctl.marker(name, "rust"), cpp)
+                self.assertIn(obctl.marker(name, "rust"), rust)
+                self.assertNotIn(obctl.marker(name, "cpp"), rust)
+
+    def test_the_adapter_marker_is_shared(self) -> None:
+        # One adapter speaks the same wire protocol to either feedd.
+        self.assertEqual(obctl.marker("adapter", "cpp"), obctl.marker("adapter", "rust"))
+        self.assertIn(
+            obctl.marker("adapter", "rust"),
+            f"/repo/python/{obctl.marker('adapter', 'rust')} --config /repo/config/dev.json",
+        )
+
+    def test_binary_path_is_the_marker_under_root(self) -> None:
+        for impl in ("cpp", "rust"):
+            with self.subTest(impl=impl):
+                self.assertEqual(
+                    obctl.binary_path("feedd", impl),
+                    self.root / obctl.marker("feedd", impl),
+                )
+
+    def test_owns_accepts_the_rust_build(self) -> None:
+        ours = FakeProc(obctl.marker("feedd", "rust"))
+        self.addCleanup(ours.stop)
+        self.assertTrue(obctl.owns(ours.pid, "feedd"))
+        self.assertFalse(obctl.owns(ours.pid, "tui"))
+
+    def test_stop_reaches_the_rust_build(self) -> None:
+        ours = FakeProc(obctl.marker("feedd", "rust"))
+        self.addCleanup(ours.stop)
+        self.write_pid("feedd", ours.pid)
+
+        obctl.stop(Path("config/dev.json"))
+
+        self.assertFalse(obctl.pid_file("feedd").exists(), "the rust instance was left running")
+
+    def test_impl_defaults_to_cpp(self) -> None:
+        self.assertEqual(obctl.parser().parse_args(["setup"]).impl, "cpp")
+        self.assertEqual(obctl.parser().parse_args(["start", "--tui"]).impl, "cpp")
+
+    def test_impl_accepts_rust(self) -> None:
+        self.assertEqual(obctl.parser().parse_args(["start", "--impl", "rust"]).impl, "rust")
+
+    def test_an_unknown_impl_is_rejected(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                obctl.parser().parse_args(["setup", "--impl", "cobol"])
+        self.assertIn("invalid choice", stderr.getvalue())
+
+    def test_setup_is_called_with_the_default_implementation(self) -> None:
+        with mock.patch.object(obctl, "setup") as setup, mock.patch.object(
+            sys, "argv", ["obctl.py", "setup"]
+        ):
+            obctl.main()
+        setup.assert_called_once_with(Path(self.root / "config" / "dev.json"), "cpp")
+
+    def test_setup_is_called_with_the_implementation_asked_for(self) -> None:
+        with mock.patch.object(obctl, "setup") as setup, mock.patch.object(
+            sys, "argv", ["obctl.py", "setup", "--impl", "rust"]
+        ):
+            obctl.main()
+        setup.assert_called_once_with(Path(self.root / "config" / "dev.json"), "rust")
+
+    def test_start_passes_the_implementation_to_setup_and_feedd(self) -> None:
+        for name in ("feedd", "tui"):
+            binary = obctl.binary_path(name, "rust")
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_text("#!/bin/sh\n")
+            binary.chmod(0o755)
+        commands: list[list[str]] = []
+
+        def record(name: str, cmd: list[str]) -> subprocess.Popen:
+            commands.append(cmd)
+            raise SystemExit("stop here")
+
+        cfg = self.root / "config" / "dev.json"
+        cfg.write_text('{"env": "dev", "listen_host": "127.0.0.1", "listen_port": 0}')
+        with mock.patch.object(obctl, "setup") as setup, mock.patch.object(
+            obctl, "spawn", side_effect=record
+        ):
+            with self.assertRaises(SystemExit):
+                obctl.start(cfg, "", False, "rust")
+
+        setup.assert_called_once_with(cfg, "rust")
+        self.assertEqual(commands[0][0], str(obctl.binary_path("feedd", "rust")))
+
+
 class AwaitStartedTest(unittest.TestCase):
     """The start check must watch the child, not the pid.
 
@@ -310,7 +433,7 @@ class StartCleanupTest(unittest.TestCase):
             # A stand-in whose command line carries the marker, so the
             # ownership check treats it as this lab's process.
             proc = subprocess.Popen(
-                [sys.executable, "-c", "import time; time.sleep(60)", obctl.PROC_MARKERS[name]],
+                [sys.executable, "-c", "import time; time.sleep(60)", obctl.marker(name, "cpp")],
                 start_new_session=True,
             )
             children.append(proc)
@@ -326,6 +449,8 @@ class StartCleanupTest(unittest.TestCase):
         with mock.patch.object(obctl, "setup"), mock.patch.object(
             obctl, "guard"
         ), mock.patch.object(obctl, "preflight"), mock.patch.object(
+            obctl, "require_build"
+        ), mock.patch.object(
             obctl, "spawn", side_effect=fake_spawn
         ), mock.patch.object(
             obctl, "await_started", side_effect=fake_await
@@ -340,6 +465,15 @@ class StartCleanupTest(unittest.TestCase):
             )
         for name in ("feedd", "adapter"):
             self.assertFalse(obctl.pid_file(name).exists())
+
+    def test_a_missing_rust_build_is_refused_by_path(self) -> None:
+        # Nothing has built rust/target/release in this temporary ROOT, so
+        # --impl rust must name the path it looked for instead of exec'ing it.
+        with mock.patch.object(obctl, "setup"):
+            with self.assertRaises(SystemExit) as caught:
+                obctl.start(self.cfg, "", False, "rust")
+
+        self.assertIn(str(obctl.binary_path("feedd", "rust")), str(caught.exception))
 
 
 if __name__ == "__main__":

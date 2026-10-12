@@ -1,0 +1,34 @@
+[package]
+name = "ob"
+description = "orderbook-lab in Rust: wire format, shared-memory bus, per-symbol books, and the multi-symbol ticker cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# No dependencies, on purpose. See docs/design/rust-implementation.md §2:
+# the only thing std cannot express here is mapping a file into shared memory,
+# so this crate declares six libc functions itself (src/sys.rs) rather than
+# taking a dependency tree for them. `cargo build` needs no network.
+[dependencies]
+
+[lib]
+name = "ob"
+path = "src/lib.rs"
+
+[lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = "warn"
+
+[lints.clippy]
+all = "warn"
+# A market-data cache indexes flat arrays with values it has already bounded;
+# refusing every cast would push `as` behind allow attributes at each site,
+# which hides the conversions that do need a second look.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+# Every integer is a deliberate bit-width choice in this crate (u32 tick
+# indexes, u64 nanosecond stamps, u8 wire fields); naming the width is the point.
+cast_possible_wrap = "allow"

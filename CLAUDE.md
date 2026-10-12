@@ -6,35 +6,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 > **This is a condensed quick reference.** Full architectural rules: `docs/CONSTRAINTS.md`. Documentation governance and templates: `docs/HARNESS.md`.
 
+**Two implementations.** The lab ships two implementations of the same design: the original C++/Python one (`include/ob/`, `src/`, `python/`, built by `make`) and a Rust sibling (`rust/`, built by Cargo). Neither replaces the other. Both read and write the same 72-byte little-endian record and the same 16-byte ring header, so one implementation can read the other's ring. Wire format changes must touch both, per `docs/CONSTRAINTS.md` §1.1.
+
 ## Quick Start Commands
 
 ```bash
-# Development
-# npm run dev / python manage.py runserver / go run main.go
+# C++ and Python path
+make test        # C++ unit tests plus Python unit tests; no network
+make e2e         # replay e2e/fixture.jsonl through the C++ binaries
+make setup       # create the data directories and build the C++ binaries
+make start       # live window; needs a network and a terminal
+make stop
 
-# Build
-# npm run build / docker build -t myapp .
+# Rust path (rust/Cargo.toml, zero external crates)
+make rust-build  # cargo build --release --manifest-path rust/Cargo.toml
+make rust-test   # cargo test, fmt --check and clippy --all-targets -- -D warnings
+make rust-e2e    # replay the same e2e/fixture.jsonl through the Rust binaries
 
-# Test
-# npm test / pytest / go test ./...
-
-# Lint
-# npm run lint / ruff check . / golangci-lint run
-
-# Type check (if applicable)
-# npx tsc --noEmit / mypy .
-```
-
-**Docker (recommended)**:
-```bash
-docker compose up --build   # Full stack at localhost:3000 (or your port)
+# The cargo commands behind the Rust targets
+cargo build --release --manifest-path rust/Cargo.toml
+cargo test --manifest-path rust/Cargo.toml
+cargo fmt --manifest-path rust/Cargo.toml --check
+cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
 ```
 
 **Before Committing**:
-1. Run tests
-2. Run type checker (if applicable)
-3. Run linter
-4. Run build
+1. Run tests: `make test` and `cargo test --manifest-path rust/Cargo.toml`
+2. Run the Rust format check: `cargo fmt --manifest-path rust/Cargo.toml --check`
+3. Run the linter: `cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings`
+4. Run the build: `make` and `cargo build --release --manifest-path rust/Cargo.toml`
 5. Update relevant `docs/design/*.md` if architecture/data models/flows changed
 
 **Git Workflow**: Work on feature branches. PRs target `dev`. For parallel work: `python launch_worktree.py {name}` (creates worktree, copies `.env` files).
@@ -122,7 +122,7 @@ No `console.log/warn/error` (or language equivalent) in production code. Use str
 | Layer | Technology |
 |-------|-----------|
 | Framework | cli-tool |
-| Language | see brief |
+| Language | C++17 and Rust (edition 2021, MSRV 1.80) |
 | Database | n/a |
 | Auth | n/a |
 | Deployment | Docker |

@@ -333,6 +333,9 @@ New plan templates should be created when a task type recurs more than twice. Fo
 | Document | Domain |
 |----------|--------|
 | `docs/design/core-architecture.md` | Technology stack, project structure, rendering strategy |
+| `docs/design/rust-implementation.md` | Rust workspace, crate boundaries, wire compatibility, build and test commands |
+| `docs/design/ticker-cache.md` | Multi-symbol ticker cache, subscriber fan-out, latency, slippage and backpressure |
+| `docs/design/vec-optimization.md` | Hot-kernel reshaping, vectorization audit, before/after measurements |
 | `docs/design/data-model.md` | Database schema, relationships, migrations |
 | `docs/design/auth-rbac.md` | Authentication, authorization, role-based access |
 | `docs/design/api-design.md` | API conventions, endpoint patterns, error handling |
@@ -354,6 +357,15 @@ New plan templates should be created when a task type recurs more than twice. Fo
 | `docs/plans/add-data-model.md` | Database schema change |
 | `docs/plans/add-observability.md` | Logging/metrics/alerts |
 | `docs/plans/add-integration.md` | External service integration |
+
+### Runbooks
+
+| Runbook | Failure Pattern |
+|---------|-----------------|
+| `docs/runbooks/port-already-in-use.md` | A port is held by another feedd or worktree |
+| `docs/runbooks/rust-build-failures.md` | Missing cargo, a stale ring file, a ring length mismatch, a failed vectorization audit, a missing macOS linker |
+| `docs/runbooks/auth-failures.md` | Authentication failures |
+| `docs/runbooks/database-issues.md` | Database errors and slow queries |
 
 ---
 

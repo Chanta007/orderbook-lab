@@ -14,14 +14,24 @@ These are the mandatory technologies. Do not introduce alternatives without upda
 
 | Layer | Required Technology | Constraint |
 |-------|-------------------|------------|
-| Language | <!-- e.g., TypeScript (strict mode), Python 3.12+, Go 1.22+ --> | <!-- e.g., No `any` types in committed code; all exports typed --> |
-| Framework | <!-- e.g., Next.js 16, FastAPI, Django, Express --> | <!-- e.g., All pages are Server Components by default --> |
-| Database | <!-- e.g., PostgreSQL 16 + pgvector --> | <!-- e.g., All access via ORM singleton --> |
-| Auth | <!-- e.g., Clerk, Auth0, Supabase Auth, custom JWT --> | <!-- e.g., Never roll custom auth; identity in auth provider, app data in ORM --> |
-| Primary LLM | <!-- e.g., Anthropic Claude, OpenAI GPT-4 --> | <!-- e.g., All calls via factory function --> |
-| Styling | <!-- e.g., Tailwind CSS v4 + shadcn/ui --> | <!-- e.g., components/ui/ are owned copy-paste components --> |
-| Encryption | AES-256-GCM (or equivalent) | All sensitive fields encrypted at rest; encryption key required in production |
-| Deployment | Docker (standalone output) | Multi-stage build; non-root user; production images are minimal |
+| Language | C++17 and Rust (edition 2021, MSRV 1.80) | The C++ path is the reference; Rust is the sibling under `rust/`. No other languages in the hot path. |
+| Build | GNU Make for the C++ path, Cargo for the Rust path | `make` builds the C++ binaries; `cargo build --release --manifest-path rust/Cargo.toml` builds the Rust ones. The Rust workspace has zero external crates. |
+| Test | `make test` plus `cargo test` | `make test` runs the C++ and Python checks; `cargo test --manifest-path rust/Cargo.toml` runs the Rust checks. Both are offline. |
+| Database | not applicable — this lab has no web surface, no database and cannot place orders | None. |
+| Auth | not applicable — this lab has no web surface, no database and cannot place orders | None. |
+| Primary LLM | not applicable — this lab has no web surface, no database and cannot place orders | None. |
+| Styling | not applicable — this lab has no web surface, no database and cannot place orders | None. |
+| Deployment | none | A local lab, no containers. Binaries run from the checkout. |
+| Observability | The repo's own structured line logger and the cache report | No external metrics stack. Log lines carry the timestamp, severity, component and operation; the cache report publishes latency, slippage and backpressure. |
+
+### 1.1 Two implementations, one wire format
+
+The C++/Python implementation and the Rust implementation are siblings, not versions of each other. Neither is deprecated. They meet on a fixed byte layout:
+
+- The record is 72 bytes, little-endian, and starts with magic `0x4F424C42`. The same field order and offsets are declared in `include/ob/msg.hpp`, in `python/feed_adapter.py` (`MSG_FMT`) and in `rust/ob/src/codec.rs` (named offset constants, asserted at compile time).
+- The ring header is 16 bytes: magic `u32`, capacity `u32`, write sequence `u64`. Either implementation can read the other's ring. The Rust reader maps the ring read-only (`PROT_READ`); the C++ reader opens it `O_RDWR`.
+
+A change to the wire format must change `include/ob/msg.hpp`, the `MSG_FMT` in `python/feed_adapter.py` and `rust/ob/src/codec.rs` in the same commit.
 
 ---
 
@@ -335,10 +345,10 @@ Tests live adjacent to source code in `__tests__/` directories (or equivalent co
 ### 8.4 Pre-Commit Checklist
 
 Before committing, all of these must pass:
-1. Unit tests
-2. Type checker (if applicable)
-3. Linter
-4. Build
+1. Unit tests: `make test` and `cargo test --manifest-path rust/Cargo.toml`
+2. Formatter: `cargo fmt --manifest-path rust/Cargo.toml --check`
+3. Linter: `cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings`
+4. Build: `make` and `cargo build --release --manifest-path rust/Cargo.toml`
 
 ---
 
@@ -567,20 +577,23 @@ External API calls SHOULD use a circuit breaker pattern:
 
 ## 14. Performance Constraints
 
-### 14.1 Response Time Targets
+This lab has no HTTP endpoints and no server. Its performance work is the ingest path, and the rules below apply to both implementations.
 
-| Endpoint Type | P50 | P95 | P99 |
-|---------------|-----|-----|-----|
-| Static page | < 100ms | < 200ms | < 500ms |
-| API read | < 200ms | < 500ms | < 1s |
-| API write | < 500ms | < 1s | < 2s |
-| AI/LLM (streaming) | TTFT < 2s | TTFT < 5s | TTFT < 10s |
+### 14.1 Per-Record Ingest Latency Budget
 
-### 14.2 Database Query Limits
+A record's life is measured in three stages: stage 1 `send_to_recv` (socket and kernel), stage 2 `recv_to_publish` (decode, ring publish, log append, cache update) and stage 3 `publish_to_seen` (fan-out to a subscriber). Stage 2 is the part an implementation controls, so stage 2 is the budgeted quantity: one record must finish decode, ring publish, log append and cache update within the per-record budget, measured at p99 and never as a mean.
 
-- No query should take > 1s without an index review
-- N+1 queries are a P1 bug
-- Connection pool sized for expected concurrency + 20% headroom
+- The budget is per record, not per second and not per batch. A mean hides the tail, and the tail is what loses money.
+- Stage 2 is reported by `obsoak` for the cache pipeline and, per kernel, by `vecbench`. The target number and the run that produced it are recorded in [`docs/design/vec-optimization.md`](design/vec-optimization.md).
+- Stage 1 and stage 3 are reported but not budgeted. Stage 1 includes the network, and stage 3 is a property of the slowest subscriber.
+
+### 14.2 Every Performance Claim Names Its Measurement
+
+A performance claim is only accepted with the measurement that supports it and the command that produced it. "This is faster" is not a claim; "stage-2 p99 fell from the before number to the after number, measured by `make rust-soak` on this machine" is. The rule applies to the C++ path and the Rust path alike, and to the vectorization work.
+
+- Record the command, the machine, and the before and after numbers.
+- A claim made from a debug build, or from two runs whose input differs, proves nothing. `vecbench` keeps the baseline shapes so the comparison is re-run, not remembered.
+- The kernel-level record lives in [`docs/design/vec-optimization.md`](design/vec-optimization.md); `make rust-vec-audit` is the check that the hot kernels still emit the instructions the record claims.
 
 ---
 
