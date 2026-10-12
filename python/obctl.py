@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """One-command setup / start / stop driven by config/*.json.
 
+`--impl` picks the build: cpp (the default) runs build/feedd and build/tui,
+rust runs rust/target/release/feedd and rust/target/release/tui. The Python
+adapter is shared, because it speaks the same wire protocol to either, and
+both builds write the same 72-byte record into the same ring file and WAL.
+
 feedd and the adapter are background processes with pid files. The TUI is
 not. On a real terminal, start replaces this process with the TUI, so
 `stop` cannot find a tui pid. Type quit in that window.
@@ -25,20 +30,67 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# A pid file is not proof of ownership: macOS reuses pids, and the file
-# outlives a crash. Before any signal, the command line must still look like
-# this lab's program for that name.
+# The processes this script starts, by implementation, each with the marker
+# that proves a pid is still that process. The marker is the path of the
+# binary, relative to ROOT, and not the bare program name: `feedd` alone
+# would match any unrelated process carrying the word in its argv. Both
+# builds install binaries with the same names under different paths, so the
+# marker also says which build the pid belongs to. The adapter is one Python
+# program shared by both implementations.
 PROC_MARKERS = {
-    "feedd": "build/feedd",
-    "adapter": "feed_adapter.py",
-    "tui": "build/tui",
+    "cpp": {
+        "feedd": "build/feedd",
+        "adapter": "feed_adapter.py",
+        "tui": "build/tui",
+    },
+    "rust": {
+        "feedd": "rust/target/release/feedd",
+        "adapter": "feed_adapter.py",
+        "tui": "rust/target/release/tui",
+    },
 }
+
+DEFAULT_IMPL = "cpp"
+
+
+def marker(name: str, impl: str) -> str:
+    """The marker that proves a pid is this lab's `name` as built by `impl`.
+    It is also that binary's path, relative to ROOT."""
+    return PROC_MARKERS[impl][name]
+
+
+def markers(name: str) -> tuple[str, ...]:
+    """Every marker that proves this pid is this lab's `name`, one per
+    implementation. Empty for a name this script never starts.
+
+    Ownership accepts either implementation on purpose. The pid file and the
+    listen port are shared, so a stop that only recognised the implementation
+    named on its own command line would leave the other one running with
+    nothing pointing at it.
+    """
+    return tuple(marks[name] for marks in PROC_MARKERS.values() if name in marks)
+
+
+def binary_path(name: str, impl: str) -> Path:
+    """Where `impl` installs the named binary, as start will exec it."""
+    return ROOT / marker(name, impl)
 
 # Each child prints a ready line, and the wait ends when it appears. The
 # ceiling is only paid when the line never comes, and it covers a child that
 # is slow to die as well as one that is slow to start. STOP_CEILING covers a
 # loop that sleeps 50 ms between checks of its run flag.
-START_CEILING = 2.0
+#
+# START_CEILING is generous because of a macOS behaviour that has nothing to do
+# with this code: the first execution of a freshly linked binary pays for code
+# signature validation, and that took over three seconds here for a 600 KB
+# binary. A two-second ceiling turned that into "feedd did not start", which
+# reads as a bug in the daemon and is not one. Measured: a hello-world Rust
+# binary took 5.1 s on its first run and 0.01 s on every run after it.
+#
+# A high ceiling costs nothing in the normal case: the loop returns as soon as
+# the marker appears, so the ceiling is only ever paid by a start that is
+# genuinely broken.
+START_CEILING = 15.0
 STOP_CEILING = 2.0
 
 
@@ -64,14 +116,17 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=str(ROOT), check=True, **kw)
 
 
-def setup(cfg_path: Path) -> None:
+def setup(cfg_path: Path, impl: str = DEFAULT_IMPL) -> None:
     """Create the data directories and compile. Does not start processes."""
     cfg = load(cfg_path)
     guard(cfg)
     for key in ("bus_path", "wal_path", "log_path"):
         p = ROOT / cfg[key]
         p.parent.mkdir(parents=True, exist_ok=True)
-    run(["make", "-C", str(ROOT), "all"])
+    if impl == "rust":
+        run(["cargo", "build", "--release", "--manifest-path", str(ROOT / "rust" / "Cargo.toml")])
+    else:
+        run(["make", "-C", str(ROOT), "all"])
     print("setup ok")
 
 
@@ -178,12 +233,13 @@ def owns(pid: int, name: str) -> bool:
     Checked before every signal. A pid recycled by an unrelated program must
     not be killed, and `make stop` must not reach outside this lab. An
     unreadable command line is not ownership.
+
+    Either implementation counts as this lab; see markers() for why.
     """
-    marker = PROC_MARKERS.get(name)
-    if not marker:
-        return False
     command = proc_command(pid)
-    return command is not None and marker in command
+    if command is None:
+        return False
+    return any(m in command for m in markers(name))
 
 
 def read_pid(name: str) -> int | None:
@@ -278,8 +334,28 @@ def await_started(name: str, proc: subprocess.Popen, offset: int, marker: str, c
     if marker in new_log_lines(name, offset):
         return
     pid_file(name).unlink(missing_ok=True)
-    detail = new_log_lines(name, offset) or "(no output)"
-    raise SystemExit(f"{name} did not start (pid={proc.pid}). Last lines:\n{detail}")
+    detail = new_log_lines(name, offset)
+    # Three different failures used to produce the same unhelpful line. A child
+    # that is still running but silent is not the same as one that died, and a
+    # child that died without writing anything is not the same as one that wrote
+    # a reason: a slow start under disk load looked exactly like a crash, and
+    # "Last lines: (no output)" sent the reader looking in the wrong place.
+    status = proc.poll()
+    if detail:
+        why = "its last lines follow"
+    elif status is not None:
+        why = f"it exited with status {status} and wrote nothing"
+    else:
+        why = (
+            f"it is still running but has not announced itself within {ceiling}s; "
+            f"the start is slow rather than broken"
+        )
+    raise SystemExit(
+        f"{name} did not start (pid={proc.pid}): {why}.\n"
+        f"  ready line looked for: {marker!r}\n"
+        f"  log: {log_file(name)}\n"
+        f"{(chr(10) + detail) if detail else ''}"
+    )
 
 
 def spawn(name: str, cmd: list[str]) -> subprocess.Popen:
@@ -304,9 +380,11 @@ def preflight(cfg: dict, cfg_path: Path) -> None:
     """Refuse to start on top of an instance that is already running.
 
     Two gates, both fatal. The pid check catches the second adapter, which
-    would connect to the running feedd and double the publish rate. The port
-    check catches a feedd this repo never recorded, from another worktree or
-    an older session, whose bind failure would otherwise be silent.
+    would connect to the running feedd and double the publish rate; it takes
+    either implementation's marker, because a rust instance holds the same
+    pid file and the same port as a cpp one. The port check catches a feedd
+    this repo never recorded, from another worktree or an older session,
+    whose bind failure would otherwise be silent.
 
     The address is also checked against what src/feedd.cpp can actually bind:
     it parses listen_host with inet_addr, which takes a numeric IPv4 address
@@ -341,11 +419,29 @@ def preflight(cfg: dict, cfg_path: Path) -> None:
         raise SystemExit(f"refusing to start: {reason}")
 
 
-def start(cfg_path: Path, fixture: str, with_tui: bool) -> None:
+def require_build(impl: str, with_tui: bool, cfg_path: Path) -> None:
+    """Refuse to start when setup did not produce the binaries this run execs.
+
+    Only the binaries that will be exec'd are required: feedd always, tui
+    only when it is about to replace this process. The path is named in the
+    message, because `--impl rust` with an empty target directory must not
+    fall back to the other build or die with a bare ENOENT from the spawn.
+    """
+    wanted = ("feedd", "tui") if with_tui and sys.stdin.isatty() else ("feedd",)
+    missing = [str(p) for name in wanted if not (p := binary_path(name, impl)).is_file()]
+    if missing:
+        raise SystemExit(
+            f"refusing to start: the {impl} build is missing {', '.join(missing)}. "
+            f"Run 'python3 python/obctl.py setup --config {cfg_path} --impl {impl}'."
+        )
+
+
+def start(cfg_path: Path, fixture: str, with_tui: bool, impl: str = DEFAULT_IMPL) -> None:
     cfg = load(cfg_path)
     guard(cfg)
     preflight(cfg, cfg_path)
-    setup(cfg_path)
+    setup(cfg_path, impl)
+    require_build(impl, with_tui, cfg_path)
     cfg_abs = str(cfg_path.resolve())
     adapter = [sys.executable, str(ROOT / "python" / "feed_adapter.py"), "--config", cfg_abs]
     if fixture:
@@ -355,7 +451,7 @@ def start(cfg_path: Path, fixture: str, with_tui: bool) -> None:
     # refused start never leaves half the pair running.
     try:
         feedd_offset = log_offset("feedd")
-        feedd = spawn("feedd", [str(ROOT / "build" / "feedd"), cfg_abs])
+        feedd = spawn("feedd", [str(binary_path("feedd", impl)), cfg_abs])
         await_started("feedd", feedd, feedd_offset, "feedd listen", START_CEILING)
         adapter_offset = log_offset("adapter")
         proc = spawn("adapter", adapter)
@@ -366,7 +462,8 @@ def start(cfg_path: Path, fixture: str, with_tui: bool) -> None:
         raise
     # exec only when stdin is a terminal. make e2e is not, so it stays headless.
     if with_tui and sys.stdin.isatty():
-        os.execv(str(ROOT / "build" / "tui"), [str(ROOT / "build" / "tui"), cfg_abs])
+        tui = str(binary_path("tui", impl))
+        os.execv(tui, [tui, cfg_abs])
     print("start ok (no tui)")
 
 
@@ -398,8 +495,7 @@ def kill_pid(name: str) -> int | None:
         path.unlink(missing_ok=True)
         return None
     command = proc_command(pid) or ""
-    marker = PROC_MARKERS.get(name)
-    if not marker or marker not in command:
+    if not any(m in command for m in markers(name)):
         print(f"left alone: {name} pid={pid} is not this lab ({command or 'no command line'})")
         path.unlink(missing_ok=True)
         return None
@@ -433,19 +529,33 @@ def stop(_cfg_path: Path) -> None:
     print("stop ok")
 
 
-def main() -> int:
+def parser() -> argparse.ArgumentParser:
+    """The command line, built here so the tests can pin the --impl default
+    and its accepted values without running a command."""
     ap = argparse.ArgumentParser(prog="ob")
     ap.add_argument("cmd", choices=["setup", "start", "stop"])
     ap.add_argument("--config", default=str(ROOT / "config" / "dev.json"))
     ap.add_argument("--fixture", default="")
     ap.add_argument("--tui", action="store_true")
-    args = ap.parse_args()
+    ap.add_argument(
+        "--impl",
+        choices=sorted(PROC_MARKERS),
+        default=DEFAULT_IMPL,
+        help="implementation to build and run (default: cpp)",
+    )
+    return ap
+
+
+def main() -> int:
+    args = parser().parse_args()
     cfg_path = Path(args.config)
     if args.cmd == "setup":
-        setup(cfg_path)
+        setup(cfg_path, args.impl)
     elif args.cmd == "start":
-        start(cfg_path, args.fixture, args.tui)
+        start(cfg_path, args.fixture, args.tui, args.impl)
     else:
+        # stop takes no --impl: ownership accepts either build's marker, and
+        # the pid file names whichever implementation is running.
         stop(cfg_path)
     return 0
 

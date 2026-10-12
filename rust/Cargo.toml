@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["ob", "ob-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# The oldest toolchain this workspace claims to build on. CI installs current
+# stable, which is newer; this bound is what a reader may rely on.
+rust-version = "1.80"
+license = "MIT"
+authors = ["orderbook-lab"]
+
+[workspace.dependencies]
+ob = { path = "ob" }
+
+# The release profile is tuned for the hot path, and it is also the profile the
+# vectorization audit compiles with: an audit of a -O0 build would prove nothing.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+overflow-checks = false
+debug-assertions = false
+# Symbols stay in so the audit can name the function it found a vector op in,
+# and so `cargo asm` / Instruments show real names.
+strip = false
+
+# Benchmarks are compiled in release but must keep debug assertions off the
+# measurement path; this profile is what `cargo bench` in ob-cli uses.
+[profile.bench]
+inherits = "release"
+debug = true

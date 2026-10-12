@@ -24,6 +24,28 @@ Read the code in this order. Each line is the thing to say about that file.
 8. [`python/obctl.py`](python/obctl.py) is setup, start, and stop. The terminal replaces that process, so `stop` cannot kill the window. Type `quit` there.
 9. [`tests/test_core.cpp`](tests/test_core.cpp) and [`python/test_ws_frames.py`](python/test_ws_frames.py) are the offline checks. The [`Makefile`](Makefile) says which target runs which.
 
+## The Rust implementation
+
+`rust/` is a second implementation of the same lab, not a replacement. The C++ and Python code stays and is still maintained. Both sides speak the same wire format: the 72-byte little-endian `Msg` and the same 16-byte ring header, so a Rust reader can read a ring the C++ `feedd` wrote, and the other way round. `make e2e` and `make rust-e2e` replay the same [`e2e/fixture.jsonl`](e2e/fixture.jsonl).
+
+The workspace [`rust/Cargo.toml`](rust/Cargo.toml) holds two crates: `ob` (the library, no external dependencies) and `ob-cli` (the programs). It builds five binaries:
+
+| Binary | What it does |
+|--------|--------------|
+| `feedd` | Reads 72-byte records from a socket, publishes the ring, appends the WAL, updates the cache. |
+| `tui` | Draws the terminal book from the ring, ten times a second. |
+| `headless` | Drains the ring and replays the WAL, prints the check line, exits. |
+| `obsoak` | Soaks the multi-symbol ticker cache and prints the latency, slippage and backpressure report. |
+| `vecbench` | Times the hot kernels against the shapes they replaced. |
+
+```bash
+cargo build --release --manifest-path rust/Cargo.toml
+cargo test --manifest-path rust/Cargo.toml
+make rust-e2e
+```
+
+Release binaries land in `rust/target/release/`. One config file drives either implementation: `python/obctl.py` takes `--impl cpp` or `--impl rust`. The design is written up in [`docs/design/rust-implementation.md`](docs/design/rust-implementation.md).
+
 ## What this is for
 
 I built this to show the kind of work I want to do in an internship: take a real data feed, put a clear boundary between processes, and make the failure modes visible.
@@ -169,6 +191,7 @@ A CMake file can build the same binaries. `make` and GitHub Actions (`.github/wo
 include/ob/    message, ring, book, WAL, config, trace
 src/           feedd, tui, headless
 python/        obctl, feed adapter, tests
+rust/          Cargo workspace: ob library, ob-cli binaries
 config/        dev.json, prod.json
 e2e/           fixture.jsonl
 docs/images/   the window at the top of this file
