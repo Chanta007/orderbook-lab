@@ -1,173 +1,124 @@
-# Deployment
+# Deployment — orderbook-lab
 
-> Last updated: <!-- DATE -->
+> Last updated: October 2026
 
-## 1. Purpose
+## 1. There is no deployment
 
-Defines the deployment architecture: Docker builds, CI/CD pipeline, environment management, and zero-downtime deployment strategy.
+This lab runs on the machine it was built on. There is no server, no container,
+no orchestration, and no release artifact. Saying so first, because a deployment
+document that described a pipeline for a program with no deployment would be
+worse than a short one that says why.
 
-## 2. Key Files
+What the document covers instead is what a reader actually needs: how to build it,
+how the two environments differ, what "deploy" would mean if it were ever one, and
+what CI does with it.
 
-| File | Responsibility |
-|------|---------------|
-| `Dockerfile` | Multi-stage production build |
-| `docker-compose.yml` | Local development environment |
-| <!-- e.g., `.github/workflows/deploy.yml` --> | CI/CD pipeline |
-| <!-- e.g., `terraform/` --> | Infrastructure as Code |
+## 2. Building
 
-## 3. Architecture
+| Implementation | Command | Requirements |
+|----------------|---------|--------------|
+| C++ and Python | `make` | a C++17 compiler, GNU make, python3. No packages. |
+| Rust | `make rust-build` | cargo and rustc. **No crates**: `cargo build` needs no network. |
+| Both | `make test` | the above, plus `python3 -m unittest` for the control script |
 
-### Environment Strategy
+`rust/ob/src/sys.rs` declares the six libc functions the Rust side needs, which is
+what removes the dependency tree. The two implementations share the wire format,
+so either can be built and run without the other.
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Development  │ ──→ │   Staging   │ ──→ │ Production  │
-│ (local)      │     │ (auto-deploy│     │ (manual gate│
-│              │     │  from dev)  │     │  from main) │
-└─────────────┘     └─────────────┘     └─────────────┘
-```
+## 3. The two environments
 
-All environments use the **same Docker image**. Only configuration differs.
+| | dev | prod |
+|---|---|---|
+| Config | `config/dev.json` | `config/prod.json` |
+| State directory | `var/dev/` | `var/prod/` |
+| Listener port | 9001 | 9101 |
+| Start requires | nothing | `ORDERBOOK_ALLOW_PROD=1` |
+| `allow_orders` | must be `false` | must be `false` |
 
-### Docker Build
+The environments differ in their directories and their ports so that a running
+instance cannot be confused with the other, and the production profile refuses to
+start without an explicit environment variable. Both implementations enforce it;
+`docs/design/security.md` §2 explains why it is a refusal rather than a warning.
 
-**Multi-stage Dockerfile**:
+There is no staging environment. There is nothing to stage.
 
-```dockerfile
-# Stage 1: Builder
-FROM node:20-alpine AS builder   # or python:3.12, golang:1.22
-WORKDIR /app
-COPY . .
-RUN npm ci && npm run build      # Install, compile, test
-RUN npm prune --production       # Remove dev dependencies
+## 4. Durability
 
-# Stage 2: Runner
-FROM node:20-alpine AS runner
-RUN addgroup --system app && adduser --system --ingroup app app
-WORKDIR /app
-COPY --from=builder --chown=app:app /app/.next/standalone ./
-COPY --from=builder --chown=app:app /app/public ./public
-USER app
-EXPOSE 3000
-HEALTHCHECK CMD wget -q --spider http://localhost:3000/api/health || exit 1
-CMD ["node", "server.js"]
-```
+The ring is recreated on every start. The log is appended to and survives.
 
-Key requirements:
-- **Non-root user** — Security best practice
-- **`--chown`** — Prevent permission errors on runtime directories
-- **Health check** — Orchestrator can verify container is ready
-- **Minimal image** — Only production artifacts, no dev tools
+| `sync_policy` | Call | What a machine crash loses | Cost |
+|---------------|------|---------------------------|------|
+| `none` | nothing | everything the OS has not flushed | zero |
+| `data` (default) | `fdatasync` / `fsync` | at most the last 32 records | tens of microseconds |
+| `full` | `F_FULLFSYNC` on macOS, `fdatasync` elsewhere | nothing the call returned for | milliseconds |
 
-### Local Development
+`full` exists because on macOS `fsync` returns once the data has reached the
+drive's cache, not the platter, and a lab that claims point-in-time recovery
+should be able to say so honestly. `docs/design/rust-implementation.md` §5.
 
-```bash
-docker compose up --build
-```
+Recovery is `Wal::replay`: read until a record is short or damaged and keep
+everything before that. A torn tail is counted and reported rather than treated as
+corruption.
 
-The compose file includes:
-- Application service (your app)
-- Database (PostgreSQL, MySQL, etc.)
-- Cache (Redis, if needed)
-- Any dependent services
+## 5. What CI does
 
-### CI/CD Pipeline
+`.github/workflows/ci.yml`, on every pull request and push to `dev` or `main`, two
+jobs on `ubuntu-latest`:
 
-```
-Push to dev → Lint → Test → Type Check → Build Image → Deploy to Staging
-                                                              ↓
-Push to main → Same checks → Deploy to Production (with approval gate)
-```
+| Job | Steps |
+|-----|-------|
+| `test` | install `g++ make python3`; `make test`; `make e2e` |
+| `rust` | install stable with `rustfmt` and `clippy`; `make rust-test`; `make rust-e2e`; `make rust-vec-audit` |
 
-**GitHub Actions example**:
-```yaml
-name: Deploy
-on:
-  push:
-    branches: [dev, main]
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: npm ci
-      - run: npm test
-      - run: npm run lint
-      - run: npm run build
-      - run: docker build -t app .
-      - run: docker push registry/app:${{ github.sha }}
-      # Deploy step depends on your hosting platform
-```
+The jobs call the **Makefile**, not the individual cargo commands. That is
+deliberate and was learned the hard way: the workflow used to repeat
+`cargo fmt --manifest-path rust/Cargo.toml --check`, which fails with "Failed to
+find targets" because `cargo fmt` needs `--all` to resolve targets from a manifest
+path. Every local check was green while the Rust job failed on every run, across
+three merged pull requests. Ledger OPT-027.
 
-## 4. Environment Configuration
+CI does not run the soak. A 1000-symbol run takes a few seconds locally and would
+be a fine addition; it is not there because the vectorization audit already
+catches the class of regression the soak would, and a longer job is a job people
+route around.
 
-### Secret Management
-
-| Environment | Method |
-|-------------|--------|
-| Development | `.env.local` (gitignored) or encrypted `.env` (dotenvx/SOPS) |
-| Staging | Deployment platform env vars or secrets manager |
-| Production | Secrets manager (Vault, AWS SM, GCP SM) or encrypted env |
-
-**Rules**:
-- Never commit plaintext secrets
-- Separate keys per environment
-- Secrets injected at runtime, never baked into images
-- Rotation documented for every secret type
-
-### Required Environment Variables
+## 6. Running it
 
 ```bash
-# Database
-DATABASE_URL=postgresql://...
-
-# Auth
-# AUTH_SECRET_KEY=...
-# AUTH_PROVIDER_KEY=...
-
-# Encryption
-ENCRYPTION_KEY=...    # 64-char hex, required in production
-
-# Observability
-# GRAFANA_API_KEY=... or DATADOG_API_KEY=...
-
-# Application
-NODE_ENV=production   # or APP_ENV
-PORT=3000
+make setup                       # build and create var/dev
+make start                       # feed daemon, adapter, and the terminal book
+make stop                        # stop the background processes
+make e2e                         # the fixture through both, headless
 ```
 
-## 5. Zero-Downtime Deployment
+`python/obctl.py` is the control surface. `--impl cpp|rust` selects the
+implementation from one config file, and the Python adapter is shared: it speaks
+the same wire protocol to either.
 
-### Strategy: Rolling Update
+`make start` with a terminal replaces the control process with the TUI, which is
+why `stop` has no tui pid to find and why the window is left with `quit`.
 
-1. New container starts alongside old container
-2. Health check passes on new container
-3. Traffic routes to new container
-4. Old container receives drain signal
-5. Old container shuts down after in-flight requests complete
+## 7. If this were ever deployed
 
-Under concurrent merge-triggered deploys, the rollout must converge before the deploy lane is released — see CONSTRAINTS §9.5 (serialize + converge + skip-superseded + gate-apply-on-live-commit + hardened-lane). A portable, convergence-safe starting point ships at `templates/.github/workflows/deploy.yml.tmpl` (bootstrap proposes it; never auto-installed).
+The parts that would need to change, in the order they would bite:
 
-### Rollback
+1. **`listen_host`.** It is `127.0.0.1`. On any other interface the daemon accepts
+   unauthenticated writes from the network. `docs/design/security.md` §2.3.
+2. **A supervisor.** Two background processes and a pid file is a laptop
+   arrangement. `obctl` already refuses to start over a running instance and
+   checks a pid's command line before signalling it, which is most of what a
+   supervisor would need to be told.
+3. **The ring's capacity.** 4096 slots is sized for one reader polling every
+   10 ms. A slower consumer needs a bigger ring or a lossier policy, and the
+   counters in §4.2 are what would say which.
+4. **A clock.** The latency numbers assume every process is on one host reading
+   the same monotonic clock. Across hosts they would need synchronisation, and
+   the honest answer is that this lab has none.
 
-- One-click rollback in deployment platform
-- Or: `docker tag registry/app:{previous-sha} registry/app:latest && deploy`
-- Database rollbacks are separate (use migration rollbacks)
+## 8. Cross-references
 
-## 6. Infrastructure as Code
-
-All cloud resources defined in code (Terraform, Pulumi, CDK):
-- Compute (containers, functions)
-- Database (provisioning, backups)
-- Networking (load balancer, DNS)
-- Monitoring (alerts, dashboards)
-- IAM (roles, permissions)
-
-No click-ops. Every infrastructure change is code-reviewed and versioned.
-
-## 7. Cross-references
-
-- **[CONSTRAINTS.md](../CONSTRAINTS.md)** — Deployment conventions (§9)
-- **[design/core-architecture.md](core-architecture.md)** — Docker architecture
-- **[design/observability.md](observability.md)** — Monitoring integration
-- **[design/security.md](security.md)** — Secret management details
+- `docs/design/core-architecture.md` — the processes
+- `docs/design/rust-implementation.md` §5 — the config keys
+- `docs/design/security.md` — the environment gates
+- `docs/runbooks/port-already-in-use.md` — the failure a restart produces
+- `docs/runbooks/rust-build-failures.md` — when the Rust build will not start

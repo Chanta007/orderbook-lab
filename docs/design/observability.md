@@ -1,161 +1,148 @@
-# Observability
+# Observability — orderbook-lab
 
-> Last updated: <!-- DATE -->
+> Last updated: October 2026
 
 ## 1. Purpose
 
-Defines the logging, metrics, alerting, and dashboard strategy. The goal is to make every production issue diagnosable without SSH access — purely through logs, metrics, and dashboards.
+What this lab can tell you about itself while it runs, and what it deliberately
+cannot. The organising rule is that **a measurement names its stages and its
+units**, and that a number which is present means what it says.
 
-## 2. Key Files
+## 2. The four surfaces
 
-| File | Responsibility |
-|------|---------------|
-| <!-- e.g., `src/lib/telemetry/logger.ts` --> | Structured logging functions |
-| <!-- e.g., `src/lib/telemetry/metrics.ts` --> | Metrics (counters, histograms, gauges) |
-| <!-- e.g., `src/lib/telemetry/spans.ts` --> | Tracing / span management |
-| <!-- e.g., `terraform/alerts.tf` --> | Alert definitions (IaC) |
+| Surface | Where it goes | Who reads it |
+|---------|--------------|--------------|
+| Structured log lines | stderr, redirected to `var/<env>/…` by `obctl` | the operator, and CI on failure |
+| The cache report | stderr every second, and once at exit | the operator |
+| The terminal book | the terminal | the operator |
+| Telemetry JSONL | `docs/telemetry/runs-*.jsonl` | the harness, for its own analysis |
 
-## 3. Architecture
+There is no metrics endpoint, no dashboard, and no OpenTelemetry collector. That
+is a decision, not an omission; §6 says why.
 
-### Observability Stack
+## 3. Log lines
 
-**Preferred: Grafana Stack** (open-source, self-hostable, cost-effective)
-```
-Application → OpenTelemetry SDK
-                ├─ Logs → Loki → Grafana Dashboards
-                ├─ Metrics → Prometheus → Grafana Dashboards
-                └─ Traces → Tempo → Grafana Dashboards (optional)
-```
+One line per event, built in a fixed 512-byte buffer with no allocation, written
+by the calling thread.
 
-**Alternative: Datadog** (managed, higher cost, excellent integrations)
-```
-Application → Datadog Agent/SDK
-                ├─ Logs → Datadog Log Explorer
-                ├─ Metrics → Datadog Metrics
-                └─ APM → Datadog APM
+```text
+t=1384215194226125 level=info component=feedd op=report published=20 applied=20 ignored=0
+t=1384215194226125 level=info component=feedd op=latency stage1=n=20 min=0.0us p50=0.0us …
 ```
 
-### Logging Architecture
+`t` is nanoseconds from `CLOCK_MONOTONIC_RAW`, which is monotonic and not a
+calendar time. Deliberate: a run's lines are read together, where differences
+matter and dates do not.
 
-```
-Business Code → logger.info/warn/error()
-                    ↓
-              Structured JSON
-              {timestamp, severity, component, operation, correlationId, ...metadata}
-                    ↓
-              Log Aggregator (Loki / Datadog / CloudWatch)
-                    ↓
-              Dashboard Queries + Alerts
-```
+The format and the field types are in `rust/ob/src/log.rs`. Fields are typed
+rather than `Display`, so a duration is formatted by the type that produced it and
+nothing on that path can allocate or panic. A line that would overflow the buffer
+is truncated with a marker rather than allocating, because a log call must never
+be the thing that fails under pressure.
 
-## 4. Structured Logging
+## 4. The numbers that matter
 
-### Log Levels
+### 4.1 Latency, in stages
 
-| Level | When | Example |
-|-------|------|---------|
-| `debug` | Detailed diagnostic info (dev only) | Function entry/exit, variable values |
-| `info` | Normal operations | Request processed, job completed, cache hit |
-| `warn` | Degraded but functional | Retry needed, slow query, fallback activated |
-| `error` | Operation failed | Unhandled exception, API failure, data corruption |
-
-### Required Fields
-
-Every log entry MUST include:
-
-| Field | Description |
-|-------|-------------|
-| `timestamp` | ISO 8601 format |
-| `severity` | debug / info / warn / error |
-| `component` | Module name (e.g., "auth", "api", "worker") |
-| `operation` | Function or endpoint name |
-| `correlationId` | Request trace ID |
-
-### Anti-Patterns
-
-```
-// BAD: Unstructured string
-console.log("Processing user " + userId + " at " + new Date());
-
-// BAD: Silent catch
-try { await doWork(); } catch (e) { /* swallowed */ }
-
-// GOOD: Structured with context
-logger.info("User processed", { component: "auth", userId, duration_ms: 42 });
-
-// GOOD: Error with full context
-logger.error("doWork failed", { component: "worker", error: String(e), userId });
+```text
+  sender stamps   daemon reads    ring publishes   subscriber sees
+       |               |               |               |
+       |<- stage 1 --->|<- stage 2 --->|<- stage 3 --->|
+       |<--------------- end to end ----------------->|
 ```
 
-## 5. Metrics
+| Stage | Measured at | Covers |
+|-------|-------------|--------|
+| 1 | publisher | socket and kernel, the sender's stamp to the daemon's read |
+| 2 | publisher | decode, ring publish, log append, cache update |
+| 3 | subscriber | how long the event waited in its queue |
 
-### Required Metrics
+What is **not** measured: the exchange's own latency, the network, or anything
+before the sender wrote the record. That needs a synchronised clock at the other
+end and this lab does not have one.
 
-| Metric | Type | Labels |
-|--------|------|--------|
-| `http_request_duration_seconds` | Histogram | route, method, status |
-| `http_request_total` | Counter | route, method, status |
-| `external_api_duration_seconds` | Histogram | provider, operation |
-| `external_api_errors_total` | Counter | provider, operation, error_type |
-| `db_query_duration_seconds` | Histogram | operation, table |
-| `active_connections` | Gauge | — |
+Stage 1 is only measurable when the sender stamped the record. When it did not,
+the count of unstamped records is reported and the end-to-end figure covers stages
+2 and 3. A zero is never reported for an unmeasured stage.
 
-### Custom Metrics
+Distributions are fixed-bucket histograms at 7.5% resolution; the mean, minimum
+and maximum are exact. A percentile is reported as the upper bound of its bucket
+and is never below the true value. `rust/ob/src/latency.rs`.
 
-Add domain-specific metrics for your application's key operations:
-- Processing queue depth
-- AI/LLM token usage
-- Cache hit/miss rates
-- Background job completion rates
+### 4.2 The cache report
 
-## 6. Alerting
+Printed every second and once at exit:
 
-### Severity Levels
-
-| Severity | Response | Channel | Examples |
-|----------|----------|---------|----------|
-| **P0** | Page immediately | PagerDuty / SMS | Service down, data loss, security breach |
-| **P1** | < 1 hour | Slack + email | Error rate spike, API degradation, auth failures |
-| **P2** | Next business day | Email / ticket | Slow queries, disk usage, dependency deprecation |
-
-### Alert Definitions
-
-Alerts are defined in infrastructure-as-code (Terraform, Pulumi), NOT in dashboard UIs:
-
-```hcl
-# Example: P1 alert for high error rate
-resource "grafana_alert_rule" "high_error_rate" {
-  name      = "P1: Error rate > 5%"
-  condition = "rate(http_errors_total[5m]) / rate(http_requests_total[5m]) > 0.05"
-  for       = "5m"
-  labels    = { severity = "P1" }
-}
+```text
+t=… op=report published=2400000 applied=2400000 ignored=0 crossed=0 evicted=0 dropped=0 symbols=1000 …
+t=… op=latency stage1=… stage2=… ingress=… stamped=0 unstamped=2400000 implausible=0
+subscriber 0: delivered=2400000 evicted=0 dropped=0 high_water=2041 state=nominal | stage3: n=… p99=165.5us
 ```
 
-### Dashboard Strategy
+Four things to read in it:
 
-| Dashboard | Purpose | Audience |
-|-----------|---------|----------|
-| Service Overview | Health at a glance (error rate, latency, throughput) | On-call engineer |
-| API Performance | Per-route latency percentiles and error rates | Backend engineer |
-| External APIs | Third-party API health and latency | Integration engineer |
-| Database | Query performance, connection pool, disk usage | DBA / backend |
+- **`dropped` and `evicted`** — records a subscriber never saw. Non-zero means a
+  consumer is not keeping up and the policy decided what to lose.
+- **`crossed`** — the book had a bid at or above an ask. A property of the feed or
+  of the generator, not of the cache; `obsoak` explains its own count in the
+  output because a seven-figure number would otherwise look like a fault.
+- **`implausible`** — a stamp that cannot be a duration on this host.
+- **the pressure state** — `nominal`, `elevated` or `saturated`, derived from lag
+  in *time* rather than queue depth, with hysteresis so a lag on a threshold does
+  not flip the state on every sample.
 
-## 7. Production Debugging Workflow
+`docs/design/ticker-cache.md` §4 explains the three measurements in full.
 
-When something breaks in production:
+### 4.3 Durability counters
 
-1. **Check the dashboard** — Service Overview for the big picture
-2. **Query logs** — Filter by error severity, component, time range
-3. **Correlate** — Use correlation ID to trace a single request
-4. **Check metrics** — Did latency spike? Error rate change? Queue depth grow?
-5. **Check alerts** — Was an alert already firing? What does the runbook say?
-6. **Check runbooks** — `docs/runbooks/` for known failure patterns
+`wal_records`, `wal_rejected`, `wal_torn_bytes` and `ring_published` come out of
+the headless checker, which reads both the ring and the log. A torn tail is
+reported and not failed on: it is what a crash mid-append looks like, and the log
+is designed to survive it.
 
-**Never SSH to diagnose.** If you need SSH, that's a gap in observability.
+## 5. Correlation
+
+`trace_id[16]` and `span_id[8]`, the W3C widths, travel in the message. No
+collector reads them; they are there so that a record can be followed across the
+socket, the ring and the log without a timestamp comparison.
+
+The daemon writes its own counter into `trace_id[8..16]` and `span_id`, and leaves
+`trace_id[0..8]` to the sender, because that half is the one that carries a
+measurement. `docs/design/security.md` §6.
+
+## 6. What is deliberately absent
+
+**No OpenTelemetry SDK on the hot path.** `StartSpan` is hundreds of nanoseconds
+plus a heap allocation, and a `SimpleSpanProcessor` takes a mutex and exports on
+the caller's thread. The lab carries the IDs and logs on a side thread instead.
+This was decided in `docs/research/2026-09-21-orderbook-lab.md` and the reasoning
+still holds.
+
+**No metrics endpoint or dashboard.** A scrape endpoint would be another listener
+and another dependency for a program whose whole output is one terminal and a
+report line. The numbers a dashboard would plot are in the report.
+
+**No tracing of individual records.** At 7M records/s, tracing one in a thousand
+would cost more than the pipeline.
+
+**No calendar timestamps in the hot path.** Converting a monotonic reading to a
+date is a syscall and a timezone database; nothing in the pipeline needs one.
+
+## 7. How to read a run
+
+```bash
+make start                       # the terminal book, plus the report on stderr
+make rust-soak                   # the cache under load, with the full report
+rust/target/release/headless config/dev.json 1500   # the e2e numbers
+```
+
+For a single run's records rather than its summary, the log is the place:
+`Wal::replay` reads it back in order, and both implementations count a torn tail
+rather than stopping.
 
 ## 8. Cross-references
 
-- **[CONSTRAINTS.md](../CONSTRAINTS.md)** — Observability rules (§5)
-- **[HARNESS.md](../HARNESS.md)** — Code change workflow requiring observability (§2.4)
-- **[design/deployment.md](deployment.md)** — How observability integrates with deployment
+- `docs/design/ticker-cache.md` §4 — the latency, slippage and pressure model
+- `docs/design/vec-optimization.md` — the kernel measurements
+- `docs/optimization/ledger.jsonl` — the record of what each change cost
+- `docs/telemetry/SCHEMA-v1.md` — the harness's own telemetry schema

@@ -1,167 +1,111 @@
-# Security
+# Security — orderbook-lab
 
-> Last updated: <!-- DATE -->
+> Last updated: October 2026
 
-## 1. Purpose
+## 1. What this lab is, in security terms
 
-Defines the threat model, encryption strategy, input validation rules, and security review process. This application is public internet-facing and must resist hostile actors on every endpoint.
+It is a local market-data viewer. It has **no users, no accounts, no sessions, no
+database, and no PII**. It cannot place an order. Its network surface is a TCP
+listener on the loopback interface and an outbound websocket to a public
+market-data host.
 
-## 2. Key Files
+Saying that plainly matters more than a checklist, because a threat model for a
+web application would be fiction here. What follows is the threat model this
+program actually has, and the four controls that implement it.
 
-| File | Responsibility |
-|------|---------------|
-| <!-- e.g., `src/lib/encryption.ts` --> | AES-256-GCM encryption for sensitive fields |
-| <!-- e.g., `src/lib/auth/gateway.ts` --> | Auth gateway (authentication, authorization) |
-| <!-- e.g., `src/middleware.ts` / `proxy.ts` --> | CORS, CSRF, rate limiting middleware |
-| <!-- e.g., `next.config.ts` / nginx config --> | Security headers (CSP, HSTS, etc.) |
+## 2. The four controls
 
-## 3. Threat Model
+### 2.1 It cannot trade
 
-### Assumptions
+The adapter connects to `wss://data-stream.binance.vision`, a market-data-only
+host that rejects order placement. That is a property of the endpoint, not of
+this code, and it is the reason the lab uses it rather than testnet.
 
-- The application is accessible from the public internet
-- Users may submit malicious input
-- Third-party dependencies may contain vulnerabilities
-- API keys and credentials are high-value targets
-- Multi-tenant data must never leak between tenants
+The second layer is `allow_orders` in the config. It must be `false` in a dev
+config, and the loader refuses a dev config that sets it to `true`. Both
+implementations check it: `rust/ob/src/config.rs` and `python/obctl.py`.
 
-### OWASP Top 10 Coverage
+### 2.2 Prod is a different environment, and it refuses to start by accident
 
-| Threat | Mitigation |
-|--------|------------|
-| **A01: Broken Access Control** | Auth gateway with role checks on every route. Data isolation per tenant. |
-| **A02: Cryptographic Failures** | AES-256-GCM for sensitive fields. TLS in transit. No plaintext secrets. |
-| **A03: Injection** | Schema validation on all input. Parameterized queries (ORM). Auto-escaping templates. |
-| **A04: Insecure Design** | Gateway pattern. Factory pattern. Principle of least privilege. |
-| **A05: Security Misconfiguration** | CSP headers. HSTS. Minimal Docker images. No default credentials. |
-| **A06: Vulnerable Components** | Automated dependency scanning (Dependabot/Snyk). No critical CVEs. |
-| **A07: Auth Failures** | Rate limiting on auth endpoints. MFA support. Session expiry. |
-| **A08: Data Integrity Failures** | Input validation. Signed artifacts. Verified deployments. |
-| **A09: Logging Failures** | Structured logging on all operations. Audit trail for sensitive actions. |
-| **A10: SSRF** | No user-controlled URLs in server-side requests. Allowlist external APIs. |
+`config/dev.json` and `config/prod.json` differ in their directories and their
+ports, so a running instance cannot be confused with the other. Starting the
+production profile requires `ORDERBOOK_ALLOW_PROD=1` in the environment; without
+it the config loader refuses, in both implementations, with a message naming the
+variable.
 
-## 4. Encryption
+The intent: reaching production should take a deliberate act rather than a typo in
+a path.
 
-### At Rest
+### 2.3 The listener is on the loopback interface
 
-Sensitive fields encrypted using AES-256-GCM:
-- API keys, tokens, credentials stored in database
-- PII fields as required by compliance
-- Session data containing sensitive information
+`listen_host` is `127.0.0.1` in both shipped configs. The daemon accepts
+unauthenticated connections from anything that can reach that address, which on a
+single-user machine is that user. That is the correct scope for a lab and it is
+stated here rather than assumed: **if `listen_host` were changed to `0.0.0.0`, the
+daemon would accept unauthenticated writes from the network and every reader
+would show whatever the sender said.**
 
-### Key Management
+### 2.4 The bus is a file, and the reader cannot write it
 
-- Encryption key stored in environment variable (`ENCRYPTION_KEY`)
-- 64-character hex string (256-bit key)
-- Key derivation via scrypt (or equivalent)
-- Key rotation procedure documented and tested
-- Separate keys per environment (dev/staging/prod)
+The ring is a file with ordinary filesystem permissions. The Rust reader opens it
+`PROT_READ`, so a terminal that has no write access to the bus cannot corrupt it
+even with a bug. The C++ reader opens `O_RDWR` because one constructor serves both
+roles; the roles are separate types in Rust, which is why the tightening was
+possible there.
 
-### In Transit
+## 3. Secrets
 
-- TLS 1.2+ for all connections
-- HSTS enabled with long max-age
-- Certificate management via platform or Let's Encrypt
+There are none. No API keys, no tokens, no credentials, no `.env`. The lab reads
+public market data and writes to local files.
 
-## 5. Security Headers
+If a future version needs a key, the rule is already written in
+`docs/CONSTRAINTS.md` §7: per-environment, never in the repository, and read in
+one place.
 
-| Header | Value | Purpose |
-|--------|-------|---------|
-| `Content-Security-Policy` | `default-src 'self'; script-src 'self'; ...` | Prevent XSS, injection |
-| `Strict-Transport-Security` | `max-age=63072000; includeSubDomains` | Force HTTPS |
-| `X-Frame-Options` | `DENY` | Prevent clickjacking |
-| `X-Content-Type-Options` | `nosniff` | Prevent MIME sniffing |
-| `Referrer-Policy` | `strict-origin-when-cross-origin` | Limit referrer leakage |
-| `Permissions-Policy` | `camera=(), microphone=(), geolocation=()` | Disable unused APIs |
+## 4. Input validation
 
-## 6. Input Validation
+Every boundary validates, and each validation has a test:
 
-### Rules
+| Boundary | What is checked | Where |
+|----------|----------------|-------|
+| The wire record | magic, declared length, type code, side code | `rust/ob/src/codec.rs` |
+| The config file | the two gates, symbol length, ring capacity, pressure ordering | `rust/ob/src/config.rs` |
+| The ring file | magic, capacity is a power of two, file length matches the header | `rust/ob/src/ring.rs` |
+| The log file | record boundaries; a torn tail is trimmed on open and counted on replay | `rust/ob/src/wal.rs` |
+| The symbol table | a bounded capacity, reported rather than grown without limit | `rust/ob/src/symbol.rs` |
 
-1. All user input validated at system boundaries with schema validation
-2. Reject unknown fields (strict mode)
-3. String length limits on all text fields
-4. Numeric range validation
-5. Email/URL format validation
-6. File upload: type whitelist, size limit, content validation
-7. JSON depth limits to prevent DoS
+A record that fails validation is counted and skipped rather than ending the feed.
+The counter is in the daemon's report, so a feed that starts sending nonsense is
+visible.
 
-### Where to Validate
+## 5. What is deliberately not defended
 
-```
-User Input → API Boundary (validate) → Business Logic (trust) → Database (ORM handles)
-              ↑ Validate HERE                                      ↑ Parameterized queries
-```
+- **A malicious sender on the loopback interface.** Anything that can open a
+  socket to `127.0.0.1:9001` can write any record it likes. The lab is a lab.
+- **Resource exhaustion by a hostile feed.** A symbol table that fills reports
+  the loss rather than growing without bound, and the fan-out drops rather than
+  blocks, but neither is a defence against an adversary with local access.
+- **At-rest encryption.** The ring and the log hold public market data. There is
+  nothing to encrypt.
+- **Transport encryption for the bus.** It is a local file.
 
-Never validate in business logic. Trust internal code. Only validate at boundaries.
+## 6. The two places this lab is deliberately strict
 
-## 7. CORS & CSRF
+**The daemon never overwrites a sender's stamp.** `trace_id[0..8]` is left exactly
+as it arrived, so a record either carries a real measurement or is reported as
+unmeasured. An earlier version filled the field with its own clock when it was
+empty, which made every record look stamped with a zero latency — a measurement
+that looks like data and is not. See `rust/ob/src/msg.rs`.
 
-### CORS
+**A rejected latency reading is reported, not clamped.** A stage-1 duration above
+one second is counted as implausible rather than folded into the histogram, so a
+bad input cannot quietly become a two-second spike in the maximum forever.
 
-- Explicit origin allowlist (no wildcards in production)
-- Credentials only from allowed origins
-- Preflight caching for performance
+Both are the same principle: a number that is present must mean what it says.
 
-### CSRF
+## 7. Cross-references
 
-- CSRF tokens for state-changing operations via web forms
-- SameSite cookie attribute
-- Origin/Referer header validation
-- API routes using Bearer tokens are inherently CSRF-safe
-
-## 8. Rate Limiting
-
-| Endpoint Type | Limit | Window | Purpose |
-|---------------|-------|--------|---------|
-| Auth (login/register) | 10 req | 1 min | Prevent brute force |
-| Public read | 100 req | 1 min | Prevent scraping |
-| Authenticated write | 30 req | 1 min | Prevent abuse |
-| Heavy compute | 5 req | 1 min | Prevent resource exhaustion |
-
-Rate limit responses include `Retry-After` header and return 429.
-
-## 9. Dependency Security
-
-- **Automated scanning**: Dependabot, Snyk, or Trivy on every PR
-- **No critical CVEs**: Block deploys with known critical vulnerabilities
-- **Minimal dependencies**: Prefer well-maintained packages. Review before adding.
-- **Pin versions**: Lock major versions. Allow minor/patch updates.
-- **Supply chain**: Use lock files. Verify checksums.
-
-## 10. Audit Trail
-
-All sensitive operations are logged to an immutable audit trail:
-
-| Event | Data Captured |
-|-------|--------------|
-| Login/logout | User ID, IP, timestamp, success/failure |
-| Permission changes | Actor, target user, old role, new role |
-| Data access (admin views) | Actor, resource type, query scope |
-| Data modification | Actor, resource ID, fields changed |
-| API key creation/rotation | Actor, key prefix, timestamp |
-
-Audit logs are:
-- Append-only (no updates or deletes)
-- Retained for compliance period (minimum 1 year)
-- Queryable by actor, action, time range
-
-## 11. Security Review Checklist
-
-For every PR that touches auth, encryption, user input, or external APIs:
-
-- [ ] Input validation present at API boundary
-- [ ] SQL queries parameterized (no string concatenation)
-- [ ] HTML output auto-escaped
-- [ ] Auth check present on all endpoints
-- [ ] Rate limiting configured
-- [ ] Sensitive data encrypted at rest
-- [ ] No secrets in code or logs
-- [ ] CORS/CSRF protections maintained
-- [ ] Error messages don't leak internal details
-
-## 12. Cross-references
-
-- **[CONSTRAINTS.md](../CONSTRAINTS.md)** — Security constraints (§6)
-- **[design/auth-rbac.md](auth-rbac.md)** — Auth gateway, role-based access
-- **[design/deployment.md](deployment.md)** — Secret management, Docker security
+- `docs/CONSTRAINTS.md` §7 — secrets management, §9 — environment isolation
+- `docs/design/deployment.md` §3 — the two environments
+- `docs/design/data-model.md` §7 — the config schema
+- `docs/runbooks/port-already-in-use.md` — the failure this listener produces

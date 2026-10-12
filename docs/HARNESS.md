@@ -293,7 +293,7 @@ The framework includes a hooks layer (prompt hooks in `.claude/settings.json`) t
 - **Data pipeline / ETL / scraping** → `/mindcoachlabs:data`
 - **Fully autonomous** → `/mindcoachlabs:agent`
 
-For full hooks architecture, see `docs/design/hooks-routing.md`.
+For the full hook architecture, see the harness itself: `skills/` and `hooks/` in the MindCoachLabs plugin, which is where that document lives. This repository holds no harness design docs.
 
 See `skills/*/` (within the plugin) for the full skill definitions.
 
@@ -330,22 +330,29 @@ New plan templates should be created when a task type recurs more than twice. Fo
 
 ### Design Documents
 
+One document per domain. The list is the directory: if a row is here, the file is
+here, and the description says what the file actually covers.
+
 | Document | Domain |
 |----------|--------|
-| `docs/design/core-architecture.md` | Technology stack, project structure, rendering strategy |
-| `docs/design/rust-implementation.md` | Rust workspace, crate boundaries, wire compatibility, build and test commands |
-| `docs/design/ticker-cache.md` | Multi-symbol ticker cache, subscriber fan-out, latency, slippage and backpressure |
-| `docs/design/vec-optimization.md` | Hot-kernel reshaping, vectorization audit, before/after measurements |
-| `docs/design/data-model.md` | Database schema, relationships, migrations |
-| `docs/design/auth-rbac.md` | Authentication, authorization, role-based access |
-| `docs/design/api-design.md` | API conventions, endpoint patterns, error handling |
-| `docs/design/testing.md` | Test strategy, framework choices, coverage |
-| `docs/design/observability.md` | Logging, metrics, alerting, dashboards |
-| `docs/design/deployment.md` | Docker, CI/CD, environment management |
-| `docs/design/security.md` | Threat model, encryption, input validation |
-| `docs/design/ui-ux.md` | Component library, responsive design, accessibility |
-| `docs/design/mindcoachlabs-harness.md` | Skills inventory, gateway, workflow, update guide, worktree usage |
-| `docs/design/hooks-routing.md` | Hook events, routing decision tree, auto/agent timing model |
+| `docs/design/core-architecture.md` | The processes, what crosses between them, and the dev/prod isolation |
+| `docs/design/data-model.md` | The 72-byte wire record, the ring and log layout, the symbol table, the book, the config schema |
+| `docs/design/rust-implementation.md` | The Rust workspace, crate boundaries, wire compatibility, the daemon's thread model |
+| `docs/design/ticker-cache.md` | The multi-symbol cache: fan-out, the four queue policies, latency, slippage, backpressure |
+| `docs/design/vec-optimization.md` | Hot-kernel reshaping, the vectorization audit, and the before/after measurements |
+| `docs/design/testing.md` | The test layers, what each is for, and the rule that a performance claim carries its command |
+| `docs/design/observability.md` | Log lines, the stage-by-stage latency model, the cache report, and what is deliberately absent |
+| `docs/design/deployment.md` | How it is built and run, the two environments, the durability policies, and what CI does |
+| `docs/design/security.md` | The threat model this program actually has: it cannot trade, and it refuses prod by accident |
+
+Two rows that used to be here are gone on purpose. `auth-rbac.md`, `api-design.md`
+and `ui-ux.md` described a web application: there are no users, no endpoints and no
+UI toolkit in this repository, and the files were never written. `hooks-routing.md`
+and `mindcoachlabs-harness.md` describe the harness itself rather than this project;
+they live with the harness. A document index that lists documents which do not
+exist is the same defect as a design doc that describes a different program, which
+is what `data-model.md`, `deployment.md`, `security.md`, `observability.md` and
+`testing.md` were until they were rewritten to describe this one.
 
 ### Execution Plans
 

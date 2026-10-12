@@ -1,125 +1,140 @@
-# Testing
+# Testing — orderbook-lab
 
-> Last updated: <!-- DATE -->
+> Last updated: October 2026
 
 ## 1. Purpose
 
-Automated testing ensures that code changes don't break existing functionality, that business logic behaves correctly under edge cases, and that critical user flows work end-to-end. The testing strategy is optimized for highest confidence per engineer-hour: unit tests for pure functions, integration tests for API routes, E2E tests for critical flows.
+What is tested, what each layer is for, and the one rule that keeps the numbers in
+this repository honest.
 
-## 2. Key Files
+## 2. The layers
 
-| File | Responsibility |
-|------|---------------|
-| <!-- e.g., `vitest.config.ts` / `pytest.ini` / `go.mod` --> | Test framework configuration |
-| <!-- e.g., `playwright.config.ts` --> | E2E test configuration (if applicable) |
-| <!-- e.g., `src/lib/**/__tests__/` --> | Unit test files |
+| Layer | Command | Count | What it covers |
+|-------|---------|-------|----------------|
+| Rust unit tests | `make rust-test` | 167 + 12 | the library, the CLI, and the ingest reader |
+| C++ unit tests | `make test` | 1 binary | the book, the ring and the log |
+| Python tests | `make test` | 38 | the control script's process handling |
+| Fixture e2e, C++ | `make e2e` | — | the fixture to a book and a log, through the C++ daemon |
+| Fixture e2e, Rust | `make rust-e2e` | — | the same fixture through the Rust daemon |
+| Interop | `make rust-interop` | — | each implementation's daemon with the other's reader |
+| Vectorization audit | `make rust-vec-audit` | 2 kernels | the compiler emitted vector operations |
+| Soak | `make rust-soak` | — | 1000 symbols through the cache, with loss counters |
 
-## 3. Architecture
+`docs/VERIFY.md` is the registry: one row per check, with the command and the
+expected result, so a verify run is a list of outcomes rather than a judgement.
 
-### Testing Pyramid
+## 3. What each layer is for, and what it is not
+
+### 3.1 Unit tests, 167 of them
+
+Concentrated where the reasoning is, not spread for coverage. The four areas that
+carry the most:
+
+- **The wire format.** Offsets asserted at compile time, a round trip, and a
+  rejection case for each way a record can be damaged.
+- **The ring and the queue.** Ordering, a lapped reader, a damaged slot, an
+  eviction, and a two-thread run. The eviction test asserts that every value
+  returned was one that was pushed *and* that the values are non-decreasing,
+  which is what catches a torn read.
+- **The book.** A depth5 picture replacing the previous one, a zero size deleting
+  a level, a crossed book, and a reset not moving the sequence.
+- **The measurements.** Exact count/sum/min/max, bucket boundaries, the
+  coordinated-omission correction, the backpressure hysteresis, and the slippage
+  decomposition.
+
+A test that would have passed before the fix is not a regression test. Five of the
+tests added after the independent review fail without their fix, and each names
+the defect it covers in its comment.
+
+### 3.2 The fixture e2e
+
+`e2e/fixture.jsonl` is three top-of-book pictures. Both implementations replay it
+and both must produce a book with levels on each side and a log with records:
 
 ```
-         /   E2E    \          ~10% — Critical user flows only
-        /────────────\
-       / Integration  \        ~20% — API routes, service interactions
-      /────────────────\
-     /   Unit Tests     \      ~70% — Pure functions, zero mocking
-    /____________________\
+bids=2 asks=2 seq=19 wal=20
 ```
 
-### Framework Choices
+The same fixture, the same checker, two implementations. That is the point: the
+e2e is a statement about the path, not about one implementation of it.
 
-| Tool | Layer | Why |
-|------|-------|-----|
-| <!-- e.g., Vitest / pytest / go test --> | Unit + Integration | <!-- e.g., Fast, native TypeScript support --> |
-| <!-- e.g., Playwright / Cypress --> | E2E | <!-- e.g., Multi-browser, auto-wait --> |
+### 3.3 Interop, which is the strongest test here
 
-## 4. Running Tests
+`make rust-interop` runs the C++ daemon and has the **Rust** reader read the ring
+and log it wrote, then the reverse. It proves the shared-format claim rather than
+asserting it, and it is the test that would fail if someone changed an offset in
+one implementation and not the other.
+
+`docs/CONSTRAINTS.md` §1.1 makes that a rule; this target is what enforces it.
+
+### 3.4 The vectorization audit
+
+`rust/scripts/vec-audit.sh` compiles the library, reads the emitted LLVM IR, and
+counts the vector operations in each named kernel. It exits non-zero when a kernel
+that should vectorize did not.
+
+It also prints the kernels **documented as scalar**, with the reason, so silence
+about them is a decision rather than an oversight.
+
+Two things it had to learn, both recorded in the ledger:
+
+- Emit the IR with `lto` off. Under fat LTO, `--emit=llvm-ir` writes pre-LTO IR,
+  and an audit of that file reported zero vector operations for the whole crate
+  (OPT-001).
+- Name the target. The same source vectorizes on aarch64 and not on baseline
+  x86-64; `mids_into` needs SSE4.2 and `top` needs AVX2 (OPT-028).
+
+### 3.5 The soak
+
+`obsoak` drives the cache with a thousand symbols and reports what it cost:
+latency by stage, slippage split into its latency and depth causes, and the
+backpressure state. It is a test in the sense that it fails loudly — non-zero
+`dropped` or `evicted` means a consumer is losing data — and a measurement in the
+sense that its numbers are the ones quoted in the design docs.
+
+## 4. The rule
+
+**A performance claim carries the command that produced it.**
+
+Every number in `docs/design/vec-optimization.md` and
+`docs/design/ticker-cache.md` comes from a line in
+`docs/optimization/ledger.jsonl`, and every line has an `evidence` field naming
+the command. `rust/scripts/opt-record.sh` appends a measurement from the benchmark
+itself, so a number cannot be typed in by hand.
+
+The corollary, learned twice: **a benchmark whose output is never read measures
+nothing.** The first version of `vecbench` reported a 512-element prefix sum as
+33 nanoseconds because the writes had been deleted as dead code, and a
+profile-guided build reported a 1000-symbol snapshot at 16 nanoseconds because
+batching made the call loop-invariant and the optimiser hoisted it out. Both are
+ledger entries (OPT-006, OPT-017).
+
+## 5. What is not tested
+
+- **A live exchange connection.** The fixture is the required path; a live run
+  needs the network and is not in CI. `docs/research/2026-09-21-orderbook-lab.md`
+  records that decision.
+- **The terminal's appearance.** `tui` is checked by running it, not by a
+  snapshot test. A frame is a string; asserting its bytes would break on every
+  layout tweak and catch nothing.
+- **Cross-host latency.** The measurement assumes one host and one clock, and the
+  design docs say so rather than testing a claim that cannot hold.
+- **Fuzzing.** The codec's rejection cases are enumerated by hand. A fuzzer would
+  be a real addition to a parser that reads a socket; it is not here because the
+  framing is fixed-width and the input space is small enough to enumerate.
+
+## 6. Running everything
 
 ```bash
-# Unit + Integration
-# npm test / pytest / go test ./...
-
-# Watch mode
-# npm run test:watch / pytest --watch
-
-# Coverage
-# npm run test:coverage / pytest --cov
-
-# E2E
-# npm run test:e2e / playwright test
+make test && make rust-test && make rust-vec-audit && make e2e && make rust-e2e && make rust-interop
 ```
 
-## 5. Test File Placement
+On a clean checkout that is the whole suite. `make rust-soak` is separate because
+it is a measurement rather than a pass/fail check.
 
-Tests live adjacent to source code:
+## 7. Cross-references
 
-```
-src/lib/auth/
-├── gateway.ts
-├── factory.ts
-└── __tests__/
-    ├── gateway.test.ts
-    └── factory.test.ts
-```
-
-## 6. What to Test vs. Skip
-
-| Test | Skip |
-|------|------|
-| Pure functions (converters, calculators, parsers) | Third-party UI components |
-| Business logic (validation, authorization, processing) | ORM schema (type system validates it) |
-| API route handlers (with mocked dependencies) | Content/markdown files |
-| Critical user flows (E2E) | Individual component rendering |
-
-## 7. Writing Tests
-
-### Unit Test Pattern
-
-```
-// Arrange
-const input = createTestInput();
-
-// Act
-const result = myFunction(input);
-
-// Assert
-expect(result).toBe(expectedOutput);
-```
-
-### Integration Test Pattern
-
-```
-// Mock external dependencies
-mock(database, "findMany", () => [testRecord]);
-mock(authGateway, "requireAuth", () => testUser);
-
-// Call the route handler
-const response = await POST(createRequest(body));
-
-// Assert response
-expect(response.status).toBe(200);
-expect(await response.json()).toEqual(expected);
-```
-
-### Edge Cases to Always Cover
-
-- Empty input / zero values
-- Boundary conditions (at limits)
-- Error cases (invalid input, missing required fields)
-- Null/undefined handling
-- Concurrent access (if applicable)
-
-## 8. Pre-Commit Checklist
-
-All must pass before committing:
-1. `test` — All unit + integration tests
-2. Type checker (if applicable)
-3. Linter
-4. Build
-
-## 9. Cross-references
-
-- **[CONSTRAINTS.md](../CONSTRAINTS.md)** — Testing conventions (§8)
-- **[HARNESS.md](../HARNESS.md)** — Code change workflow requiring tests (§2.4)
-- **[plans/add-test.md](../plans/add-test.md)** — Step-by-step plan for adding tests
+- `docs/VERIFY.md` — the registry of checks
+- `docs/design/vec-optimization.md` — the kernel measurements and the oracle
+- `docs/optimization/README.md` — the ledger schema
+- `docs/CONSTRAINTS.md` §8 — testing conventions
