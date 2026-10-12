@@ -113,3 +113,51 @@ created: 2026-09-22
 ---
 
 Move the TUI to FTXUI
+
+---
+id: 326326d6bda2dc
+title: `obctl status` command printing each tracked pid, liveness, and the port hold...
+source-path: docs/plans/archive/2026-10-11-mac-run-path.md
+source-section: ## Deferred (NOT in this plan)
+status: open
+priority: medium
+i: 3
+c: 2
+e: 2
+revisit-when: manual review
+created: 2026-10-12
+---
+
+`obctl status` command printing each tracked pid, liveness, and the port holder. Revisit when a third "why is my window stalled" question shows up.
+
+---
+id: ad7bf482ea0d4e
+title: Cross-worktree port message: when the port is held by a feedd from another ch...
+source-path: docs/plans/archive/2026-10-11-mac-run-path.md
+source-section: ## Deferred (NOT in this plan)
+status: open
+priority: medium
+i: 3
+c: 2
+e: 2
+revisit-when: manual review
+created: 2026-10-12
+---
+
+Cross-worktree port message: when the port is held by a feedd from another checkout, the refusal names the address but not the other worktree. Revisit when two worktrees are worked at once.
+
+---
+id: b0095323eccb6e
+title: Add a product-path OTKP pack for the order book run path
+source-path: inline:adhoc
+source-section: inline capture 2026-10-12
+status: open
+priority: medium
+i: 3
+c: 3
+e: 3
+revisit-when: when a second macOS/Linux run-path regression appears, or when the OTKP engine accepts consumer packs
+created: 2026-10-12
+---
+
+Add a product-path OTKP pack for the order book run path

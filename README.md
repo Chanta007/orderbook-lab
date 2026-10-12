@@ -37,7 +37,7 @@ The interesting parts are not a framework. They are the choices underneath a sho
 - A websocket client written against the spec. Client frames are masked. A pong copies the ping payload. Binance's spot stream closes the connection if that pong does not come back.
 - The stream is `btcusdt@depth5@100ms`. That is a fresh top-5 picture, not a diff. Each picture clears that side of the book before the new prices are inserted. Treating it as a diff is what left old bids on the screen.
 - Dev cannot send orders. `allow_orders` must stay false, the adapter refuses trade URLs, and prod refuses to start unless `ORDERBOOK_ALLOW_PROD=1`.
-- Tests do not need a network. `make test` checks the book, the ring, the log, and the masked websocket frame. `make e2e` replays `e2e/fixture.jsonl` through the same processes.
+- Tests do not need a network. `make test` checks the book, the ring, the log, the masked websocket frame, and the pid-file guards in `obctl`. `make e2e` replays `e2e/fixture.jsonl` through the same processes.
 
 ## Run it
 
@@ -53,6 +53,8 @@ python3 python/obctl.py stop  --config config/dev.json
 ```
 
 `make setup`, `make start`, and `make stop` are the same three commands. Run them from the repository root. `make` looks for `./Makefile`, so a shell sitting in `config/` will not find it.
+
+`start` refuses when an instance is already running. It names the pid, or the address when something else holds the port. The refusal is deliberate: a second `start` used to overwrite the pid files of the instance already running, which left a feedd holding the port with nothing pointing at it. `stop` signals only a process whose command line still looks like this lab's, waits for it to exit, and reports any that did not. If a bind failure is reported, see [`docs/runbooks/port-already-in-use.md`](docs/runbooks/port-already-in-use.md).
 
 In the window, type a command and press Enter. The picture refreshes ten times a second, so the letters you type may not stay visible.
 
@@ -158,7 +160,7 @@ A CMake file can build the same binaries. `make` and GitHub Actions (`.github/wo
 ```
 include/ob/    message, ring, book, WAL, config, trace
 src/           feedd, tui, headless
-python/        obctl, feed adapter, frame tests
+python/        obctl, feed adapter, tests
 config/        dev.json, prod.json
 e2e/           fixture.jsonl
 docs/images/   the window at the top of this file
