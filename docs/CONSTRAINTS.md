@@ -346,7 +346,7 @@ Tests live adjacent to source code in `__tests__/` directories (or equivalent co
 
 Before committing, all of these must pass:
 1. Unit tests: `make test` and `cargo test --manifest-path rust/Cargo.toml`
-2. Formatter: `cargo fmt --manifest-path rust/Cargo.toml --check`
+2. Formatter: `cargo fmt --all --manifest-path rust/Cargo.toml --check`
 3. Linter: `cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings`
 4. Build: `make` and `cargo build --release --manifest-path rust/Cargo.toml`
 
