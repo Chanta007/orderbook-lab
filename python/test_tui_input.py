@@ -80,6 +80,16 @@ class TuiInput(unittest.TestCase):
         self.workdir = pathlib.Path(tempfile.mkdtemp(prefix="ob-tui-test-"))
         self.port = free_port()
         self.config = self.workdir / "config.json"
+        self.write_config()
+        self.feedd = None
+        self.feedd_log = None
+
+    def write_config(self):
+        """Write a config this test owns: its own ring, WAL and port.
+
+        The ring and the log live in a temporary directory so a run cannot read or
+        overwrite the state of an instance the user has running.
+        """
         self.config.write_text(
             """{
   "env": "dev",
@@ -101,8 +111,6 @@ class TuiInput(unittest.TestCase):
                 self.port,
             )
         )
-        self.feedd = None
-        self.feedd_log = None
 
     def tearDown(self):
         if getattr(self, "feedd_log", None) is not None:
@@ -120,29 +128,54 @@ class TuiInput(unittest.TestCase):
 
         The terminal does not create the ring: attaching to a file that is not
         there would be indistinguishable from attaching to an empty one.
+
+        The port is picked by binding zero and closing the socket, which leaves a
+        window between that and the daemon binding it. Something else taking the
+        port in that window is unlikely and does happen, and a rare failure in a
+        gate is worse than no gate, so an early exit is retried on a fresh port.
+
+        The retry keys on the exit rather than on the daemon's message, because
+        the two daemons say different things: the Rust one reports the address and
+        names the likely cause, and the C++ one prints `bind failed` and nothing
+        else. Matching text would couple this test to two log formats and would
+        still miss the next variant. Retrying any early exit cannot hide a real
+        failure either: three attempts all fail and the log is reported.
         """
         daemon = ROOT / "build" / "feedd"
         if not daemon.exists():
             self.skipTest(f"build/feedd is missing; run `make` first ({name})")
-        self.feedd_log = open(self.workdir / "feedd.log", "wb")
-        log = self.feedd_log
-        self.feedd = subprocess.Popen(
-            [str(daemon), str(self.config)],
-            cwd=str(ROOT),
-            stdout=log,
-            stderr=log,
-            start_new_session=True,
-        )
-        # The daemon prints its ready line to stderr, which is the same file.
-        deadline = time.monotonic() + FRAME_DEADLINE
-        while time.monotonic() < deadline:
+
+        for attempt in range(3):
+            self.feedd_log = open(self.workdir / "feedd.log", "wb")
+            self.feedd = subprocess.Popen(
+                [str(daemon), str(self.config)],
+                cwd=str(ROOT),
+                stdout=self.feedd_log,
+                stderr=self.feedd_log,
+                start_new_session=True,
+            )
+            # The daemon prints its ready line to stderr, which is the same file.
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                text = (self.workdir / "feedd.log").read_text(errors="replace")
+                if "feedd listen" in text:
+                    return
+                if self.feedd.poll() is not None:
+                    break
+                time.sleep(0.05)
             text = (self.workdir / "feedd.log").read_text(errors="replace")
-            if "feedd listen" in text:
-                return
+            self.feedd_log.close()
             if self.feedd.poll() is not None:
-                self.fail(f"feedd exited: {text}")
-            time.sleep(0.05)
-        self.fail("feedd did not print its ready line")
+                # An early exit. Most likely the port was taken between the probe
+                # and the bind; possibly something else. Try a fresh port.
+                print(f"  feedd exited early ({text.strip()[:80]}); retrying on another port")
+                self.port = free_port()
+                self.write_config()
+                continue
+            self.fail("feedd did not print its ready line")
+        self.fail(
+            "feedd could not be started in three attempts; last output:\n" + text
+        )
 
     def drain(self, master: int, deadline: float) -> str:
         """Read everything the child has drawn until the deadline."""
