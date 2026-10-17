@@ -28,6 +28,7 @@ slippage and backpressure as first-class reported quantities
 | `rust/ob/src/latency.rs`, `slippage.rs`, `pressure.rs` | The three measurements. |
 | `rust/ob-cli/src/ingest.rs` | Accepting connections and reading whole records. |
 | `rust/ob-cli/src/bin/` | `feedd`, `tui`, `headless`, `obsoak`, `vecbench`. |
+| `python/test_tui_input.py` | The terminal test: a pseudo-terminal, keystrokes, and what came back. |
 
 ## 3. Architecture
 
@@ -166,6 +167,22 @@ serves both:
 
 `python/obctl.py --impl rust` drives the Rust binaries from the same commands as
 the C++ ones. The Python adapter is shared: it speaks the wire protocol to either.
+
+### 3.6 The terminal owns its input line
+
+`tui` puts the tty into non-canonical mode with echo off, keeps the input buffer
+itself, and draws it as the last row of every frame. The first version read whole
+lines and cleared the screen on every frame, which erased the terminal's own echo:
+the commands worked and were invisible.
+
+The mode is restored on every exit path, including from a signal, because a
+program that leaves a terminal without echo and line editing makes the shell look
+broken and the only recovery is `stty sane`. `python/test_tui_input.py` asserts
+all of that through a pseudo-terminal, and `OB_TUI_TEST_BINARY` points it at any
+terminal binary so the test can be shown failing against an unfixed one.
+
+The C++ terminal in `src/tui.cpp` still clears the screen on every frame and so
+still has this behaviour. `make rust-start` is the window that does not.
 
 ## 6. Cross-references
 

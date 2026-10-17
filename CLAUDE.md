@@ -22,6 +22,7 @@ make stop
 make rust-build  # cargo build --release --manifest-path rust/Cargo.toml
 make rust-test   # cargo test, fmt --check and clippy --all-targets -- -D warnings
 make rust-e2e    # replay the same e2e/fixture.jsonl through the Rust binaries
+make rust-start  # `make start` with --impl rust: the same window, Rust binaries
 
 # The cargo commands behind the Rust targets
 cargo build --release --manifest-path rust/Cargo.toml
