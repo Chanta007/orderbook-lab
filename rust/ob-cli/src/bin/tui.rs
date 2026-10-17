@@ -1,8 +1,7 @@
-//! `tui` — the terminal book.
+//! `tui` — the terminal book, with a working input line.
 //!
 //! Draws the book ten times a second from the shared-memory ring. Bid prices are
-//! red, ask prices are green, and the layout matches the C++ terminal so the two
-//! implementations look the same side by side.
+//! red, ask prices are green, and the layout matches the C++ terminal.
 //!
 //! ```text
 //!   tui <config.json>
@@ -16,31 +15,39 @@
 //! resets that came before it, and a stale price would sit above the asks until
 //! the next picture arrived.
 //!
-//! # What this adds over the C++ terminal
+//! # Why this owns the input line
 //!
-//! Two numbers that the ring can supply and the C++ version does not show:
-//! **lag**, how many records behind the writer this reader is, and **age**, how
-//! long since a record was applied. They are the cross-process form of the
-//! backpressure state that the in-process cache reports through
-//! [`ob::pressure`], and they are the first thing to look at when the book stops
-//! moving.
+//! The first version read whole lines with `read_line` and cleared the screen on
+//! every frame. That erases the terminal's own echo of what the user is typing,
+//! ten times a second, so the commands were unusable: the input still reached
+//! `read_line` — the tty's line buffer is not affected by drawing over the screen
+//! — but nobody could see what they had typed.
+//!
+//! The fix is to stop depending on the terminal's echo and own the line:
+//!
+//! 1. Put the tty into non-canonical mode without echo, so bytes arrive one at a
+//!    time and nothing is echoed by the kernel.
+//! 2. Keep the buffer here, and draw it as the last line of every frame.
+//! 3. Never clear the screen below the frame's own last row without redrawing
+//!    that row, so there is no window in which the typed text is missing.
+//!
+//! [`TerminalMode`] restores the terminal on the way out, including from a
+//! signal, so a Ctrl-C does not leave the shell in a mode where nothing echoes.
 //!
 //! # Input
 //!
-//! A second thread reads lines, because `read_line` blocks and the draw loop must
-//! keep running while nobody is typing. The refresh erases the screen, so the
-//! characters being typed are not visible; they still reach the reader when Enter
-//! is pressed. The C++ terminal has the same behaviour and says so on screen.
+//! Read one byte at a time on a thread of its own, because a blocking read must
+//! not stop the frame from drawing. `quit` and `q` leave; `levels N` changes the
+//! depth, from 1 to 64. Ctrl-C and Ctrl-D also leave. Backspace works.
 
 use ob::book::{Book, Level};
-use ob::clock;
 use ob::config::Config;
-use ob::msg::{Msg, Side};
-use ob::ring::{Consume, RingReader};
+use ob::msg::Msg;
+use ob::ring::RingReader;
 use ob_cli::{load_config, CliError, CliResult};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long without a record before the header says the feed has stalled.
@@ -49,11 +56,86 @@ const STALL_AFTER: Duration = Duration::from_secs(2);
 /// How often a frame is drawn.
 const FRAME: Duration = Duration::from_millis(100);
 
+/// The run flag. The signal handler is a bare `extern "C"` function and cannot
+/// capture anything, so this is the one place it can write.
+static RUNNING: AtomicBool = AtomicBool::new(true);
+
+extern "C" {
+    /// `void (*signal(int, void (*)(int)))(int)`.
+    fn signal(sig: i32, handler: usize) -> usize;
+}
+
+/// Ask the loop to stop. Async-signal-safe: one atomic store.
+extern "C" fn on_signal(_sig: i32) {
+    RUNNING.store(false, Ordering::SeqCst);
+}
+
 fn main() {
     if let Err(e) = run() {
         ob_cli::note(&format!("tui: {e}"));
         std::process::exit(e.code);
     }
+}
+
+/// The terminal mode this program needs, restored on drop.
+///
+/// `stty` rather than `tcsetattr` because the `termios` structure differs between
+/// Darwin and Linux and this program needs four flags from it. `stty` already
+/// knows both platforms, and the two commands below are the whole of what is
+/// required.
+///
+/// The mode is only changed when stdin is a terminal. A piped or redirected
+/// stdin keeps the line-based reader and the frame says so, which is what makes
+/// this program usable from a script and testable from a pseudo-terminal.
+#[derive(Debug)]
+struct TerminalMode {
+    /// Whether this value actually changed anything, and so must restore it.
+    owns_mode: bool,
+}
+
+impl TerminalMode {
+    /// Switch the terminal to byte-at-a-time input with no echo.
+    fn enter() -> Self {
+        if !stdin_is_tty() {
+            return TerminalMode { owns_mode: false };
+        }
+        let ok = stty(&["-icanon", "-echo", "min", "1", "time", "0"]);
+        TerminalMode { owns_mode: ok }
+    }
+}
+
+impl Drop for TerminalMode {
+    fn drop(&mut self) {
+        if self.owns_mode {
+            // Explicit flags rather than a saved string. Restoring an opaque
+            // `stty -g` blob means passing it back through a shell, where its
+            // brackets are glob characters. These two are what was changed, and
+            // they are what an interactive shell wants.
+            let _ = stty(&["icanon", "echo"]);
+        }
+    }
+}
+
+/// Whether stdin is a terminal.
+fn stdin_is_tty() -> bool {
+    // SAFETY: `isatty` takes a file descriptor and has no other requirement.
+    extern "C" {
+        fn isatty(fd: i32) -> i32;
+    }
+    unsafe { isatty(0) == 1 }
+}
+
+/// Run `stty` with the given arguments against this process's stdin.
+fn stty(args: &[&str]) -> bool {
+    use std::process::{Command, Stdio};
+    Command::new("stty")
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn run() -> CliResult {
@@ -62,16 +144,23 @@ fn run() -> CliResult {
         return Err(CliError::usage("usage: tui <config.json>"));
     };
     let cfg = load_config(cfg_path)?;
-    let levels = args.number::<usize>("levels", cfg.levels)?;
+    let levels = args.number::<usize>("--levels", cfg.levels)?;
 
     let ring = RingReader::open(std::path::Path::new(&cfg.bus_path))?;
     let mut book = Book::new(cfg.cache_depth.max(levels + 1));
     // Start at the live end: show what arrives from now on, not history.
     let mut cursor = ring.published();
-    let running = Arc::new(AtomicBool::new(true));
     let level_count = Arc::new(AtomicUsize::new(levels.clamp(1, 64)));
+    let typed = Arc::new(Mutex::new(String::new()));
 
-    let input = spawn_input_thread(Arc::clone(&running), Arc::clone(&level_count));
+    // Take the terminal before the input thread starts, so no byte is read in the
+    // wrong mode. The guard restores it on every exit path below, including the
+    // early returns, a signal, and a panic.
+    let interactive = stdin_is_tty();
+    let _mode = TerminalMode::enter();
+
+    install_signal_handlers()?;
+    let input = spawn_input_thread(Arc::clone(&typed), Arc::clone(&level_count));
 
     let mut out = [Msg::default(); 512];
     let mut last_record = Instant::now();
@@ -81,7 +170,7 @@ fn run() -> CliResult {
 
     let stdout = std::io::stdout();
     let mut screen = stdout.lock();
-    while running.load(Ordering::Relaxed) {
+    while RUNNING.load(Ordering::Relaxed) {
         let n = ring.consume_batch(&mut cursor, &mut out);
         if n > 0 {
             for m in &out[..n] {
@@ -91,6 +180,7 @@ fn run() -> CliResult {
             last_record = Instant::now();
             saw_any = true;
         }
+        let buffer = typed.lock().map(|b| b.clone()).unwrap_or_default();
         draw(
             &mut screen,
             &cfg,
@@ -102,17 +192,21 @@ fn run() -> CliResult {
                 age: last_record.elapsed(),
                 consumed,
                 resyncs,
+                input: &buffer,
+                interactive,
             },
         )?;
         std::thread::sleep(FRAME);
     }
 
-    // Leave the terminal on a clean line.
+    // Leave the terminal on a clean line. The drop guard restores the mode; this
+    // only moves the cursor past the frame.
     let _ = writeln!(
         screen,
         "\nclosed. The feed keeps running until `obctl stop`."
     );
     let _ = screen.flush();
+    drop(screen);
     if input.is_finished() {
         let _ = input.join();
     }
@@ -120,18 +214,22 @@ fn run() -> CliResult {
 }
 
 /// What one frame needs beyond the book.
-#[derive(Debug, Clone, Copy)]
-struct Frame {
+#[derive(Debug)]
+struct Frame<'a> {
     levels: usize,
     live: bool,
     lag: u64,
     age: Duration,
     consumed: u64,
     resyncs: u64,
+    /// What the user has typed and not yet submitted.
+    input: &'a str,
+    /// Whether the input line is being drawn at all.
+    interactive: bool,
 }
 
 /// Draw one frame.
-fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame) -> CliResult {
+fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame<'_>) -> CliResult {
     const RED: &str = "\x1b[31m";
     const GREEN: &str = "\x1b[32m";
     const RESET: &str = "\x1b[0m";
@@ -142,42 +240,43 @@ fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame) -> CliRe
     let na = book.asks.top(frame.levels, &mut asks);
     let feed = if frame.live { "live" } else { "stalled" };
 
-    // Home the cursor and erase, then draw the whole frame: the command list is
-    // part of the frame rather than printed once, which is why it survives.
+    // Home the cursor and redraw every row, erasing each to the end of its line.
+    // The whole screen is not cleared, because the input line is the last row of
+    // this frame and clearing the screen under it is what used to erase the
+    // user's typing.
     let mut buf = String::with_capacity(2048);
-    buf.push_str("\x1b[H\x1b[2J");
+    buf.push_str("\x1b[H");
     buf.push_str(&format!(
-        "orderbook-lab (rust)  env={}  symbol={}  seq={}  feed={}\n",
+        "orderbook-lab (rust)  env={}  symbol={}  seq={}  feed={}\x1b[K\n",
         cfg.env,
         cfg.symbol,
         book.last_seq(),
         feed
     ));
     buf.push_str(&format!(
-        "ring={} lag={} records  age={:.1}s  consumed={} resyncs={}\n",
+        "ring={} lag={} records  age={:.1}s  consumed={} resyncs={}\x1b[K\n",
         cfg.ring_capacity,
         frame.lag,
         frame.age.as_secs_f64(),
         frame.consumed,
         frame.resyncs
     ));
-    buf.push_str("Bid prices are red. Ask prices are green.\n");
-    buf.push_str("Type a command and press Enter. Refresh clears the echo.\n");
-    buf.push_str("  quit | q     leave this window\n");
-    buf.push_str("  levels N     show N price levels, from 1 to 64\n");
-    buf.push_str("  help         this list is already on screen\n");
+    buf.push_str("Bid prices are red. Ask prices are green.\x1b[K\n");
+    buf.push_str("  quit | q     leave this window\x1b[K\n");
+    buf.push_str("  levels N     show N price levels, from 1 to 64\x1b[K\n");
+    buf.push_str(&format!("Showing {} levels.\x1b[K\n", frame.levels));
     if !frame.live {
         buf.push_str(
-            "Feed stalled. The adapter reconnects on its own. The book stays on the last update.\n",
+            "Feed stalled. The adapter reconnects on its own. The book stays on the last update.\x1b[K\n",
         );
     }
     if frame.lag > cfg.ring_capacity as u64 / 2 {
         buf.push_str(
-            "Ring lag is over half the ring: records are being overwritten. Drain faster.\n",
+            "Ring lag is over half the ring: records are being overwritten. Drain faster.\x1b[K\n",
         );
     }
     buf.push_str(&format!(
-        "{RED}{:>12} {:>12}{RESET}    {GREEN}{:>12} {:>12}{RESET}\n",
+        "{RED}{:>12} {:>12}{RESET}    {GREEN}{:>12} {:>12}{RESET}\x1b[K\n",
         "BID PX", "BID QTY", "ASK PX", "ASK QTY"
     ));
     let rows = nb.max(na);
@@ -191,8 +290,18 @@ fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame) -> CliRe
             _ => (String::new(), String::new()),
         };
         buf.push_str(&format!(
-            "{RED}{bp:>12} {bq:>12}{RESET}    {GREEN}{ap:>12} {aq:>12}{RESET}\n"
+            "{RED}{bp:>12} {bq:>12}{RESET}    {GREEN}{ap:>12} {aq:>12}{RESET}\x1b[K\n"
         ));
+    }
+    // Clear whatever is left below the frame from an earlier, longer one. This
+    // happens before the prompt is written, so the prompt is never erased.
+    buf.push_str("\x1b[J");
+    // The input line, drawn by us rather than by the tty. No newline after it, so
+    // the cursor sits where the next character will be inserted.
+    if frame.interactive {
+        buf.push_str(&format!("> {}\x1b[K", frame.input));
+    } else {
+        buf.push_str("> (input disabled: stdin is not a terminal)\x1b[K");
     }
     out.write_all(buf.as_bytes())
         .map_err(|e| CliError::failed(format!("draw: {e}")))?;
@@ -201,64 +310,146 @@ fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame) -> CliRe
     Ok(())
 }
 
-/// Read commands on a thread of their own.
+/// Install handlers so a signal leaves the terminal usable.
 ///
-/// Detached and not joined when it is still blocked in `read_line`: a terminal
-/// that has been asked to quit must quit, and a thread blocked on stdin cannot
-/// be interrupted. The process exits and the thread goes with it.
+/// Without this a Ctrl-C would kill the process with the tty still in
+/// non-canonical mode, and the shell would look broken until the user ran
+/// `stty sane`. The handler only sets the run flag; the loop then leaves by the
+/// normal path, which drops the mode guard.
+fn install_signal_handlers() -> CliResult {
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    for sig in [SIGINT, SIGTERM] {
+        let handler = on_signal as extern "C" fn(i32);
+        // SAFETY: the handler stores to a static `AtomicBool`, which is
+        // async-signal-safe.
+        let previous = unsafe { signal(sig, handler as *const () as usize) };
+        if previous == usize::MAX {
+            return Err(CliError::failed(format!(
+                "cannot install handler for {sig}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Read keystrokes and maintain the input line.
+///
+/// Detached and not joined when it is blocked in a read: a terminal that has been
+/// asked to quit must quit, and a read on a tty cannot be interrupted from here.
+/// The process exits and the thread goes with it. When stdin is not a terminal
+/// this still works — it reads whatever bytes arrive and treats a newline as end
+/// of command — which is what makes the pseudo-terminal test possible.
 fn spawn_input_thread(
-    running: Arc<AtomicBool>,
+    typed: Arc<Mutex<String>>,
     levels: Arc<AtomicUsize>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("input".to_string())
         .spawn(move || {
-            let mut line = String::new();
-            while running.load(Ordering::Relaxed) {
-                line.clear();
-                match std::io::stdin().read_line(&mut line) {
+            let stdin = std::io::stdin();
+            let mut handle = stdin.lock();
+            let mut byte = [0u8; 1];
+            loop {
+                match handle.read(&mut byte) {
                     Ok(0) => {
-                        running.store(false, Ordering::Relaxed);
+                        // End of input.
+                        RUNNING.store(false, Ordering::Relaxed);
                         return;
                     }
                     Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        // A signal. The handler has set the flag; leave so the
+                        // mode guard can run.
+                        return;
+                    }
                     Err(_) => {
-                        running.store(false, Ordering::Relaxed);
+                        RUNNING.store(false, Ordering::Relaxed);
                         return;
                     }
                 }
-                let cmd = line.trim();
-                if cmd == "q" || cmd == "quit" {
-                    running.store(false, Ordering::Relaxed);
-                    return;
-                }
-                if let Some(rest) = cmd.strip_prefix("levels ") {
-                    if let Ok(n) = rest.trim().parse::<usize>() {
-                        levels.store(n.clamp(1, 64), Ordering::Relaxed);
+                match byte[0] {
+                    // Ctrl-C, in case it arrives as a byte rather than as a
+                    // signal, and Ctrl-D for end of input.
+                    0x03 | 0x04 => {
+                        RUNNING.store(false, Ordering::Relaxed);
+                        return;
                     }
+                    b'\r' | b'\n' => {
+                        let line = typed
+                            .lock()
+                            .map(|mut b| std::mem::take(&mut *b))
+                            .unwrap_or_default();
+                        submit(&line, &levels);
+                    }
+                    // Backspace, and the delete key's other spelling.
+                    0x7f | 0x08 => {
+                        if let Ok(mut b) = typed.lock() {
+                            b.pop();
+                        }
+                    }
+                    // Printable ASCII. Anything else is an escape sequence from
+                    // an arrow key or a terminal reply, and is ignored rather
+                    // than appended to the line.
+                    0x20..=0x7e => {
+                        if let Ok(mut b) = typed.lock() {
+                            b.push(byte[0] as char);
+                        }
+                    }
+                    _ => {}
                 }
             }
         })
         .expect("spawn the input thread")
 }
 
-/// A short description of the ring a terminal is attached to, for a caller that
-/// wants to print one before drawing.
-pub fn describe(ring: &RingReader) -> String {
-    format!(
-        "ring capacity={} published={}",
-        ring.capacity(),
-        ring.published()
-    )
+/// Act on a submitted command.
+///
+/// Unknown commands are ignored, which is the same behaviour the C++ terminal
+/// has: a typo does nothing rather than stopping the viewer.
+fn submit(line: &str, levels: &AtomicUsize) {
+    let cmd = line.trim();
+    if cmd == "q" || cmd == "quit" {
+        RUNNING.store(false, Ordering::Relaxed);
+    } else if let Some(n) = parse_levels(cmd) {
+        levels.store(n, Ordering::Relaxed);
+    }
 }
 
-/// Read one record without drawing, for a caller that wants the raw stream.
-pub fn peek(ring: &RingReader, cursor: &mut u64, out: &mut Msg) -> Consume {
-    let _ = clock::now_ns();
-    ring.consume(cursor, out)
+/// The depth limits a `levels` command accepts.
+pub const LEVELS_MIN: usize = 1;
+/// The depth limits a `levels` command accepts.
+pub const LEVELS_MAX: usize = 64;
+
+/// Parse a `levels N` command, or return `None`.
+///
+/// Separate from the input thread so it can be tested without a terminal, which
+/// is the only part of this file that a unit test can reach.
+pub fn parse_levels(line: &str) -> Option<usize> {
+    let rest = line.trim().strip_prefix("levels ")?;
+    let n: usize = rest.trim().parse().ok()?;
+    if (LEVELS_MIN..=LEVELS_MAX).contains(&n) {
+        Some(n)
+    } else {
+        None
+    }
 }
 
-/// The side a record names, for a caller that wants to label it.
-pub fn side_of(m: &Msg) -> Side {
-    m.side
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn levels_parses_within_range_and_rejects_outside_it() {
+        assert_eq!(parse_levels("levels 5"), Some(5));
+        assert_eq!(parse_levels("  levels 1  "), Some(1));
+        assert_eq!(parse_levels("levels 64"), Some(64));
+        assert_eq!(parse_levels("levels 0"), None);
+        assert_eq!(parse_levels("levels 65"), None);
+        assert_eq!(parse_levels("levels"), None);
+        assert_eq!(parse_levels("levels 5 "), Some(5));
+        assert_eq!(parse_levels("levels1 5"), None);
+        assert_eq!(parse_levels("levels abc"), None);
+        assert_eq!(parse_levels("quit"), None);
+    }
 }

@@ -117,6 +117,12 @@ consumer assumes.**
 | OPT-024 | `expected_interval_ns` was read from the config, stored on the publisher, and never used. The documented correction never ran. | A configuration key that is parsed, validated and never read is worse than a missing feature, because the docs say the behaviour is on. |
 | OPT-025 | The same shape as OPT-024, counted: three separate features were parsed and never applied, each failing silently with a plausible default. | Silent defaulting is the failure mode of every optional setting. A test that the option *changes an observable value* is the only thing that catches it. |
 
+### Terminal behaviour
+
+| id | Finding | Lesson |
+|----|---------|--------|
+| OPT-029 | The terminal book cleared the whole screen on every frame, which erased the terminal's own echo of the input line. The keystrokes still reached the program — the tty's line buffer is not affected by drawing over the screen — so the commands worked and were invisible. Fixed by owning the line: non-canonical mode with echo off, the buffer in the program, drawn as the last row of the frame, with the mode restored on every exit path including a signal. | A full-screen refresh destroys the terminal's echo of the input line, and no test without a terminal can see it. A test for this needs a pseudo-terminal, and it has to be shown failing against the unfixed binary before it is believed. |
+
 ### Platform
 
 | id | Finding | Lesson |

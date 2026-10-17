@@ -14,6 +14,7 @@ this repository honest.
 | Rust unit tests | `make rust-test` | 167 + 12 | the library, the CLI, and the ingest reader |
 | C++ unit tests | `make test` | 1 binary | the book, the ring and the log |
 | Python tests | `make test` | 38 | the control script's process handling |
+| Terminal behaviour | `make rust-test` | 2 | the book's input line and its terminal mode, through a real pty |
 | Fixture e2e, C++ | `make e2e` | — | the fixture to a book and a log, through the C++ daemon |
 | Fixture e2e, Rust | `make rust-e2e` | — | the same fixture through the Rust daemon |
 | Interop | `make rust-interop` | — | each implementation's daemon with the other's reader |
@@ -84,7 +85,26 @@ Two things it had to learn, both recorded in the ledger:
 - Name the target. The same source vectorizes on aarch64 and not on baseline
   x86-64; `mids_into` needs SSE4.2 and `top` needs AVX2 (OPT-028).
 
-### 3.5 The soak
+### 3.5 The terminal test
+
+`python/test_tui_input.py` opens a pseudo-terminal, runs the book on it, types
+into it, and reads back what the book drew. It exists because the bug it covers
+cannot be seen without a terminal: the first version cleared the whole screen on
+every frame, which erased the terminal's own echo of the input line, so commands
+worked and were invisible.
+
+It asserts four things: what is typed appears in a frame, the terminal is in
+non-canonical mode with echo off while the book runs, the command takes effect,
+and the terminal is restored when the book exits — including when it exits on a
+signal.
+
+`OB_TUI_TEST_BINARY=<path>` points it at any terminal binary. That is how it was
+checked against one that still has the old behaviour: pointed at `build/tui` it
+fails on `ICANON is still set`, and pointed at the Rust one it passes. **A test for
+a bug that was fixed has to be shown failing before it is believed**, and the
+override is what makes that repeatable rather than a claim.
+
+### 3.6 The soak
 
 `obsoak` drives the cache with a thousand symbols and reports what it cost:
 latency by stage, slippage split into its latency and depth causes, and the

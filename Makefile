@@ -17,6 +17,10 @@
 # symbols. `make rust-interop` is the cross-implementation proof: the C++
 # feedd writes the ring and WAL and the Rust headless reads them, then the
 # Rust feedd writes and the C++ headless reads. `make rust-vec-audit`
+# `make rust-start` is `make start` with --impl rust: the same window, driven by
+# rust/target/release. The C++ terminal still clears the screen on every frame,
+# which erases the terminal's echo of what you type, so use rust-start if you want
+# to type commands. `make stop` stops either implementation.
 # compiles the hot kernels and fails when one that should vectorize did not.
 CXX ?= c++
 CXXFLAGS ?= -std=c++17 -O2 -pthread -Iinclude -Wall -Wextra
@@ -24,7 +28,7 @@ LDFLAGS ?= -pthread
 BUILD := build
 RUST := rust/target/release
 
-.PHONY: all test e2e clean setup start stop rust-build rust-test rust-e2e rust-soak rust-interop rust-vec-audit
+.PHONY: all test e2e clean setup start stop rust-build rust-test rust-e2e rust-soak rust-interop rust-vec-audit rust-start
 
 all: $(BUILD)/feedd $(BUILD)/tui $(BUILD)/headless $(BUILD)/test_core
 
@@ -64,13 +68,17 @@ start:
 stop:
 	python3 python/obctl.py stop --config config/dev.json
 
+rust-start:
+	python3 python/obctl.py start --config config/dev.json --impl rust --tui
+
 rust-build:
 	cargo build --release --manifest-path rust/Cargo.toml
 
-rust-test:
+rust-test: rust-build
 	cargo test --manifest-path rust/Cargo.toml
 	cargo fmt --all --manifest-path rust/Cargo.toml --check
 	cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+	python3 -m unittest python.test_tui_input
 
 rust-e2e: rust-build
 	python3 python/obctl.py setup --config config/dev.json --impl rust
