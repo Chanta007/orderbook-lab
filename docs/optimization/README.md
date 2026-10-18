@@ -135,6 +135,12 @@ consumer assumes.**
 |----|---------|--------|
 | OPT-031 | The terminal's lag was a count of records. It now reports the count **and** the span of feed time those records cover, plus the age of the newest published record. | A backlog in messages is not a latency. Every queue that reports a depth should also report the time that depth covers, because only the time can be compared against a threshold without knowing the arrival rate — and data staleness belongs beside it, since caught up on a dead feed is not caught up on a live one. |
 
+### Verification habits
+
+| id | Finding | Lesson |
+|----|---------|--------|
+| OPT-032 | A local sweep piped `make rust-test` through `grep -c` and reported nine passing suites while the target was exiting 2 on a formatting failure. Without `set -o pipefail` a pipeline reports the **last** command's status, so the chain continued. CI, which runs the target directly, caught it. | Appending a filter to a check turns it into a check that cannot fail. Use `set -o pipefail`, and prefer running a gate directly over parsing its output. A green local sweep beside a red pipeline is the signature of a filter standing between you and the exit code. |
+
 ### Platform
 
 | id | Finding | Lesson |

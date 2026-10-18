@@ -327,9 +327,7 @@ fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame<'_>) -> C
     buf.push_str("Bid prices are red. Ask prices are green.\x1b[K\n");
     buf.push_str("  quit | q     leave this window\x1b[K\n");
     buf.push_str("  levels N     show N price levels, from 1 to 64\x1b[K\n");
-    buf.push_str(
-        "  lag          records behind you, and the span of feed time that is.\x1b[K\n",
-    );
+    buf.push_str("  lag          records behind you, and the span of feed time that is.\x1b[K\n");
     buf.push_str(
         "  staleness    how old the newest published record is. Both are your view, not the exchange's.\x1b[K\n",
     );
