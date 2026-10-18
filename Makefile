@@ -7,6 +7,14 @@
 # fixture file, waits one second, and runs headless. headless exits 0
 # only when both sides of the book and the WAL are non-empty.
 # `make start` is the live window. It needs a network and a terminal.
+# The test targets (`test`, `e2e`, `rust-e2e`, `rust-interop`) use
+# $(TEST_CONFIG), whose paths, port, pid files and logs are their own, so
+# running one cannot stop the daemon of a window somebody has open. They used
+# the live config and did exactly that: see docs/optimization/ledger.jsonl
+# OPT-038.
+# `make rust-feed` starts the feed and the adapter and no window, which is how a
+# window that lost its feed gets one back: it re-attaches on its own. Do not
+# reach for `make stop` — that stops the window too.
 # start refuses when an instance is already running, and stop waits for
 # each process to exit and reports any that did not. See
 # docs/runbooks/port-already-in-use.md when a bind failure is reported.
@@ -28,7 +36,15 @@ LDFLAGS ?= -pthread
 BUILD := build
 RUST := rust/target/release
 
-.PHONY: all test e2e clean setup start stop rust-build rust-test rust-e2e rust-soak rust-interop rust-vec-audit rust-start
+# The live config: what a window runs on. A second window gets its own ring,
+# WAL, port, pid files and logs by overriding this one variable, and the two
+# then cannot reach each other.
+CONFIG ?= config/dev.json
+
+# The test config. Never the live one, for the reason in the header above.
+TEST_CONFIG ?= config/test.json
+
+.PHONY: all test e2e clean setup start stop rust-build rust-test rust-e2e rust-soak rust-interop rust-vec-audit rust-start rust-feed
 
 all: $(BUILD)/feedd $(BUILD)/tui $(BUILD)/headless $(BUILD)/test_core
 
@@ -52,24 +68,30 @@ test: $(BUILD)/test_core
 	python3 -m unittest discover -s python -p 'test_*.py'
 
 e2e: all
-	python3 python/obctl.py setup --config config/dev.json
-	python3 python/obctl.py stop --config config/dev.json
-	python3 python/obctl.py start --config config/dev.json --fixture e2e/fixture.jsonl
+	python3 python/obctl.py setup --config $(TEST_CONFIG)
+	python3 python/obctl.py stop --config $(TEST_CONFIG)
+	python3 python/obctl.py start --config $(TEST_CONFIG) --fixture e2e/fixture.jsonl
 	sleep 1
-	$(BUILD)/headless config/dev.json 1500
-	python3 python/obctl.py stop --config config/dev.json
+	$(BUILD)/headless $(TEST_CONFIG) 1500
+	python3 python/obctl.py stop --config $(TEST_CONFIG)
 
 setup:
-	python3 python/obctl.py setup --config config/dev.json
+	python3 python/obctl.py setup --config $(CONFIG)
 
 start:
-	python3 python/obctl.py start --config config/dev.json --tui
+	python3 python/obctl.py start --config $(CONFIG) --tui
 
 stop:
-	python3 python/obctl.py stop --config config/dev.json
+	python3 python/obctl.py stop --config $(CONFIG)
 
 rust-start:
-	python3 python/obctl.py start --config config/dev.json --impl rust --tui
+	python3 python/obctl.py start --config $(CONFIG) --impl rust --tui
+
+# The feed and the adapter only, in this terminal, for a window that has one
+# open already. `rust-start` would open a second window; `stop` would close the
+# first one. The window re-attaches by itself once feedd is publishing again.
+rust-feed:
+	python3 python/obctl.py start --config $(CONFIG) --impl rust
 
 rust-build:
 	cargo build --release --manifest-path rust/Cargo.toml
@@ -81,12 +103,12 @@ rust-test: rust-build
 	python3 -m unittest python.test_tui_input
 
 rust-e2e: rust-build
-	python3 python/obctl.py setup --config config/dev.json --impl rust
-	python3 python/obctl.py stop --config config/dev.json
-	python3 python/obctl.py start --config config/dev.json --fixture e2e/fixture.jsonl --impl rust
+	python3 python/obctl.py setup --config $(TEST_CONFIG) --impl rust
+	python3 python/obctl.py stop --config $(TEST_CONFIG)
+	python3 python/obctl.py start --config $(TEST_CONFIG) --fixture e2e/fixture.jsonl --impl rust
 	sleep 1
-	$(RUST)/headless config/dev.json 1500
-	python3 python/obctl.py stop --config config/dev.json
+	$(RUST)/headless $(TEST_CONFIG) 1500
+	python3 python/obctl.py stop --config $(TEST_CONFIG)
 
 rust-soak: rust-build
 	$(RUST)/obsoak --symbols 1000 --ticks 200
@@ -95,23 +117,23 @@ rust-soak: rust-build
 # the whole check: a reader that cannot parse the other writer's ring or
 # WAL stops the target before the PASS line prints.
 rust-interop: all rust-build
-	python3 python/obctl.py setup --config config/dev.json --impl cpp
-	python3 python/obctl.py stop --config config/dev.json
-	python3 python/obctl.py start --config config/dev.json --fixture e2e/fixture.jsonl --impl cpp
+	python3 python/obctl.py setup --config $(TEST_CONFIG) --impl cpp
+	python3 python/obctl.py stop --config $(TEST_CONFIG)
+	python3 python/obctl.py start --config $(TEST_CONFIG) --fixture e2e/fixture.jsonl --impl cpp
 	sleep 1
-	$(RUST)/headless config/dev.json 1500
-	python3 python/obctl.py stop --config config/dev.json
+	$(RUST)/headless $(TEST_CONFIG) 1500
+	python3 python/obctl.py stop --config $(TEST_CONFIG)
 	@echo "PASS: the Rust headless read the ring and WAL the C++ feedd wrote"
-	python3 python/obctl.py setup --config config/dev.json --impl rust
-	python3 python/obctl.py stop --config config/dev.json
-	python3 python/obctl.py start --config config/dev.json --fixture e2e/fixture.jsonl --impl rust
+	python3 python/obctl.py setup --config $(TEST_CONFIG) --impl rust
+	python3 python/obctl.py stop --config $(TEST_CONFIG)
+	python3 python/obctl.py start --config $(TEST_CONFIG) --fixture e2e/fixture.jsonl --impl rust
 	sleep 1
-	$(BUILD)/headless config/dev.json 1500
-	python3 python/obctl.py stop --config config/dev.json
+	$(BUILD)/headless $(TEST_CONFIG) 1500
+	python3 python/obctl.py stop --config $(TEST_CONFIG)
 	@echo "PASS: the C++ headless read the ring and WAL the Rust feedd wrote"
 
 rust-vec-audit:
 	sh rust/scripts/vec-audit.sh
 
 clean:
-	rm -rf $(BUILD) var/dev var/prod var/run
+	rm -rf $(BUILD) var/dev var/prod var/test var/run
