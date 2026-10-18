@@ -77,6 +77,16 @@ pub const SPAN_ID_LEN: usize = 8;
 /// Bytes reserved for the symbol, including the terminator.
 pub const SYMBOL_LEN: usize = 8;
 
+/// Whether a symbol can be carried in the record's eight bytes.
+///
+/// The check a caller makes before setting a symbol, because the field cannot
+/// hold more and the alternative is losing the tail: a truncated symbol is a
+/// different symbol, and a reader would show one pair's prices under another's
+/// name.
+pub fn symbol_fits(name: &str) -> bool {
+    !name.is_empty() && name.len() <= SYMBOL_LEN && name.is_ascii()
+}
+
 /// What a record means.
 ///
 /// `Heartbeat` and `Cmd` are reserved: the book ignores both. They exist so a
@@ -250,16 +260,25 @@ impl Msg {
         matches!(self.kind, MsgType::Depth | MsgType::DepthReset)
     }
 
-    /// Copy `name` into the symbol field, truncating to seven bytes and zero
-    /// padding the rest.
+    /// Copy `name` into the symbol field, using all eight bytes.
     ///
-    /// Seven, not eight: the field is zero padded, and a consumer that prints it
-    /// as text needs a terminator it can trust. This matches the C++ daemon's
-    /// `strncpy(m.symbol, cfg.symbol.c_str(), 7)`.
+    /// # Why not seven plus a terminator
+    ///
+    /// The field is fixed-width eight bytes and is **not** a C string. An earlier
+    /// version truncated to seven to keep a terminator, which mangled every
+    /// eight-character symbol: `PEPEUSDT` became `PEPEUSD`, `SHIBUSDT` became
+    /// `SHIBUSD`, and a reader could not tell it apart from a genuinely
+    /// seven-character name. A large share of the market's pairs are eight
+    /// characters, so the terminator was costing real symbols to buy nothing:
+    /// [`Msg::symbol_bytes`] stops at the first zero byte, which is the right rule
+    /// for a zero-padded field and needs no terminator to be present.
+    ///
+    /// A name longer than eight characters cannot be carried. Use
+    /// [`symbol_fits`] to check rather than losing the tail silently.
     pub fn set_symbol(&mut self, name: &str) {
         self.symbol = [0; SYMBOL_LEN];
         let bytes = name.as_bytes();
-        let take = bytes.len().min(SYMBOL_LEN - 1);
+        let take = bytes.len().min(SYMBOL_LEN);
         self.symbol[..take].copy_from_slice(&bytes[..take]);
     }
 
@@ -360,15 +379,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn symbol_is_truncated_to_seven_bytes_and_padded() {
+    fn a_symbol_uses_all_eight_bytes_and_is_zero_padded() {
         let mut m = Msg::default();
         m.set_symbol("BTCUSDT");
         assert_eq!(&m.symbol, b"BTCUSDT\0");
         assert_eq!(m.symbol_str(), "BTCUSDT");
 
+        // The eight-character case, which truncating to seven used to mangle.
+        m.set_symbol("PEPEUSDT");
+        assert_eq!(&m.symbol, b"PEPEUSDT");
+        assert_eq!(m.symbol_str(), "PEPEUSDT");
+
+        // Longer than the field cannot be carried, and the tail is lost.
         m.set_symbol("AVERYLONGSYMBOL");
-        assert_eq!(&m.symbol, b"AVERYLO\0");
-        assert_eq!(m.symbol_str(), "AVERYLO");
+        assert_eq!(&m.symbol, b"AVERYLON");
+        assert!(!symbol_fits("AVERYLONGSYMBOL"));
+    }
+
+    #[test]
+    fn the_fit_check_matches_what_the_field_holds() {
+        assert!(symbol_fits("BTCUSDT"));
+        assert!(symbol_fits("PEPEUSDT"));
+        assert!(symbol_fits("DOGEUSDT"));
+        assert!(!symbol_fits("1000SHIBUSDT"));
+        assert!(!symbol_fits(""));
+        assert!(!symbol_fits("BTC€"));
     }
 
     #[test]

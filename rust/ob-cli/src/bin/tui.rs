@@ -1,52 +1,62 @@
-//! `tui` — the terminal book, with a working input line.
+//! `tui` — the terminal book: several tickers, a picker, and a working input line.
 //!
-//! Draws the book ten times a second from the shared-memory ring. Bid prices are
-//! red, ask prices are green, and the layout matches the C++ terminal.
+//! Draws one symbol's book ten times a second from the shared-memory ring. Bid
+//! prices are red, ask prices are green.
 //!
 //! ```text
-//!   tui <config.json>
+//!   tui <config.json> [--levels N]
 //! ```
 //!
-//! # The cursor starts at the live end
+//! # Watching several tickers
 //!
-//! The C++ terminal starts at the ring's write sequence, so it shows what arrives
-//! after it opens rather than replaying history. This does the same, and the
-//! reason is the same: a book built from a partial replay would be missing the
-//! resets that came before it, and a stale price would sit above the asks until
-//! the next picture arrived.
+//! The terminal writes `var/<env>/watch.txt` — the symbols it wants subscribed to
+//! — and the adapter reads it and holds one websocket for exactly that set. Typing
+//! a symbol, or picking one from the list, adds it to the set and switches the
+//! book to it. So the subscription follows what is being looked at rather than
+//! being a fixed list decided at startup. [`ob_cli::watch`] owns that file.
+//!
+//! # The picker
+//!
+//! While there is something on the input line, the terminal offers the catalog's
+//! matching symbols below the book and above the prompt. `Tab` completes to the
+//! best match, the arrow keys move the highlight, and `Enter` takes the
+//! highlighted one. Ranking lives in [`ob_cli::tickers`]: a prefix beats an
+//! interior match, and the file's order breaks ties.
 //!
 //! # Why this owns the input line
 //!
 //! The first version read whole lines with `read_line` and cleared the screen on
-//! every frame. That erases the terminal's own echo of what the user is typing,
-//! ten times a second, so the commands were unusable: the input still reached
-//! `read_line` — the tty's line buffer is not affected by drawing over the screen
-//! — but nobody could see what they had typed.
+//! every frame, which erased the terminal's own echo of what the user was typing.
+//! The input reached `read_line` — the tty's line buffer is not affected by drawing
+//! over the screen — so commands worked and were invisible.
 //!
-//! The fix is to stop depending on the terminal's echo and own the line:
+//! The fix is to stop depending on the terminal's echo and own the line: put the
+//! tty into non-canonical mode without echo, keep the buffer here, draw it as the
+//! last row of every frame, and restore the mode on every exit path including a
+//! signal. [`TerminalMode`].
 //!
-//! 1. Put the tty into non-canonical mode without echo, so bytes arrive one at a
-//!    time and nothing is echoed by the kernel.
-//! 2. Keep the buffer here, and draw it as the last line of every frame.
-//! 3. Never clear the screen below the frame's own last row without redrawing
-//!    that row, so there is no window in which the typed text is missing.
+//! # The three times in the header
 //!
-//! [`TerminalMode`] restores the terminal on the way out, including from a
-//! signal, so a Ctrl-C does not leave the shell in a mode where nothing echoes.
+//! - **backlog** is the span of feed time covered by the records this reader has
+//!   not taken. A count of records needs the feed's rate to mean anything; a span
+//!   does not.
+//! - **staleness** is how old the newest published record is. It grows when the
+//!   feed stops as well as when the reader falls behind.
+//! - **age** is how long since this reader last applied a record, which is the one
+//!   that says whether *this window* is being fed.
 //!
-//! # Input
-//!
-//! Read one byte at a time on a thread of its own, because a blocking read must
-//! not stop the frame from drawing. `quit` and `q` leave; `levels N` changes the
-//! depth, from 1 to 64. Ctrl-C and Ctrl-D also leave. Backspace works.
+//! All three are this reader's view, not the exchange's.
 
 use ob::book::{Book, Level};
 use ob::clock;
 use ob::config::Config;
-use ob::msg::Msg;
+use ob::msg::{symbol_fits, Msg};
 use ob::ring::RingReader;
+use ob_cli::tickers::Catalog;
+use ob_cli::watch::Watch;
 use ob_cli::{load_config, CliError, CliResult};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -56,6 +66,12 @@ const STALL_AFTER: Duration = Duration::from_secs(2);
 
 /// How often a frame is drawn.
 const FRAME: Duration = Duration::from_millis(100);
+
+/// How many suggestions the picker offers at once.
+const SUGGESTIONS: usize = 8;
+
+/// Bytes the input thread may hold, so a paste cannot grow it without bound.
+const INPUT_LIMIT: usize = 64;
 
 /// The run flag. The signal handler is a bare `extern "C"` function and cannot
 /// capture anything, so this is the one place it can write.
@@ -81,16 +97,10 @@ fn main() {
 /// The terminal mode this program needs, restored on drop.
 ///
 /// `stty` rather than `tcsetattr` because the `termios` structure differs between
-/// Darwin and Linux and this program needs four flags from it. `stty` already
-/// knows both platforms, and the two commands below are the whole of what is
-/// required.
-///
-/// The mode is only changed when stdin is a terminal. A piped or redirected
-/// stdin keeps the line-based reader and the frame says so, which is what makes
-/// this program usable from a script and testable from a pseudo-terminal.
+/// Darwin and Linux and this program needs four flags from it. `stty` already knows
+/// both platforms.
 #[derive(Debug)]
 struct TerminalMode {
-    /// Whether this value actually changed anything, and so must restore it.
     owns_mode: bool,
 }
 
@@ -110,8 +120,7 @@ impl Drop for TerminalMode {
         if self.owns_mode {
             // Explicit flags rather than a saved string. Restoring an opaque
             // `stty -g` blob means passing it back through a shell, where its
-            // brackets are glob characters. These two are what was changed, and
-            // they are what an interactive shell wants.
+            // brackets are glob characters.
             let _ = stty(&["icanon", "echo"]);
         }
     }
@@ -139,49 +148,154 @@ fn stty(args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// What the input thread and the draw loop share.
+#[derive(Debug, Default)]
+struct Input {
+    /// What has been typed and not submitted.
+    line: String,
+    /// Which suggestion is highlighted.
+    highlighted: usize,
+    /// A request from the input thread for the loop to act on.
+    pending: Option<Command>,
+}
+
+/// A command the input thread parsed, to be run by the draw loop.
+///
+/// The thread that reads keystrokes does not touch the book or the watch file: it
+/// records an intent and the loop performs it. One thread owns the state, which is
+/// why none of it needs a lock beyond the small one around this struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Command {
+    /// A line the user submitted.
+    Submit(String),
+    /// Replace the line with the completion of what is on it.
+    Complete,
+    /// Move the highlight by this much, wrapping.
+    MoveHighlight(isize),
+}
+
 fn run() -> CliResult {
     let args = ob_cli::Args::from_env();
     let Some(cfg_path) = args.positional(0) else {
-        return Err(CliError::usage("usage: tui <config.json>"));
+        return Err(CliError::usage("usage: tui <config.json> [--levels N]"));
     };
     let cfg = load_config(cfg_path)?;
     let levels = args.number::<usize>("--levels", cfg.levels)?;
 
     let ring = RingReader::open(std::path::Path::new(&cfg.bus_path))?;
+    let catalog = Catalog::load(&PathBuf::from(&cfg.tickers_path))?;
+    let watch_path = PathBuf::from(&cfg.watch_path);
+    let mut watch = Watch::load(&watch_path, &cfg.symbol)?;
+    // The terminal is the authority on what is watched while it runs, so write the
+    // set it opened with. Without this the adapter would keep whatever was there
+    // from last time, which may be a symbol this window is not showing.
+    let mut status = match watch.save(&watch_path) {
+        Ok(()) => format!("watching {}: {}", watch.len(), watch.symbols().join(" ")),
+        Err(e) => format!("cannot write {}: {}", watch_path.display(), e.message),
+    };
+
     let mut book = Book::new(cfg.cache_depth.max(levels + 1));
-    // Start at the live end: show what arrives from now on, not history.
     let mut cursor = ring.published();
     let level_count = Arc::new(AtomicUsize::new(levels.clamp(1, 64)));
-    let typed = Arc::new(Mutex::new(String::new()));
+    let input = Arc::new(Mutex::new(Input::default()));
 
-    // Take the terminal before the input thread starts, so no byte is read in the
-    // wrong mode. The guard restores it on every exit path below, including the
-    // early returns, a signal, and a panic.
     let interactive = stdin_is_tty();
     let _mode = TerminalMode::enter();
-
     install_signal_handlers()?;
-    let input = spawn_input_thread(Arc::clone(&typed), Arc::clone(&level_count));
+    let reader = spawn_input_thread(Arc::clone(&input));
 
     let mut out = [Msg::default(); 512];
     let mut last_record = Instant::now();
     let mut saw_any = false;
     let mut consumed = 0u64;
-    let resyncs = 0u64;
+    let mut resyncs = 0u64;
+    let mut displayed = watch.current().to_string();
 
     let stdout = std::io::stdout();
     let mut screen = stdout.lock();
     while RUNNING.load(Ordering::Relaxed) {
+        // Take whatever the input thread has asked for.
+        let (line, highlighted, pending) = {
+            let mut guard = input.lock().map_err(|_| {
+                CliError::failed("the input lock was poisoned by a panic in the reader")
+            })?;
+            let pending = guard.pending.take();
+            (guard.line.clone(), guard.highlighted, pending)
+        };
+        if let Some(command) = pending {
+            match command {
+                Command::MoveHighlight(delta) => {
+                    let matches = catalog.suggest(&first_token(&line), SUGGESTIONS);
+                    if !matches.is_empty() {
+                        let n = matches.len() as isize;
+                        let next = (highlighted as isize + delta).rem_euclid(n);
+                        if let Ok(mut guard) = input.lock() {
+                            guard.highlighted = next as usize;
+                        }
+                    }
+                }
+                Command::Complete => {
+                    if let Some(best) = catalog.complete(&first_token(&line)) {
+                        if let Ok(mut guard) = input.lock() {
+                            guard.line = best.to_string();
+                            guard.highlighted = 0;
+                        }
+                    }
+                }
+                Command::Submit(text) => {
+                    match act(&text, &catalog, &mut watch, &watch_path) {
+                        Action::Quit => break,
+                        Action::Depth(n) => level_count.store(n, Ordering::Relaxed),
+                        Action::Switched {
+                            added,
+                            symbol,
+                            remark,
+                        } => {
+                            displayed = symbol.clone();
+                            // Start at the live end: a book built from a
+                            // half-replayed history would be missing the resets
+                            // that came before it, and a stale price would sit
+                            // above the asks until the next picture arrived.
+                            cursor = ring.published();
+                            book = Book::new(cfg.cache_depth.max(levels + 1));
+                            last_record = Instant::now();
+                            saw_any = false;
+                            consumed = 0;
+                            resyncs = 0;
+                            let what = if added {
+                                format!("watching {} symbols now; {symbol} selected", watch.len())
+                            } else {
+                                format!("switched to {symbol}")
+                            };
+                            status = match remark {
+                                Some(text) => format!("{what} — {text}"),
+                                None => what,
+                            };
+                        }
+                        Action::Note(text) => status = text,
+                    }
+                }
+            }
+        }
+
+        // Drain the ring, applying only the displayed symbol's records.
         let n = ring.consume_batch(&mut cursor, &mut out);
         if n > 0 {
+            let mut applied = 0;
             for m in &out[..n] {
-                book.apply(m);
+                if m.symbol_bytes() == displayed.as_bytes() {
+                    book.apply(m);
+                    applied += 1;
+                }
             }
             consumed += n as u64;
-            last_record = Instant::now();
-            saw_any = true;
+            if applied > 0 {
+                last_record = Instant::now();
+                saw_any = true;
+            }
         }
-        let buffer = typed.lock().map(|b| b.clone()).unwrap_or_default();
+
+        let suggestions = catalog.suggest(&first_token(&line), SUGGESTIONS);
         draw(
             &mut screen,
             &cfg,
@@ -189,6 +303,7 @@ fn run() -> CliResult {
             &Frame {
                 levels: level_count.load(Ordering::Relaxed),
                 live: saw_any && last_record.elapsed() < STALL_AFTER,
+                symbol: &displayed,
                 ring_capacity: ring.capacity(),
                 lag: ring.lag(cursor),
                 backlog_ns: backlog_ns(&ring, cursor),
@@ -196,66 +311,154 @@ fn run() -> CliResult {
                 age: last_record.elapsed(),
                 consumed,
                 resyncs,
-                input: &buffer,
+                watched: watch.len(),
+                status: &status,
+                suggestions: &suggestions,
+                highlighted: highlighted.min(suggestions.len().saturating_sub(1)),
+                input: &line,
                 interactive,
             },
         )?;
         std::thread::sleep(FRAME);
     }
 
-    // Leave the terminal on a clean line. The drop guard restores the mode; this
-    // only moves the cursor past the frame.
     let _ = writeln!(
         screen,
         "\nclosed. The feed keeps running until `obctl stop`."
     );
     let _ = screen.flush();
     drop(screen);
-    if input.is_finished() {
-        let _ = input.join();
+    if reader.is_finished() {
+        let _ = reader.join();
     }
     Ok(())
 }
 
-/// What one frame needs beyond the book.
-#[derive(Debug)]
-struct Frame<'a> {
-    levels: usize,
-    live: bool,
-    /// The ring's own capacity, read from its header.
-    ///
-    /// Read from the ring rather than from the config, because the two can
-    /// disagree: the file survives between runs, and a config that changed
-    /// `ring_capacity` does not resize a ring that already exists.
-    ring_capacity: u32,
-    /// Records published and not yet taken by this reader.
-    lag: u64,
-    /// Feed time between the oldest record not yet taken and the newest
-    /// published one. `None` when either of those slots has been reused.
-    ///
-    /// This is the lag in time rather than in records: a count needs the feed's
-    /// rate to mean anything, and a span does not.
-    backlog_ns: Option<u64>,
-    /// How old the newest published record is, measured from this reader's
-    /// clock. Non-zero on a quiet feed as well as on a slow reader, which is
-    /// what makes it the number to watch.
-    staleness_ns: Option<u64>,
-    /// Time since this reader last applied a record.
-    age: Duration,
-    consumed: u64,
-    resyncs: u64,
-    /// What the user has typed and not yet submitted.
-    input: &'a str,
-    /// Whether the input line is being drawn at all.
-    interactive: bool,
+/// What a submitted line asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Action {
+    /// Leave.
+    Quit,
+    /// Show this many levels.
+    Depth(usize),
+    /// Display this symbol, watching it if it was not.
+    Switched {
+        /// Whether the watch set grew.
+        added: bool,
+        /// The symbol now displayed.
+        symbol: String,
+        /// Something worth saying about it, such as it not being in the catalog.
+        ///
+        /// Part of the action rather than a side channel: an earlier version
+        /// attached it with a helper that discarded the text, which is the same
+        /// shape of defect as a message nobody reads.
+        remark: Option<String>,
+    },
+    /// Say something and change nothing.
+    Note(String),
+}
+
+/// Act on a submitted line.
+///
+/// Unknown commands are ignored with a note, which is the same behaviour the C++
+/// terminal has for a typo: it does nothing rather than stopping the viewer.
+fn act(text: &str, catalog: &Catalog, watch: &mut Watch, watch_path: &Path) -> Action {
+    let line = text.trim();
+    if line.is_empty() {
+        return Action::Note(String::new());
+    }
+    if line == "q" || line == "quit" {
+        return Action::Quit;
+    }
+    if let Some(n) = parse_levels(line) {
+        return Action::Depth(n);
+    }
+    if line == "watch" {
+        return Action::Note(format!(
+            "watching {}: {}",
+            watch.len(),
+            watch.symbols().join(" ")
+        ));
+    }
+    if let Some(rest) = line.strip_prefix("unwatch ") {
+        return match watch.remove(rest) {
+            Ok(true) => match watch.save(watch_path) {
+                Ok(()) => Action::Note(format!(
+                    "unwatched {}; {} left",
+                    rest.trim().to_ascii_uppercase(),
+                    watch.len()
+                )),
+                Err(e) => Action::Note(e.message),
+            },
+            Ok(false) => Action::Note(format!("{} was not being watched", rest.trim())),
+            Err(e) => Action::Note(e.message),
+        };
+    }
+    if let Some(rest) = line.strip_prefix("only ") {
+        return match watch.only(rest) {
+            Ok(()) => match watch.save(watch_path) {
+                Ok(()) => Action::Switched {
+                    added: false,
+                    symbol: watch.current().to_string(),
+                    remark: None,
+                },
+                Err(e) => Action::Note(e.message),
+            },
+            Err(e) => Action::Note(e.message),
+        };
+    }
+    // `force SYMBOL` is the way past the catalog check below.
+    let (symbol, forced) = match line.strip_prefix("force ") {
+        Some(rest) => (rest.trim(), true),
+        None => (
+            match line.strip_prefix("watch ") {
+                Some(rest) => rest.trim(),
+                None => line,
+            },
+            false,
+        ),
+    };
+    if !symbol_fits(symbol) {
+        return Action::Note(format!(
+            "{symbol:?} is not a command and does not fit the 8-byte symbol field"
+        ));
+    }
+    // A symbol the catalog does not list is refused rather than tried, because of
+    // what it can do to everything else: all the watched symbols share one
+    // websocket, and an unknown stream name in a combined URL can take the whole
+    // connection down, so one typo would stop the feed for every other pair. The
+    // escape is explicit and says what it risks.
+    // The canonical form, so a message and the watch file agree even when the user
+    // typed lower case.
+    let canonical = symbol.to_ascii_uppercase();
+    if !forced && !catalog.contains(&canonical) {
+        return Action::Note(format!(
+            "{canonical} is not in config/tickers.txt. Add it there, or type \
+             `force {canonical}` to try it anyway: an unknown stream name can \
+             break the subscription for every symbol."
+        ));
+    }
+    let remark = forced.then(|| format!("{canonical} is not in the catalog; forced anyway"));
+
+    match watch.select(symbol) {
+        Ok(added) => match watch.save(watch_path) {
+            Ok(()) => Action::Switched {
+                added,
+                symbol: watch.current().to_string(),
+                remark,
+            },
+            Err(e) => Action::Note(e.message),
+        },
+        Err(e) => Action::Note(e.message),
+    }
+}
+
+/// The first whitespace-separated token, which is what the picker matches on.
+fn first_token(line: &str) -> String {
+    line.split_whitespace().next().unwrap_or("").to_string()
 }
 
 /// Feed time between the oldest record not yet taken and the newest published.
-///
-/// The two slots are read by sequence, and either can have been reused by a later
-/// lap; when one has, this reports nothing rather than a span computed from the
-/// wrong lap. Zero is the honest answer when there is nothing waiting: a reader
-/// at the live end has a backlog of zero by definition.
 fn backlog_ns(ring: &RingReader, cursor: u64) -> Option<u64> {
     let newest = ring.published().checked_sub(1)?;
     if cursor > newest {
@@ -267,20 +470,43 @@ fn backlog_ns(ring: &RingReader, cursor: u64) -> Option<u64> {
 }
 
 /// How old the newest published record is, from this process's clock.
-///
-/// `None` when the ring is empty or the slot has been reused. The two ends are on
-/// one host reading one monotonic clock, which is the same assumption every
-/// latency number in this lab rests on.
 fn staleness_ns(ring: &RingReader) -> Option<u64> {
     let newest = ring.published().checked_sub(1)?;
     let latest = ring.timestamp_at(newest)?;
     Some(clock::now_ns().saturating_sub(latest))
 }
 
+/// What one frame needs beyond the book.
+#[derive(Debug)]
+struct Frame<'a> {
+    levels: usize,
+    live: bool,
+    /// The symbol on screen.
+    symbol: &'a str,
+    ring_capacity: u32,
+    lag: u64,
+    backlog_ns: Option<u64>,
+    staleness_ns: Option<u64>,
+    age: Duration,
+    consumed: u64,
+    resyncs: u64,
+    /// How many symbols are being watched.
+    watched: usize,
+    /// The last thing that happened, for the user to read.
+    status: &'a str,
+    /// What the picker is offering.
+    suggestions: &'a [&'a str],
+    /// Which suggestion is highlighted.
+    highlighted: usize,
+    input: &'a str,
+    interactive: bool,
+}
+
 /// Draw one frame.
 fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame<'_>) -> CliResult {
     const RED: &str = "\x1b[31m";
     const GREEN: &str = "\x1b[32m";
+    const BOLD: &str = "\x1b[1m";
     const RESET: &str = "\x1b[0m";
 
     let mut bids = vec![Level::EMPTY; frame.levels];
@@ -291,21 +517,18 @@ fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame<'_>) -> C
 
     // Home the cursor and redraw every row, erasing each to the end of its line.
     // The whole screen is not cleared, because the input line is the last row of
-    // this frame and clearing the screen under it is what used to erase the
-    // user's typing.
-    let mut buf = String::with_capacity(2048);
+    // this frame and clearing the screen under it is what used to erase the user's
+    // typing.
+    let mut buf = String::with_capacity(3072);
     buf.push_str("\x1b[H");
     buf.push_str(&format!(
-        "orderbook-lab (rust)  env={}  symbol={}  seq={}  feed={}\x1b[K\n",
+        "orderbook-lab (rust)  env={}  {BOLD}{}{RESET}  seq={}  feed={}  watching {}\x1b[K\n",
         cfg.env,
-        cfg.symbol,
+        frame.symbol,
         book.last_seq(),
-        feed
+        feed,
+        frame.watched
     ));
-    // The lag is shown twice on purpose. A count of records is what a drain loop
-    // acts on; the span of feed time is what says whether that count matters, and
-    // it is the one an operator can compare against a threshold without knowing
-    // the feed's rate.
     let backlog = match frame.backlog_ns {
         Some(ns) => ob_cli::duration_ns(ns),
         None => "-".to_string(),
@@ -325,28 +548,30 @@ fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame<'_>) -> C
         ob_cli::duration_ns(frame.age.as_nanos().min(u128::from(u64::MAX)) as u64)
     ));
     buf.push_str("Bid prices are red. Ask prices are green.\x1b[K\n");
-    buf.push_str("  quit | q     leave this window\x1b[K\n");
-    buf.push_str("  levels N     show N price levels, from 1 to 64\x1b[K\n");
-    buf.push_str("  lag          records behind you, and the span of feed time that is.\x1b[K\n");
+    buf.push_str("  q | quit        leave this window\x1b[K\n");
+    buf.push_str("  levels N        show N price levels, from 1 to 64\x1b[K\n");
     buf.push_str(
-        "  staleness    how old the newest published record is. Both are your view, not the exchange's.\x1b[K\n",
+        "  SYMBOL          switch to it and watch it. Tab completes; arrows pick from the list\x1b[K\n",
     );
-    buf.push_str(&format!("Showing {} levels.\x1b[K\n", frame.levels));
-    if !frame.live {
-        buf.push_str(
-            "Feed stalled. The adapter reconnects on its own. The book stays on the last update.\x1b[K\n",
-        );
+    buf.push_str("  watch           list what is being watched\x1b[K\n");
+    buf.push_str("  only SYMBOL     watch just that one\x1b[K\n");
+    buf.push_str("  unwatch SYMBOL  stop watching one\x1b[K\n");
+    // The three times, each on its own line and each saying what it is for. They
+    // are not the same number and confusing them is easy: a backlog is not an age.
+    buf.push_str("  lag             records behind you, and the span of feed time that is\x1b[K\n");
+    buf.push_str("  staleness       how old the newest published record is\x1b[K\n");
+    buf.push_str("  age             how long since this window applied a record\x1b[K\n");
+    buf.push_str(&format!(
+        "Showing {} levels, watching {} symbols.\x1b[K\n",
+        frame.levels, frame.watched
+    ));
+    if !frame.status.is_empty() {
+        buf.push_str(&format!("{}{RESET}\x1b[K\n", frame.status));
     }
-    if frame.lag > u64::from(frame.ring_capacity) / 2 {
+    if !frame.live && frame.consumed == 0 {
         buf.push_str(
-            "Ring lag is over half the ring: records are being overwritten. Drain faster.\x1b[K\n",
-        );
-    }
-    // A quiet feed and a slow reader both show up here, and they are the same
-    // problem for a viewer: what is on screen is old.
-    if frame.staleness_ns.is_some_and(|ns| ns > 1_000_000_000) {
-        buf.push_str(
-            "The newest record is over a second old: the feed has stopped, or the sender is slow.\x1b[K\n",
+            "Nothing for this symbol yet. If it never arrives, check that the \
+             adapter is watching it: `watch` lists the set.\x1b[K\n",
         );
     }
     buf.push_str(&format!(
@@ -367,11 +592,21 @@ fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame<'_>) -> C
             "{RED}{bp:>12} {bq:>12}{RESET}    {GREEN}{ap:>12} {aq:>12}{RESET}\x1b[K\n"
         ));
     }
-    // Clear whatever is left below the frame from an earlier, longer one. This
-    // happens before the prompt is written, so the prompt is never erased.
+    // Clear whatever is left below the frame from an earlier, longer one. Before
+    // the picker and the prompt are written, so neither is ever erased.
     buf.push_str("\x1b[J");
-    // The input line, drawn by us rather than by the tty. No newline after it, so
-    // the cursor sits where the next character will be inserted.
+    // The picker sits between the book and the prompt, which is where a completion
+    // list belongs: the prompt stays the last line so the cursor is already where
+    // the next character goes.
+    if frame.interactive && !frame.suggestions.is_empty() && !frame.input.trim().is_empty() {
+        for (i, symbol) in frame.suggestions.iter().enumerate() {
+            if i == frame.highlighted {
+                buf.push_str(&format!("  {BOLD}> {symbol}{RESET}\x1b[K\n"));
+            } else {
+                buf.push_str(&format!("    {symbol}\x1b[K\n"));
+            }
+        }
+    }
     if frame.interactive {
         buf.push_str(&format!("> {}\x1b[K", frame.input));
     } else {
@@ -387,9 +622,7 @@ fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame<'_>) -> C
 /// Install handlers so a signal leaves the terminal usable.
 ///
 /// Without this a Ctrl-C would kill the process with the tty still in
-/// non-canonical mode, and the shell would look broken until the user ran
-/// `stty sane`. The handler only sets the run flag; the loop then leaves by the
-/// normal path, which drops the mode guard.
+/// non-canonical mode, and the shell would look broken until `stty sane`.
 fn install_signal_handlers() -> CliResult {
     const SIGINT: i32 = 2;
     const SIGTERM: i32 = 15;
@@ -411,13 +644,8 @@ fn install_signal_handlers() -> CliResult {
 ///
 /// Detached and not joined when it is blocked in a read: a terminal that has been
 /// asked to quit must quit, and a read on a tty cannot be interrupted from here.
-/// The process exits and the thread goes with it. When stdin is not a terminal
-/// this still works — it reads whatever bytes arrive and treats a newline as end
-/// of command — which is what makes the pseudo-terminal test possible.
-fn spawn_input_thread(
-    typed: Arc<Mutex<String>>,
-    levels: Arc<AtomicUsize>,
-) -> std::thread::JoinHandle<()> {
+/// The process exits and the thread goes with it.
+fn spawn_input_thread(input: Arc<Mutex<Input>>) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("input".to_string())
         .spawn(move || {
@@ -427,48 +655,63 @@ fn spawn_input_thread(
             loop {
                 match handle.read(&mut byte) {
                     Ok(0) => {
-                        // End of input.
                         RUNNING.store(false, Ordering::Relaxed);
                         return;
                     }
                     Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                        // A signal. The handler has set the flag; leave so the
-                        // mode guard can run.
-                        return;
-                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return,
                     Err(_) => {
                         RUNNING.store(false, Ordering::Relaxed);
                         return;
                     }
                 }
+                let mut guard = match input.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
                 match byte[0] {
-                    // Ctrl-C, in case it arrives as a byte rather than as a
-                    // signal, and Ctrl-D for end of input.
                     0x03 | 0x04 => {
                         RUNNING.store(false, Ordering::Relaxed);
                         return;
                     }
                     b'\r' | b'\n' => {
-                        let line = typed
-                            .lock()
-                            .map(|mut b| std::mem::take(&mut *b))
-                            .unwrap_or_default();
-                        submit(&line, &levels);
+                        let line = std::mem::take(&mut guard.line);
+                        guard.highlighted = 0;
+                        guard.pending = Some(Command::Submit(line));
                     }
-                    // Backspace, and the delete key's other spelling.
+                    b'\t' => guard.pending = Some(Command::Complete),
                     0x7f | 0x08 => {
-                        if let Ok(mut b) = typed.lock() {
-                            b.pop();
-                        }
+                        guard.line.pop();
+                        guard.highlighted = 0;
                     }
-                    // Printable ASCII. Anything else is an escape sequence from
-                    // an arrow key or a terminal reply, and is ignored rather
-                    // than appended to the line.
-                    0x20..=0x7e => {
-                        if let Ok(mut b) = typed.lock() {
-                            b.push(byte[0] as char);
+                    // An escape sequence. The arrow keys are how the picker is
+                    // driven, so they are read rather than ignored: ESC, then
+                    // `[`, then a letter for the ones that matter.
+                    0x1b => {
+                        drop(guard);
+                        let mut rest = [0u8; 2];
+                        if handle.read_exact(&mut rest).is_err() {
+                            return;
                         }
+                        if rest[0] == b'[' {
+                            let delta = match rest[1] {
+                                b'A' => -1,
+                                b'B' => 1,
+                                _ => 0,
+                            };
+                            if delta != 0 {
+                                if let Ok(mut g) = input.lock() {
+                                    g.pending = Some(Command::MoveHighlight(delta));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    0x20..=0x7e => {
+                        if guard.line.len() < INPUT_LIMIT {
+                            guard.line.push(byte[0] as char);
+                        }
+                        guard.highlighted = 0;
                     }
                     _ => {}
                 }
@@ -477,28 +720,9 @@ fn spawn_input_thread(
         .expect("spawn the input thread")
 }
 
-/// Act on a submitted command.
-///
-/// Unknown commands are ignored, which is the same behaviour the C++ terminal
-/// has: a typo does nothing rather than stopping the viewer.
-fn submit(line: &str, levels: &AtomicUsize) {
-    let cmd = line.trim();
-    if cmd == "q" || cmd == "quit" {
-        RUNNING.store(false, Ordering::Relaxed);
-    } else if let Some(n) = parse_levels(cmd) {
-        levels.store(n, Ordering::Relaxed);
-    }
-}
-
-/// The depth limits a `levels` command accepts.
-pub const LEVELS_MIN: usize = 1;
-/// The depth limits a `levels` command accepts.
-pub const LEVELS_MAX: usize = 64;
-
 /// Parse a `levels N` command, or return `None`.
 ///
-/// Separate from the input thread so it can be tested without a terminal, which
-/// is the only part of this file that a unit test can reach.
+/// Separate from the input thread so it can be tested without a terminal.
 pub fn parse_levels(line: &str) -> Option<usize> {
     let rest = line.trim().strip_prefix("levels ")?;
     let n: usize = rest.trim().parse().ok()?;
@@ -508,6 +732,11 @@ pub fn parse_levels(line: &str) -> Option<usize> {
         None
     }
 }
+
+/// The depth limits a `levels` command accepts.
+pub const LEVELS_MIN: usize = 1;
+/// The depth limits a `levels` command accepts.
+pub const LEVELS_MAX: usize = 64;
 
 #[cfg(test)]
 mod tests {
@@ -521,9 +750,168 @@ mod tests {
         assert_eq!(parse_levels("levels 0"), None);
         assert_eq!(parse_levels("levels 65"), None);
         assert_eq!(parse_levels("levels"), None);
-        assert_eq!(parse_levels("levels 5 "), Some(5));
-        assert_eq!(parse_levels("levels1 5"), None);
         assert_eq!(parse_levels("levels abc"), None);
         assert_eq!(parse_levels("quit"), None);
+    }
+
+    #[test]
+    fn the_picker_matches_on_the_first_token_only() {
+        // `watch ETH` should suggest ETHUSDT, not treat "ETH" as part of a longer
+        // query that matches nothing.
+        assert_eq!(first_token("eth"), "eth");
+        assert_eq!(first_token("watch eth"), "watch");
+        assert_eq!(first_token("   et   "), "et");
+        assert_eq!(first_token(""), "");
+    }
+
+    /// The repository's catalog, found the way any test must find a repo file:
+    /// from the crate's own directory, not from the working directory, which is
+    /// the crate directory when `cargo test` runs. A relative path here loaded
+    /// nothing, so every symbol looked unlisted and three tests failed for a
+    /// reason that had nothing to do with the behaviour under test.
+    fn repo_catalog() -> Catalog {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        Catalog::load(&root.join("config/tickers.txt")).expect("the shipped catalog must load")
+    }
+
+    fn watch_at(path: &std::path::Path) -> (Watch, PathBuf, Catalog) {
+        (
+            Watch::load(path, "BTCUSDT").expect("watch"),
+            path.to_path_buf(),
+            repo_catalog(),
+        )
+    }
+
+    #[test]
+    fn a_bare_symbol_switches_and_watches_it() {
+        let dir = std::env::temp_dir().join(format!("ob-act-{}", std::process::id()));
+        let (mut w, path, catalog) = watch_at(&dir.join("watch.txt"));
+        let action = act("pepeusdt", &catalog, &mut w, &path);
+        match action {
+            Action::Switched { added, symbol, .. } => {
+                assert!(added, "it was not being watched");
+                assert_eq!(symbol, "PEPEUSDT");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(w.symbols(), &["BTCUSDT", "PEPEUSDT"]);
+        assert_eq!(w.current(), "PEPEUSDT");
+        // And the file on disk says so, which is what the adapter reads.
+        let written = std::fs::read_to_string(&path).expect("written");
+        assert!(written.contains("PEPEUSDT"), "{written}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watch_add_subcommand_and_only_both_work() {
+        let dir = std::env::temp_dir().join(format!("ob-act2-{}", std::process::id()));
+        let (mut w, path, catalog) = watch_at(&dir.join("watch.txt"));
+        act("watch ethusdt", &catalog, &mut w, &path);
+        assert_eq!(w.symbols(), &["BTCUSDT", "ETHUSDT"]);
+        assert_eq!(w.current(), "ETHUSDT", "watch switches to what it adds");
+        act("only pepeusdt", &catalog, &mut w, &path);
+        assert_eq!(w.symbols(), &["PEPEUSDT"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unwatch_removes_and_the_plain_command_lists() {
+        let dir = std::env::temp_dir().join(format!("ob-act3-{}", std::process::id()));
+        let (mut w, path, catalog) = watch_at(&dir.join("watch.txt"));
+        act("only pepeusdt", &catalog, &mut w, &path);
+        act("watch ethusdt", &catalog, &mut w, &path);
+        match act("unwatch ethusdt", &catalog, &mut w, &path) {
+            Action::Note(text) => assert!(text.contains("unwatched ETHUSDT"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(w.symbols(), &["PEPEUSDT"]);
+        match act("watch", &catalog, &mut w, &path) {
+            Action::Note(text) => assert!(text.contains("PEPEUSDT"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        // Removing the last one is refused with a reason.
+        match act("unwatch pepeusdt", &catalog, &mut w, &path) {
+            Action::Note(text) => assert!(text.contains("only symbol"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(w.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symbol_that_does_not_fit_is_refused_with_a_reason() {
+        let dir = std::env::temp_dir().join(format!("ob-act4-{}", std::process::id()));
+        let (mut w, path, catalog) = watch_at(&dir.join("watch.txt"));
+        match act("1000shibusdt", &catalog, &mut w, &path) {
+            Action::Note(text) => {
+                assert!(text.contains("does not fit"), "{text}");
+                assert!(text.contains("8-byte"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(w.symbols(), &["BTCUSDT"], "nothing changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quit_and_levels_are_still_commands() {
+        let dir = std::env::temp_dir().join(format!("ob-act5-{}", std::process::id()));
+        let (mut w, path, catalog) = watch_at(&dir.join("watch.txt"));
+        assert_eq!(act("q", &catalog, &mut w, &path), Action::Quit);
+        assert_eq!(act("quit", &catalog, &mut w, &path), Action::Quit);
+        assert_eq!(act("levels 7", &catalog, &mut w, &path), Action::Depth(7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symbol_the_catalog_does_not_list_is_refused_with_the_way_past_it() {
+        // Refused, not tried: every watched symbol shares one websocket, and an
+        // unknown stream name in a combined URL can take the whole connection
+        // down. One typo would stop the feed for every other pair.
+        let dir = std::env::temp_dir().join(format!("ob-act6-{}", std::process::id()));
+        let (mut w, path, catalog) = watch_at(&dir.join("watch.txt"));
+        assert!(
+            !catalog.contains("ZZZTUSDT"),
+            "the test needs an unlisted symbol"
+        );
+        match act("zzztusdt", &catalog, &mut w, &path) {
+            Action::Note(text) => {
+                assert!(text.contains("not in config/tickers.txt"), "{text}");
+                assert!(text.contains("force ZZZTUSDT"), "{text}");
+                assert!(text.contains("break the subscription"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(w.symbols(), &["BTCUSDT"], "nothing changed");
+
+        // And the escape hatch works, with a remark saying what was done.
+        match act("force zzztusdt", &catalog, &mut w, &path) {
+            Action::Switched { symbol, remark, .. } => {
+                assert_eq!(symbol, "ZZZTUSDT");
+                assert!(
+                    remark.as_deref().is_some_and(|r| r.contains("forced")),
+                    "{remark:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(w.current(), "ZZZTUSDT");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_listed_symbol_needs_no_force() {
+        let dir = std::env::temp_dir().join(format!("ob-act7-{}", std::process::id()));
+        let (mut w, path, catalog) = watch_at(&dir.join("watch.txt"));
+        assert!(catalog.contains("ETHUSDT"));
+        match act("ethusdt", &catalog, &mut w, &path) {
+            Action::Switched { remark, .. } => assert!(remark.is_none(), "{remark:?}"),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

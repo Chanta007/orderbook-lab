@@ -80,6 +80,17 @@ FRAME_DEADLINE = 10.0
 EXIT_DEADLINE = 5.0
 
 
+def plain(text: str) -> str:
+    """The text without the cursor and colour escapes.
+
+    A failure message that quotes a raw frame is a wall of `\x1b[K` and unreadable.
+    Stripping them is what makes an assertion failure something you can act on.
+    """
+    import re
+
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+
+
 def newest_source_mtime() -> float:
     """The newest modification time under the Rust sources."""
     newest = 0.0
@@ -364,9 +375,10 @@ class TuiInput(unittest.TestCase):
                         if "Showing 7 levels." in after:
                             break
                     self.assertIn(
-                        "Showing 7 levels.",
+                        "Showing 7 levels",
                         after,
-                        f"{name}: `levels 7` did not take effect. Got: {after[-400:]!r}",
+                        f"{name}: `levels 7` did not take effect. Got: "
+                        f"{plain(after)[-300:]!r}",
                     )
 
                     # 5. Quitting works, and the terminal is handed back.
@@ -388,6 +400,111 @@ class TuiInput(unittest.TestCase):
                         child.send_signal(signal.SIGKILL)
                         child.wait(timeout=EXIT_DEADLINE)
                     os.close(master)
+
+    def test_the_picker_switches_ticker_and_writes_the_watch_file(self):
+        """Typing a prefix, completing it, and switching.
+
+        The picker is the visible half of a two-process arrangement: the terminal
+        writes the watch file and the adapter subscribes to what is in it. This
+        checks the half that can be checked without a network, and that the
+        subscription follows the selection rather than being fixed at startup.
+        """
+        name, binary = TERMINALS[0]
+        reason = skip_reason(binary)
+        if reason is not None:
+            self.skipTest(reason)
+        self.start_feeder(name)
+        self.feed_fixture()
+
+        master, slave = pty.openpty()
+        initial = termios.tcgetattr(slave)
+        initial[3] |= termios.ICANON | termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, initial)
+        child = subprocess.Popen(
+            [str(binary), str(self.config)],
+            cwd=str(ROOT),
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+        )
+        os.close(slave)
+        watch = self.workdir / "watch.txt"
+        try:
+            first = self.drain(master, time.monotonic() + FRAME_DEADLINE)
+            self.assertIn("orderbook-lab", first, first[:300])
+
+            # The terminal is the authority on what is watched while it runs, so
+            # it writes the file on open.
+            self.assertTrue(watch.exists(), "the terminal wrote no watch file")
+            self.assertIn("BTCUSDT", watch.read_text())
+
+            # 1. A prefix offers the matching symbols.
+            os.write(master, b"eth")
+            offered = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                offered += self.drain(master, time.monotonic() + 0.4)
+                if "ETHUSDT" in offered:
+                    break
+            self.assertIn(
+                "ETHUSDT",
+                offered,
+                f"{name}: the picker offered nothing for 'eth'. Got: {offered[-400:]!r}",
+            )
+
+            # 2. Tab completes the line to it.
+            os.write(master, b"\t")
+            completed = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                completed += self.drain(master, time.monotonic() + 0.4)
+                if "> ETHUSDT" in completed:
+                    break
+            self.assertIn(
+                "> ETHUSDT",
+                completed,
+                f"{name}: Tab did not complete the line. Got: {completed[-300:]!r}",
+            )
+
+            # 3. Enter switches, and the subscription grows with it.
+            os.write(master, b"\r")
+            switched = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                switched += self.drain(master, time.monotonic() + 0.4)
+                if "ETHUSDT" in switched and "watching 2" in switched:
+                    break
+            self.assertIn(
+                "watching 2",
+                switched,
+                f"{name}: the switch did not add a second symbol. Got: {switched[-400:]!r}",
+            )
+            written = watch.read_text()
+            self.assertIn("ETHUSDT", written, "the watch file did not grow")
+            self.assertIn("BTCUSDT", written, "the first symbol was dropped")
+
+            # 4. A symbol the catalog does not list is refused, with the way past
+            #    it named. Refused rather than tried because every watched symbol
+            #    shares one websocket.
+            os.write(master, b"zzzqqq\r")
+            refused = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                refused += self.drain(master, time.monotonic() + 0.4)
+                if "not in config/tickers.txt" in refused:
+                    break
+            self.assertIn("not in config/tickers.txt", refused, f"{name}: {refused[-300:]!r}")
+            self.assertIn("force ZZZQQQ", refused, "the escape hatch was not named")
+            self.assertNotIn(
+                "ZZZQQQ",
+                [line for line in watch.read_text().splitlines() if not line.startswith("#")],
+                "a refused symbol was written to the watch file anyway",
+            )
+        finally:
+            if child.poll() is None:
+                child.send_signal(signal.SIGKILL)
+                child.wait(timeout=EXIT_DEADLINE)
+            os.close(master)
 
     def test_a_signal_restores_the_terminal(self):
         """Ctrl-C must not leave the shell without echo.

@@ -29,6 +29,9 @@ slippage and backpressure as first-class reported quantities
 | `rust/ob-cli/src/ingest.rs` | Accepting connections and reading whole records. |
 | `rust/ob-cli/src/bin/` | `feedd`, `tui`, `headless`, `obsoak`, `vecbench`. |
 | `python/test_tui_input.py` | The terminal test: a pseudo-terminal, keystrokes, and what came back. |
+| `rust/ob-cli/src/tickers.rs` | The ticker catalog and the picker's ranking. |
+| `rust/ob-cli/src/watch.rs` | The watch set, and the atomic write that tells the adapter about it. |
+| `config/tickers.txt` | The symbols the picker offers. Editable; symbols over 8 bytes are refused. |
 
 ## 3. Architecture
 
@@ -164,11 +167,32 @@ serves both:
 | `pressure_elevated_ns` | 1000000 | Lag at which a subscriber reports elevated. |
 | `pressure_saturated_ns` | 10000000 | Lag at which it reports saturated. |
 | `expected_interval_ns` | 100000 | Expected record interval, for the coordinated-omission correction. |
+| `watch_path` | beside `bus_path` | The file the terminal writes to say what to subscribe to. Derived from `bus_path` in both implementations. |
+| `tickers_path` | `config/tickers.txt` | The symbols the picker suggests from. |
 
 `python/obctl.py --impl rust` drives the Rust binaries from the same commands as
 the C++ ones. The Python adapter is shared: it speaks the wire protocol to either.
 
-### 3.6 The terminal owns its input line
+### 3.6 One websocket, several tickers
+
+The adapter holds one combined Binance stream for the whole watch set rather than
+a connection per symbol. Each payload names its own stream, so one connection can
+carry fifty pairs and every record still says which pair it belongs to. The
+adapter polls the watch file between frames and reconnects when the set changes,
+which is what makes the subscription follow what is being looked at instead of
+being fixed at startup.
+
+**An unknown stream name can break that connection for every symbol**, which is
+why the terminal refuses a symbol the catalog does not list and names a `force`
+escape rather than trying it. Ledger OPT-036.
+
+The eight-byte symbol field is the other limit: any pair whose name is longer —
+`1000SHIBUSDT`, `1000SATSUSDT` — cannot be carried, and the catalog loader refuses
+one rather than truncating it, because `1000SHIBUSDT` and `1000SATSUSDT` both
+truncate to `1000SHIB` and a reader would show one pair's prices under the other's
+name. Ledger OPT-035.
+
+### 3.7 The terminal owns its input line
 
 `tui` puts the tty into non-canonical mode with echo off, keeps the input buffer
 itself, and draws it as the last row of every frame. The first version read whole

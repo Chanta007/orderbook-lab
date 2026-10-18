@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunsplit
 
 MAGIC = 0x4F424C42
 MSG_FMT = "<IHBBQQ16s8sqq8s"
@@ -36,13 +36,118 @@ DEPTH = 1
 DEPTH_RESET = 4
 
 
+# The default market-data host and its depth stream. One string, so a config that
+# does not set `ws_url` and the combined URL built from it cannot disagree.
+DEFAULT_WS_URL = "wss://data-stream.binance.vision:443/ws/btcusdt@depth5@100ms"
+
+# The wire record carries a symbol in a fixed eight-byte field, so this is the
+# most a symbol can be. Anything longer cannot be carried, and truncating it would
+# map distinct pairs onto the same bytes: a reader would show one pair's prices
+# under another's name.
+SYMBOL_BYTES = 8
+
+# The depth stream every watched symbol is subscribed to. Used both to build the
+# URL and to read the symbol back out of a combined payload, so the two cannot
+# disagree.
+STREAM_SUFFIX = "@depth5@100ms"
+
+# The file the terminal writes to say what it wants watched.
+#
+# A file rather than a socket, because the two processes already share a directory
+# and a file needs no protocol: the terminal replaces it atomically, the adapter
+# stats it, and either side can restart without the other noticing. It is also
+# readable by hand, which makes the subscription something you can inspect rather
+# than something you have to infer.
+WATCH_NAME = "watch.txt"
+
+
+def symbol_fits(symbol: str) -> bool:
+    """Whether a symbol can be carried in the record's eight bytes."""
+    return 0 < len(symbol) <= SYMBOL_BYTES and symbol.isascii()
+
+
+def watch_path(cfg: dict) -> Path:
+    """Where the watch list lives, defaulting to the bus's directory.
+
+    Derived from `bus_path` so there is no second path to keep in step: whatever
+    environment the bus is in, the watch list sits beside it.
+    """
+    explicit = cfg.get("watch_path")
+    if explicit:
+        return Path(explicit)
+    return Path(cfg.get("bus_path", "var/dev/bus")).parent / WATCH_NAME
+
+
+def read_watch(cfg: dict) -> list[str]:
+    """The symbols to subscribe to, uppercase, in file order, without duplicates.
+
+    A missing or empty file means the configured default symbol, so the lab works
+    before the terminal has ever been opened. A symbol that does not fit the wire
+    field is refused with its line number rather than truncated.
+    """
+    default = [str(cfg.get("symbol", "BTCUSDT")).upper()]
+    path = watch_path(cfg)
+    try:
+        text = path.read_text()
+    except OSError:
+        return default
+    out: list[str] = []
+    seen: set[str] = set()
+    for number, line in enumerate(text.splitlines(), 1):
+        symbol = line.strip().upper()
+        if not symbol or symbol.startswith("#"):
+            continue
+        if not symbol_fits(symbol):
+            log(
+                f"watch {path} line {number}: {symbol!r} does not fit "
+                f"{SYMBOL_BYTES} bytes; ignoring it"
+            )
+            continue
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        out.append(symbol)
+    return out or default
+
+
+def combined_url(cfg: dict, symbols: list[str]) -> str:
+    """One websocket carrying every symbol in `symbols`.
+
+    Binance's combined form wraps each payload as
+    `{"stream": "btcusdt@depth5@100ms", "data": {...}}`, which is what lets one
+    connection carry several symbols and still say which is which. A connection
+    per symbol would work too and would be a thread per symbol; one connection is
+    less to go wrong.
+    """
+    base = urlparse(cfg.get("ws_url") or DEFAULT_WS_URL)
+    streams = "/".join(f"{s.lower()}{STREAM_SUFFIX}" for s in symbols)
+    return urlunsplit((base.scheme, base.netloc, "/stream", f"streams={streams}", ""))
+
+
+def symbol_of(obj: dict, fallback: str) -> str:
+    """Which symbol a payload belongs to.
+
+    The stream name carries it: `btcusdt@depth5@100ms` is `BTCUSDT`. A payload with
+    no stream name came from a single-stream connection, which is what a config's
+    own `ws_url` is, and belongs to the symbol the caller expects.
+    """
+    stream = obj.get("stream")
+    if isinstance(stream, str) and "@" in stream:
+        return stream.split("@", 1)[0].upper()
+    return fallback
+
+
 def pack_msg(side: int, px: float, qty: float, symbol: str, msg_type: int = DEPTH) -> bytes:
     """Float prices become e8 integers here. seq and trace id stay zero.
 
     feedd fills the trace id and the timestamp. The ring fills seq when it
     publishes. Do not invent those fields in Python.
     """
-    sym = symbol.encode("ascii")[:8].ljust(8, b"\0")
+    # Eight bytes exactly, zero padded. Not a C string: a symbol that fills the
+    # field has no terminator, and a reader takes the bytes it is given. The Rust
+    # side truncated to seven to keep one, which mangled every eight-character
+    # symbol; both use all eight now.
+    sym = symbol.encode("ascii")[:SYMBOL_BYTES].ljust(SYMBOL_BYTES, b"\0")
     return struct.pack(
         MSG_FMT,
         MAGIC,
@@ -261,9 +366,13 @@ def run_live(cfg: dict, sock: socket.socket | None = None) -> None:
     This function does not return on a normal close. That is what stopped
     the old adapter from exiting and leaving the TUI on a frozen book.
     """
-    url = cfg.get("ws_url") or "wss://data-stream.binance.vision:443/ws/btcusdt@depth5@100ms"
-    symbol = cfg.get("symbol", "BTCUSDT")
+    symbols = read_watch(cfg)
     delay = 1
+    # How often to look at the watch file while frames are arriving. Frames come
+    # in every 100 ms per symbol, so this is checked thousands of times a second
+    # at fifty symbols; a timestamp keeps it to five stats a second.
+    check_every = 0.2
+    next_check = time.monotonic() + check_every
     try:
         while True:
             try:
@@ -277,13 +386,19 @@ def run_live(cfg: dict, sock: socket.socket | None = None) -> None:
                 if sock is not None:
                     sink = sock
                     sink_dead = False
+                    url = combined_url(cfg, symbols)
+                    log(f"watching {len(symbols)}: {' '.join(symbols)}")
                     for raw in ws_frames(url):
                         delay = 1
                         try:
                             obj = json.loads(raw)
                         except json.JSONDecodeError:
                             continue
+                        # The combined payload names its own symbol, so one
+                        # connection can carry fifty pairs and each record still
+                        # says which one it belongs to.
                         data = obj.get("data", obj)
+                        symbol = symbol_of(obj, symbols[0])
                         for msg in parse_depth5(data, symbol):
                             try:
                                 send_all(sink, msg)
@@ -295,6 +410,21 @@ def run_live(cfg: dict, sock: socket.socket | None = None) -> None:
                                 break
                         if sink_dead:
                             break
+                        # Has the terminal asked for a different set? Answered
+                        # between frames rather than on a timer thread, because
+                        # the frames are the clock and this is where the answer
+                        # matters: a reconnect is only safe between frames.
+                        now = time.monotonic()
+                        if now >= next_check:
+                            next_check = now + check_every
+                            wanted = read_watch(cfg)
+                            if wanted != symbols:
+                                log(
+                                    f"watch changed: {len(symbols)} -> "
+                                    f"{len(wanted)}; reconnecting"
+                                )
+                                symbols = wanted
+                                break
                     else:
                         log("ws closed; reconnecting")
             except Exception as exc:

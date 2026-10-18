@@ -24,6 +24,7 @@ make test && make rust-test && make rust-vec-audit && make e2e && make rust-e2e
 | `rust-e2e` | The fixture reaches the Rust book and the log | shell-command | rust changed | `make rust-e2e` | exit 0; `bids=` and `asks=` non-zero |
 | `interop` | Each implementation reads the other's ring and log | shell-command | wire format or bus changed | `make rust-interop` | exit 0; two `PASS:` lines |
 | `vec-audit` | The kernels that should vectorize still do | shell-command | hot kernel changed | `make rust-vec-audit` | exit 0; `PASS every required kernel emitted vector operations` |
+| `tui-picker` | The ticker picker completes, switches, writes the watch file, and refuses an unlisted symbol | shell-command | tickers or watch changed | `python3 -m unittest python.test_tui_input` | exit 0; 3 tests ok |
 | `tui-input` | The terminal book's input line survives a refresh, and the terminal is handed back | shell-command | tui changed | `python3 -m unittest python.test_tui_input` | exit 0; 2 tests ok |
 | `soak` | The cache holds a thousand symbols without loss | data-check | cache changed | `make rust-soak` | exit 0; `dropped=0` and `evicted=0` |
 | `wire-format` | The 72-byte layout matches the Python packer | shell-command | wire format changed | `cargo test --manifest-path rust/Cargo.toml codec::` | exit 0 |

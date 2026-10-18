@@ -132,7 +132,26 @@ could not show that at all.
 All three are the **reader's** view. None of them is the exchange's latency, which
 this lab cannot measure; §4.1 says what is and is not measured.
 
-### 4.4 Durability counters
+### 4.4 The ticker picker and the status line
+
+Two parts of the frame report state rather than measurements:
+
+**The status line** is the last thing that happened: a switch, a refusal, or a
+reason a write failed. It is where a command's answer appears, because the input
+line is consumed by submitting it.
+
+**The picker** appears between the book and the prompt when there is something on
+the input line. It lists at most eight of the catalog's matches, best first, with
+the highlighted one marked. Ranking is by prefix before interior match, with the
+catalog's own order breaking ties, so typing `ET` offers `ETCUSDT` before a pair
+that merely contains those letters.
+
+The header also carries the displayed symbol, the count of watched symbols, and
+the size of the subscription, because a book that never updates has three possible
+causes and they are told apart by what is on that line: the wrong symbol selected,
+the symbol not watched, or the feed stalled.
+
+### 4.5 Durability counters
 
 `wal_records`, `wal_rejected`, `wal_torn_bytes` and `ring_published` come out of
 the headless checker, which reads both the ring and the log. A torn tail is

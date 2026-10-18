@@ -17,6 +17,8 @@ use ob::config::Config;
 use std::path::Path;
 
 pub mod ingest;
+pub mod tickers;
+pub mod watch;
 
 /// The result type the binaries use: an error message and an exit code.
 pub type CliResult<T = ()> = std::result::Result<T, CliError>;

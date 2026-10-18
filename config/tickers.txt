@@ -1,0 +1,76 @@
+# Tickers the terminal can watch, one symbol per line.
+#
+# This is the list the picker suggests from. It is a file rather than a constant
+# because names change: an exchange renames a pair, a project rebrands, a pair is
+# delisted. Edit it freely.
+#
+# # The eight-byte limit
+#
+# The wire record carries a symbol in a fixed eight-byte field, so **a symbol
+# longer than eight characters cannot be carried at all** and must not appear
+# here. That excludes several liquid pairs on Binance, whose names carry a
+# multiplier prefix: 1000SHIBUSDT and 1000SATSUSDT are twelve characters. They are
+# left out rather than truncated, because truncation would map distinct symbols
+# onto the same eight bytes and quietly show one pair's prices under another's
+# name. The loader refuses a long line and says which one, so a mistake here is a
+# message rather than a wrong price.
+#
+# Anything up to and including eight characters is fine, which covers most of the
+# market: PEPEUSDT, SHIBUSDT, AVAXUSDT, ATOMUSDT, LINKUSDT and NEARUSDT all fit.
+#
+# # Ordering
+#
+# The file's order is the picker's order for equal-quality matches, so the most
+# watched pairs are first.
+BTCUSDT
+ETHUSDT
+SOLUSDT
+BNBUSDT
+XRPUSDT
+DOGEUSDT
+ADAUSDT
+AVAXUSDT
+LINKUSDT
+DOTUSDT
+TRXUSDT
+LTCUSDT
+ATOMUSDT
+UNIUSDT
+NEARUSDT
+APTUSDT
+ARBUSDT
+OPUSDT
+SUIUSDT
+SEIUSDT
+TIAUSDT
+INJUSDT
+FILUSDT
+RUNEUSDT
+AAVEUSDT
+MKRUSDT
+SNXUSDT
+CRVUSDT
+COMPUSDT
+GRTUSDT
+SANDUSDT
+MANAUSDT
+AXSUSDT
+EOSUSDT
+XLMUSDT
+ALGOUSDT
+VETUSDT
+ICPUSDT
+HBARUSDT
+ETCUSDT
+BCHUSDT
+ZECUSDT
+DASHUSDT
+EGLDUSDT
+PEPEUSDT
+SHIBUSDT
+WIFUSDT
+BONKUSDT
+JUPUSDT
+PYTHUSDT
+STRKUSDT
+WLDUSDT
