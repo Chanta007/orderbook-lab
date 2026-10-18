@@ -11,10 +11,24 @@
 
 ## What it means
 
-1. **`cargo` is not on PATH.** The Rust path needs a toolchain of at least
+1. **`cargo` cannot be found.** The Rust path needs a toolchain of at least
    1.80, which is the `rust-version` in `rust/Cargo.toml`. `make rust-build`
    runs `cargo` from PATH, so a shell that has never sourced the rustup
    environment, or a machine without Rust, fails before anything compiles.
+
+   `python/obctl.py` is stricter about this than `make` is: it looks on PATH and
+   then in `$HOME/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` and
+   `/usr/bin`, and if the tool is in none of them it exits with a message naming
+   the tool, what it was needed for, and where it looked. That matters because
+   rustup reaches PATH through `~/.cargo/env`, which a shell reads only if its
+   profile has loaded — so a terminal opened before that line existed, or an IDE
+   that does not read the profile, has no `cargo` on PATH while having a perfectly
+   good toolchain installed. `make rust-start` works in that environment.
+
+   If you see a message rather than a traceback, the toolchain really is absent
+   and step 1 of the fix applies. A Python traceback ending
+   `FileNotFoundError: ... 'cargo'` from `obctl` was the older behaviour and is
+   now fixed.
 2. **A stale ring file.** `var/dev/bus` (or `var/prod/bus`) is a file that
    survives between runs. The reader refuses a file whose first four bytes are
    not `0x4F424C42` (ASCII `OBLB`). That happens when the path holds a file

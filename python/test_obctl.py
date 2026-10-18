@@ -476,5 +476,75 @@ class StartCleanupTest(unittest.TestCase):
         self.assertIn(str(obctl.binary_path("feedd", "rust")), str(caught.exception))
 
 
+class BuildToolResolution(unittest.TestCase):
+    """A build tool has to be found, or the failure has to say what to do.
+
+    `cargo` is installed by rustup into ~/.cargo/bin and reaches PATH through
+    ~/.cargo/env, which a shell reads only if its profile has loaded. A terminal
+    opened before that line existed hands the script an environment without it,
+    and the first version of this code answered with a Python traceback ending
+    `FileNotFoundError: [Errno 2] No such file or directory: 'cargo'` — naming
+    neither the tool's purpose nor the fix. A user hit exactly that.
+    """
+
+    def setUp(self) -> None:
+        # The module prints its operator messages; keep them out of test output.
+        self.quiet = contextlib.redirect_stdout(io.StringIO())
+        self.quiet.__enter__()
+        self.addCleanup(self.quiet.__exit__, None, None, None)
+
+    def test_a_tool_on_path_is_used_as_is(self):
+        found = obctl.resolve_tool("sh")
+        self.assertIsNotNone(found)
+        self.assertTrue(found.endswith("/sh"))
+
+    def test_a_tool_missing_from_path_is_found_where_it_is_installed(self):
+        # A directory that is not on PATH, holding an executable.
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "pretend-tool"
+            exe.write_text("#!/bin/sh\nexit 0\n")
+            exe.chmod(0o755)
+            with mock.patch.object(obctl, "TOOL_SEARCH_DIRS", (Path(tmp),)):
+                with mock.patch.object(obctl.shutil, "which", return_value=None):
+                    self.assertEqual(obctl.resolve_tool("pretend-tool"), str(exe))
+
+    def test_a_tool_that_is_nowhere_is_reported_not_raised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(obctl, "TOOL_SEARCH_DIRS", (Path(tmp),)):
+                with mock.patch.object(obctl.shutil, "which", return_value=None):
+                    self.assertIsNone(obctl.resolve_tool("no-such-tool-anywhere"))
+                    with self.assertRaises(SystemExit) as caught:
+                        obctl.require_tool("cargo", "build the Rust workspace")
+        message = str(caught.exception)
+        self.assertIn("cargo", message)
+        self.assertIn("build the Rust workspace", message)
+        self.assertIn("looked on PATH and in:", message)
+        self.assertIn("source ~/.cargo/env", message)
+
+    def test_a_missing_executable_never_escapes_as_a_traceback(self):
+        # The backstop for any command that did not go through require_tool.
+        with self.assertRaises(SystemExit) as caught:
+            obctl.run(["no-such-command-anywhere"])
+        self.assertIn("not found", str(caught.exception))
+        self.assertIn("PATH", str(caught.exception))
+
+    def test_setup_uses_the_resolved_cargo_rather_than_the_bare_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "dev.json"
+            cfg.write_text(
+                '{"env": "dev", "bus_path": "%s", "wal_path": "%s",'
+                ' "log_path": "%s", "listen_port": 1, "allow_orders": false}'
+                % (Path(tmp) / "bus", Path(tmp) / "wal", Path(tmp) / "log")
+            )
+            with mock.patch.object(obctl, "ROOT", Path(tmp)):
+                with mock.patch.object(
+                    obctl, "require_tool", return_value="/found/cargo"
+                ) as req:
+                    with mock.patch.object(obctl, "run") as ran:
+                        obctl.setup(cfg, "rust")
+            req.assert_called_once()
+            self.assertEqual(ran.call_args[0][0][0], "/found/cargo")
+
+
 if __name__ == "__main__":
     unittest.main()

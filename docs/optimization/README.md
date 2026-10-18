@@ -123,6 +123,12 @@ consumer assumes.**
 |----|---------|--------|
 | OPT-029 | The terminal book cleared the whole screen on every frame, which erased the terminal's own echo of the input line. The keystrokes still reached the program — the tty's line buffer is not affected by drawing over the screen — so the commands worked and were invisible. Fixed by owning the line: non-canonical mode with echo off, the buffer in the program, drawn as the last row of the frame, with the mode restored on every exit path including a signal. | A full-screen refresh destroys the terminal's echo of the input line, and no test without a terminal can see it. A test for this needs a pseudo-terminal, and it has to be shown failing against the unfixed binary before it is believed. |
 
+### Tooling and the run path
+
+| id | Finding | Lesson |
+|----|---------|--------|
+| OPT-030 | `obctl` invoked `cargo` by name. A user whose terminal predated the `~/.cargo/env` line in their profile had a working toolchain that was invisible to the process, and got a Python traceback ending `FileNotFoundError: ... 'cargo'`. It now resolves the tool on PATH and in the usual install directories, and reports clearly when it is genuinely absent. | A tool that invokes another tool must not assume PATH: rustup reaches PATH through a profile file a stale terminal has never read. When you cannot find an executable, say what was needed and where you looked — a subprocess traceback names the missing file and nothing a reader can act on. |
+
 ### Platform
 
 | id | Finding | Lesson |
