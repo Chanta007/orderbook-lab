@@ -140,6 +140,7 @@ consumer assumes.**
 | id | Finding | Lesson |
 |----|---------|--------|
 | OPT-032 | A local sweep piped `make rust-test` through `grep -c` and reported nine passing suites while the target was exiting 2 on a formatting failure. Without `set -o pipefail` a pipeline reports the **last** command's status, so the chain continued. CI, which runs the target directly, caught it. | Appending a filter to a check turns it into a check that cannot fail. Use `set -o pipefail`, and prefer running a gate directly over parsing its output. A green local sweep beside a red pipeline is the signature of a filter standing between you and the exit code. |
+| OPT-033 | `make test` failed twice and passed on a retry. The terminal test was failing against a **stale** `rust/target/release/tui` that predated the assertions it was being run against. It now skips when the binary is older than its sources, naming the build to run. | A test that drives a build artifact must check the artifact is current: a stale binary is worse than a missing one, because missing skips and stale fails or passes for a reason unrelated to the source. When a test fails once and passes on a retry, check what it was actually running before calling it flaky. |
 
 ### Platform
 

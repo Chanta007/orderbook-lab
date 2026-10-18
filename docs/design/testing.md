@@ -98,6 +98,16 @@ non-canonical mode with echo off while the book runs, the command takes effect,
 and the terminal is restored when the book exits — including when it exits on a
 signal.
 
+It also refuses to test a stale artifact. The test drives a compiled binary, so it
+checks the binary is newer than the newest file under `rust/*/src` and skips with a
+message if it is not. A stale binary is worse than a missing one: missing skips,
+and stale fails or passes for a reason that has nothing to do with the source. That
+happened — the frame assertions were added, a checkout had not been rebuilt, and
+the new test failed against code that predated the change, which looked like
+flakiness until the build date was checked. `make rust-test` depends on
+`rust-build`, so it always tests what is in the tree; `make test` does not, so it
+skips these two on a stale tree and says so.
+
 `OB_TUI_TEST_BINARY=<path>` points it at any terminal binary. That is how it was
 checked against one that still has the old behaviour: pointed at `build/tui` it
 fails on `ICANON is still set`, and pointed at the Rust one it passes. **A test for
