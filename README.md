@@ -88,7 +88,7 @@ In the window, type a command and press Enter. The picture refreshes ten times a
 | `levels N` | Show 1 to 20 price levels. |
 | `help` | The list is already on the screen. |
 
-`feed=stalled` means no new message has arrived for about two seconds. The adapter reconnects on its own. The book stays on the last update until the next picture arrives.
+`feed=stalled` means no new message has arrived for about two seconds. The adapter reconnects on its own. The book stays on the last update until the next picture arrives. The window says which of the two causes it is: an adapter that is alive and an exchange that has gone quiet, or an adapter that has exited. When a feed is started again, the window re-attaches by itself and counts it in the header; `make rust-feed` starts the feed and the adapter without opening or closing a window.
 
 The live socket is market-data only:
 
@@ -111,7 +111,7 @@ There is no API key. That host cannot place an order. `make e2e` does not open i
 ORDERBOOK_ALLOW_PROD=1 python3 python/obctl.py start --config config/prod.json --tui
 ```
 
-Runtime state lives under the directory its config names: pid files and `feedd.log` / `adapter.log` in `var/run/`, and the mmap ring and the WAL in `var/dev/` or `var/prod/`. `make clean` removes `build/`, `var/dev`, `var/prod`, and `var/run`.
+Runtime state lives under the directory its config names: the mmap ring and the WAL in `var/dev/`, `var/test/` or `var/prod/`, and the pid files and `feedd.log` / `adapter.log` in `var/run/dev/`, `var/run/test/` or `var/run/prod/`. The run directory is keyed by the config file, so a test run cannot stop the processes a window is using. `make clean` removes `build/`, `var/dev`, `var/test`, `var/prod`, and `var/run`.
 
 `dev` on GitHub is the integration branch. `main` is the release branch. Feature work belongs on `feature/*`.
 

@@ -11,10 +11,10 @@ this repository honest.
 
 | Layer | Command | Count | What it covers |
 |-------|---------|-------|----------------|
-| Rust unit tests | `make rust-test` | 167 + 12 | the library, the CLI, and the ingest reader |
+| Rust unit tests | `make rust-test` | 175 + 38 + 9 | the library, the CLI, and the ingest reader |
 | C++ unit tests | `make test` | 1 binary | the book, the ring and the log |
-| Python tests | `make test` | 38 | the control script's process handling |
-| Terminal behaviour | `make rust-test` | 2 | the book's input line and its terminal mode, through a real pty |
+| Python tests | `make test` | 53 | the control script's process handling, the run directory, and the adapter's frames |
+| Terminal behaviour | `make rust-test` | 5 | the book's input line, its terminal mode, the picker, two books in one ring, and re-attaching to a restarted feed, through a real pty |
 | Fixture e2e, C++ | `make e2e` | — | the fixture to a book and a log, through the C++ daemon |
 | Fixture e2e, Rust | `make rust-e2e` | — | the same fixture through the Rust daemon |
 | Interop | `make rust-interop` | — | each implementation's daemon with the other's reader |
@@ -26,7 +26,7 @@ expected result, so a verify run is a list of outcomes rather than a judgement.
 
 ## 3. What each layer is for, and what it is not
 
-### 3.1 Unit tests, 167 of them
+### 3.1 Unit tests, 175 of them
 
 Concentrated where the reasoning is, not spread for coverage. The four areas that
 carry the most:
@@ -113,6 +113,35 @@ checked against one that still has the old behaviour: pointed at `build/tui` it
 fails on `ICANON is still set`, and pointed at the Rust one it passes. **A test for
 a bug that was fixed has to be shown failing before it is believed**, and the
 override is what makes that repeatable rather than a claim.
+
+One of the five cases is a recovery, and it is worth saying why the assertion is
+the counter rather than the prices. `test_the_window_re_attaches_when_the_feed_restarts`
+feeds a window, stops the daemon, starts a second daemon over the same ring, and
+requires the window to come back on its own with `reattaches=1`. A window that did
+*not* re-attach still appears to recover once the new run has published as many
+records as the old cursor had reached, because the slot's sequence then matches
+and `consume` carries on from the middle of the stream. The prices come back; only
+the counter shows that the start of the run was lost. Disabling the check and
+re-running is how that was established, and the same run is what makes the pricing
+assertions worth keeping.
+
+## Session isolation
+
+Every config keeps its pid files and process logs in its own `var/run/<config>/`,
+because a test that stops processes must not be able to reach a session somebody
+has open. `make e2e`, `make rust-e2e` and `make rust-interop` use
+`config/test.json`, which has its own ring, WAL, log, watch file and port; the live
+targets use `$(CONFIG)`, which is `config/dev.json` by default and can be
+overridden per window.
+
+This is a test-suite rule rather than a convenience. A harness run of `make e2e`
+from a second worktree stopped a live window's feedd and adapter and left it on
+`feed=stalled` with a 39-second staleness, and the window could not recover even
+after the feed was started again. Both halves are fixed and both have a test:
+`RunDirectoryTest` in `python/test_obctl.py` asserts that two configs share no pid
+file, that a stop on one leaves the other's process running, and that the two
+shipped configs share no path or port; the terminal test above asserts the
+recovery. `docs/optimization/ledger.jsonl` OPT-038 has the evidence.
 
 ### 3.6 The soak
 

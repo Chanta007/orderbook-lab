@@ -31,6 +31,7 @@ so either can be built and run without the other.
 |---|---|---|
 | Config | `config/dev.json` | `config/prod.json` |
 | State directory | `var/dev/` | `var/prod/` |
+| Run directory (pid files, process logs) | `var/run/dev/` | `var/run/prod/` |
 | Listener port | 9001 | 9101 |
 | Start requires | nothing | `ORDERBOOK_ALLOW_PROD=1` |
 | `allow_orders` | must be `false` | must be `false` |
@@ -39,6 +40,14 @@ The environments differ in their directories and their ports so that a running
 instance cannot be confused with the other, and the production profile refuses to
 start without an explicit environment variable. Both implementations enforce it;
 `docs/design/security.md` §2 explains why it is a refusal rather than a warning.
+
+There is a third config, `config/test.json`, which is not a third environment: it
+is `env: dev` with its own directories, port and run directory, and the `Makefile`
+points every test target at it. A test that starts and stops processes needs its
+own handles, and a config-shared `var/run` is how `make e2e` came to stop a live
+window's daemon (`docs/optimization/ledger.jsonl` OPT-038). The run directory is
+keyed by the config file rather than by its `env`, precisely because this config
+shares one.
 
 There is no staging environment. There is nothing to stage.
 
