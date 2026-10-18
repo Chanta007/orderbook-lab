@@ -337,6 +337,37 @@ impl RingReader {
         self.published().saturating_sub(cursor)
     }
 
+    /// The daemon's stamp on the record at `seq`, when that slot still holds it.
+    ///
+    /// This is what turns a lag in *records* into a lag in *time*: the span
+    /// between the stamp of the oldest record a reader has not taken and the
+    /// stamp of the newest published one is how much feed time that reader is
+    /// behind. Without it a reader can only say "forty records", which means
+    /// nothing without knowing the rate.
+    ///
+    /// `None` when `seq` has not been published, or when the slot has been
+    /// reused by a later lap. The sequence check is the same discipline
+    /// [`RingReader::consume`] uses, and for the same reason: a stamp from the
+    /// wrong lap would silently misreport how far behind a reader is.
+    pub fn timestamp_at(&self, seq: u64) -> Option<u64> {
+        if seq >= self.published() {
+            return None;
+        }
+        let offset = HEADER_SIZE + (seq as usize & (self.capacity as usize - 1)) * MSG_SIZE;
+        // SAFETY: `offset + MSG_SIZE` is inside the mapping, which `open`
+        // checked to be `file_size(capacity)`. Readers only load from the
+        // mapping; the writer's release store of `wseq` is what makes the bytes
+        // visible, and the sequence check below rejects a slot from an earlier
+        // lap.
+        let bytes = unsafe { self.map.as_slice() };
+        let (found, stamp) = codec::seq_and_stamp(&bytes[offset..offset + MSG_SIZE])?;
+        if found == seq {
+            Some(stamp)
+        } else {
+            None
+        }
+    }
+
     /// Read the record at `cursor`, advancing it on success.
     ///
     /// Never blocks, never waits for the writer, and never returns a record that
@@ -517,6 +548,60 @@ mod tests {
         assert_eq!(reader.consume(&mut cursor, &mut out), Consume::Fresh);
         assert_eq!(out.seq, 6);
         assert_eq!(out.px_e8, 106);
+
+        drop(reader);
+        drop(ring);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_record_keeps_its_stamp_for_a_later_reader() {
+        // The stamp is what makes a lag measurable in time rather than in
+        // records: a reader needs the times of two records it has not decoded,
+        // one it has not taken and the newest published.
+        let path = scratch("stamp-at");
+        let ring = Ring::create(&path, 8).expect("create");
+        for i in 0..5 {
+            let mut m = depth(100 + i, Side::Bid);
+            m.ts_ns = 1_000_000 + i as u64 * 250;
+            ring.publish(&mut m);
+        }
+        let reader = RingReader::open(&path).expect("open");
+
+        // The newest published record, and the one a reader at cursor 0 is
+        // waiting for. Their difference is the span of feed time not yet read.
+        assert_eq!(reader.timestamp_at(4), Some(1_000_000 + 4 * 250));
+        assert_eq!(reader.timestamp_at(0), Some(1_000_000));
+        assert_eq!(
+            reader.timestamp_at(4).unwrap() - reader.timestamp_at(0).unwrap(),
+            1_000
+        );
+
+        // A sequence that has not been published has no stamp.
+        assert_eq!(reader.timestamp_at(5), None);
+        assert_eq!(reader.timestamp_at(u64::MAX), None);
+
+        drop(reader);
+        drop(ring);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_reused_slot_reports_no_stamp_rather_than_the_wrong_lap() {
+        let path = scratch("stamp-lap");
+        let ring = Ring::create(&path, 4).expect("create");
+        for i in 0..6 {
+            let mut m = depth(100 + i, Side::Bid);
+            m.ts_ns = 1_000 + i as u64;
+            ring.publish(&mut m);
+        }
+        let reader = RingReader::open(&path).expect("open");
+        // Sequences 0 and 1 have been overwritten by 4 and 5, so their slots
+        // hold a later stamp. Reporting it would understate a lag.
+        assert_eq!(reader.timestamp_at(0), None);
+        assert_eq!(reader.timestamp_at(1), None);
+        assert_eq!(reader.timestamp_at(2), Some(1_002));
+        assert_eq!(reader.timestamp_at(5), Some(1_005));
 
         drop(reader);
         drop(ring);

@@ -277,6 +277,22 @@ pub fn decode_batch(buf: &[u8], out: &mut [Msg]) -> BatchStats {
     stats
 }
 
+/// The sequence number and the daemon's stamp of a record, if its header is
+/// valid.
+///
+/// A caller that needs to know *when* a record was published rather than what it
+/// says should not pay for a full decode: both fields sit at fixed offsets, and
+/// the header check is what makes them trustworthy. A damaged record returns
+/// `None` rather than a plausible-looking stamp, because a wrong time is worse
+/// than no time when the number is used to decide whether a reader is behind.
+#[inline]
+pub fn seq_and_stamp(record: &[u8]) -> Option<(u64, u64)> {
+    if record.len() < MSG_SIZE || !header_ok(record) {
+        return None;
+    }
+    Some((u64_at(record, OFF_SEQ), u64_at(record, OFF_TS_NS)))
+}
+
 /// Counts from one [`decode_batch`] call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BatchStats {
@@ -445,6 +461,21 @@ mod tests {
         // Empty and sub-record buffers.
         assert_eq!(stream_records(&[]), 0);
         assert_eq!(stream_records(&a[..10]), 0);
+    }
+
+    #[test]
+    fn a_stamp_can_be_read_without_decoding_the_record() {
+        let mut m = sample();
+        m.seq = 7;
+        m.ts_ns = 1_234_567;
+        let wire = encode(&m);
+        assert_eq!(seq_and_stamp(&wire), Some((7, 1_234_567)));
+
+        // A record whose header is wrong has no trustworthy stamp.
+        let mut bad = wire;
+        bad[OFF_MAGIC] = 0;
+        assert_eq!(seq_and_stamp(&bad), None);
+        assert_eq!(seq_and_stamp(&wire[..10]), None);
     }
 
     #[test]

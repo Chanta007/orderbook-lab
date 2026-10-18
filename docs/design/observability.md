@@ -93,7 +93,46 @@ Four things to read in it:
 
 `docs/design/ticker-cache.md` §4 explains the three measurements in full.
 
-### 4.3 Durability counters
+### 4.3 The terminal book's header
+
+The book reports the reader's own view of the ring, in three different measures.
+They are not the same number and each answers a different question, which is why
+it shows all three:
+
+```text
+ring=4096  lag=0 records (0ns of feed time)  staleness=5.236s
+consumed=20 records  resyncs=0  age=4.910s
+```
+
+| Field | Unit | Question it answers |
+|-------|------|---------------------|
+| `lag` | records | how many published records this reader has not taken |
+| the parenthesised span | time | how much **feed time** those records span |
+| `staleness` | time | how old the newest published record is |
+| `age` | time | how long since this reader last applied a record |
+| `resyncs` | count | how many times the writer lapped this reader |
+
+**Why the lag is shown as a count and a span.** A count of records means nothing
+without the feed's rate: forty records behind is a disaster at a hundred per
+second and irrelevant at a million. The span is the same information in a unit an
+operator can compare against a threshold without knowing the rate. It is computed
+from the record stamps the ring already carries, so it costs one slot read.
+
+**Why staleness is separate.** The span is zero when a reader has caught up, even
+if the feed itself stopped an hour ago. Staleness is the age of the newest record,
+so it grows on a quiet feed as well as on a slow reader. On the run above the
+fixture had finished five seconds earlier: `lag` was zero, the span was zero, and
+staleness was 5.2 s — which is the number that says what is on screen is old.
+
+**Why the units change.** Durations are formatted to three decimals in whichever
+unit keeps them readable: `812ns`, `14.273us`, `2.501ms`, `5.236s`. A live feed's
+staleness is normally tens of microseconds, and a display offering whole seconds
+could not show that at all.
+
+All three are the **reader's** view. None of them is the exchange's latency, which
+this lab cannot measure; §4.1 says what is and is not measured.
+
+### 4.4 Durability counters
 
 `wal_records`, `wal_rejected`, `wal_torn_bytes` and `ring_published` come out of
 the headless checker, which reads both the ring and the log. A torn tail is
