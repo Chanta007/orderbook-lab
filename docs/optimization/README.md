@@ -129,6 +129,18 @@ consumer assumes.**
 |----|---------|--------|
 | OPT-030 | `obctl` invoked `cargo` by name. A user whose terminal predated the `~/.cargo/env` line in their profile had a working toolchain that was invisible to the process, and got a Python traceback ending `FileNotFoundError: ... 'cargo'`. It now resolves the tool on PATH and in the usual install directories, and reports clearly when it is genuinely absent. | A tool that invokes another tool must not assume PATH: rustup reaches PATH through a profile file a stale terminal has never read. When you cannot find an executable, say what was needed and where you looked — a subprocess traceback names the missing file and nothing a reader can act on. |
 
+### Observability
+
+| id | Finding | Lesson |
+|----|---------|--------|
+| OPT-031 | The terminal's lag was a count of records. It now reports the count **and** the span of feed time those records cover, plus the age of the newest published record. | A backlog in messages is not a latency. Every queue that reports a depth should also report the time that depth covers, because only the time can be compared against a threshold without knowing the arrival rate — and data staleness belongs beside it, since caught up on a dead feed is not caught up on a live one. |
+
+### Verification habits
+
+| id | Finding | Lesson |
+|----|---------|--------|
+| OPT-032 | A local sweep piped `make rust-test` through `grep -c` and reported nine passing suites while the target was exiting 2 on a formatting failure. Without `set -o pipefail` a pipeline reports the **last** command's status, so the chain continued. CI, which runs the target directly, caught it. | Appending a filter to a check turns it into a check that cannot fail. Use `set -o pipefail`, and prefer running a gate directly over parsing its output. A green local sweep beside a red pipeline is the signature of a filter standing between you and the exit code. |
+
 ### Platform
 
 | id | Finding | Lesson |

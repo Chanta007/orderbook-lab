@@ -123,6 +123,28 @@ class TuiInput(unittest.TestCase):
                 self.feedd.kill()
         shutil.rmtree(self.workdir, ignore_errors=True)
 
+    def feed_fixture(self) -> None:
+        """Send the fixture, so the ring holds records with stamps.
+
+        The lag in feed time is a difference of two record stamps, so a test for
+        it needs records. Without them the header reports `-`, which is the honest
+        answer and not the one under test.
+        """
+        subprocess.run(
+            [
+                sys.executable,
+                "python/feed_adapter.py",
+                "--config",
+                str(self.config),
+                "--fixture",
+                "e2e/fixture.jsonl",
+            ],
+            cwd=str(ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=FRAME_DEADLINE,
+        )
+
     def start_feeder(self, name: str):
         """Run the feed daemon, because the book attaches to a ring that exists.
 
@@ -219,6 +241,9 @@ class TuiInput(unittest.TestCase):
                 os.close(slave)
 
                 try:
+                    # 0. Give the ring records to report on.
+                    self.feed_fixture()
+
                     # 1. The book draws something.
                     first = self.drain(master, time.monotonic() + FRAME_DEADLINE)
                     self.assertIn(
@@ -237,6 +262,33 @@ class TuiInput(unittest.TestCase):
                     self.assertFalse(
                         running[3] & termios.ECHO,
                         f"{name}: ECHO is still set",
+                    )
+
+                    # 2a. The lag is reported as a span of feed time as well as a
+                    # count of records, and the newest record's age is a real
+                    # duration rather than the `-` an empty ring gives.
+                    header = ""
+                    deadline = time.monotonic() + FRAME_DEADLINE
+                    while time.monotonic() < deadline:
+                        header += self.drain(master, time.monotonic() + 0.4)
+                        if "of feed time" in header and "staleness=" in header:
+                            break
+                    self.assertIn(
+                        "of feed time",
+                        header,
+                        f"{name}: the header does not report the lag in time. "
+                        f"Got: {header[-500:]!r}",
+                    )
+                    self.assertRegex(
+                        header,
+                        r"lag=\d+ records \([0-9.]+(ns|us|ms|s) of feed time\)",
+                        f"{name}: the lag span is not a formatted duration",
+                    )
+                    self.assertRegex(
+                        header,
+                        r"staleness=[0-9.]+(ns|us|ms|s)",
+                        f"{name}: staleness is not a formatted duration. It reads "
+                        f"`-` when the ring is empty, so the fixture did not reach it",
                     )
 
                     # 3. Typing appears in a frame.

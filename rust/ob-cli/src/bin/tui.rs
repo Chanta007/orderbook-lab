@@ -41,6 +41,7 @@
 //! depth, from 1 to 64. Ctrl-C and Ctrl-D also leave. Backspace works.
 
 use ob::book::{Book, Level};
+use ob::clock;
 use ob::config::Config;
 use ob::msg::Msg;
 use ob::ring::RingReader;
@@ -188,7 +189,10 @@ fn run() -> CliResult {
             &Frame {
                 levels: level_count.load(Ordering::Relaxed),
                 live: saw_any && last_record.elapsed() < STALL_AFTER,
+                ring_capacity: ring.capacity(),
                 lag: ring.lag(cursor),
+                backlog_ns: backlog_ns(&ring, cursor),
+                staleness_ns: staleness_ns(&ring),
                 age: last_record.elapsed(),
                 consumed,
                 resyncs,
@@ -218,7 +222,25 @@ fn run() -> CliResult {
 struct Frame<'a> {
     levels: usize,
     live: bool,
+    /// The ring's own capacity, read from its header.
+    ///
+    /// Read from the ring rather than from the config, because the two can
+    /// disagree: the file survives between runs, and a config that changed
+    /// `ring_capacity` does not resize a ring that already exists.
+    ring_capacity: u32,
+    /// Records published and not yet taken by this reader.
     lag: u64,
+    /// Feed time between the oldest record not yet taken and the newest
+    /// published one. `None` when either of those slots has been reused.
+    ///
+    /// This is the lag in time rather than in records: a count needs the feed's
+    /// rate to mean anything, and a span does not.
+    backlog_ns: Option<u64>,
+    /// How old the newest published record is, measured from this reader's
+    /// clock. Non-zero on a quiet feed as well as on a slow reader, which is
+    /// what makes it the number to watch.
+    staleness_ns: Option<u64>,
+    /// Time since this reader last applied a record.
     age: Duration,
     consumed: u64,
     resyncs: u64,
@@ -226,6 +248,33 @@ struct Frame<'a> {
     input: &'a str,
     /// Whether the input line is being drawn at all.
     interactive: bool,
+}
+
+/// Feed time between the oldest record not yet taken and the newest published.
+///
+/// The two slots are read by sequence, and either can have been reused by a later
+/// lap; when one has, this reports nothing rather than a span computed from the
+/// wrong lap. Zero is the honest answer when there is nothing waiting: a reader
+/// at the live end has a backlog of zero by definition.
+fn backlog_ns(ring: &RingReader, cursor: u64) -> Option<u64> {
+    let newest = ring.published().checked_sub(1)?;
+    if cursor > newest {
+        return Some(0);
+    }
+    let first_waiting = ring.timestamp_at(cursor)?;
+    let latest = ring.timestamp_at(newest)?;
+    Some(latest.saturating_sub(first_waiting))
+}
+
+/// How old the newest published record is, from this process's clock.
+///
+/// `None` when the ring is empty or the slot has been reused. The two ends are on
+/// one host reading one monotonic clock, which is the same assumption every
+/// latency number in this lab rests on.
+fn staleness_ns(ring: &RingReader) -> Option<u64> {
+    let newest = ring.published().checked_sub(1)?;
+    let latest = ring.timestamp_at(newest)?;
+    Some(clock::now_ns().saturating_sub(latest))
 }
 
 /// Draw one frame.
@@ -253,26 +302,51 @@ fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame<'_>) -> C
         book.last_seq(),
         feed
     ));
+    // The lag is shown twice on purpose. A count of records is what a drain loop
+    // acts on; the span of feed time is what says whether that count matters, and
+    // it is the one an operator can compare against a threshold without knowing
+    // the feed's rate.
+    let backlog = match frame.backlog_ns {
+        Some(ns) => ob_cli::duration_ns(ns),
+        None => "-".to_string(),
+    };
+    let staleness = match frame.staleness_ns {
+        Some(ns) => ob_cli::duration_ns(ns),
+        None => "-".to_string(),
+    };
     buf.push_str(&format!(
-        "ring={} lag={} records  age={:.1}s  consumed={} resyncs={}\x1b[K\n",
-        cfg.ring_capacity,
-        frame.lag,
-        frame.age.as_secs_f64(),
+        "ring={}  lag={} records ({backlog} of feed time)  staleness={staleness}\x1b[K\n",
+        frame.ring_capacity, frame.lag
+    ));
+    buf.push_str(&format!(
+        "consumed={} records  resyncs={}  age={}\x1b[K\n",
         frame.consumed,
-        frame.resyncs
+        frame.resyncs,
+        ob_cli::duration_ns(frame.age.as_nanos().min(u128::from(u64::MAX)) as u64)
     ));
     buf.push_str("Bid prices are red. Ask prices are green.\x1b[K\n");
     buf.push_str("  quit | q     leave this window\x1b[K\n");
     buf.push_str("  levels N     show N price levels, from 1 to 64\x1b[K\n");
+    buf.push_str("  lag          records behind you, and the span of feed time that is.\x1b[K\n");
+    buf.push_str(
+        "  staleness    how old the newest published record is. Both are your view, not the exchange's.\x1b[K\n",
+    );
     buf.push_str(&format!("Showing {} levels.\x1b[K\n", frame.levels));
     if !frame.live {
         buf.push_str(
             "Feed stalled. The adapter reconnects on its own. The book stays on the last update.\x1b[K\n",
         );
     }
-    if frame.lag > cfg.ring_capacity as u64 / 2 {
+    if frame.lag > u64::from(frame.ring_capacity) / 2 {
         buf.push_str(
             "Ring lag is over half the ring: records are being overwritten. Drain faster.\x1b[K\n",
+        );
+    }
+    // A quiet feed and a slow reader both show up here, and they are the same
+    // problem for a viewer: what is on screen is old.
+    if frame.staleness_ns.is_some_and(|ns| ns > 1_000_000_000) {
+        buf.push_str(
+            "The newest record is over a second old: the feed has stopped, or the sender is slow.\x1b[K\n",
         );
     }
     buf.push_str(&format!(
