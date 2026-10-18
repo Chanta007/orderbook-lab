@@ -21,6 +21,7 @@ import argparse
 import errno
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -111,9 +112,61 @@ def guard(cfg: dict) -> None:
         raise SystemExit("dev config must keep allow_orders false")
 
 
+# Where a build tool may be when it is not on PATH. rustup installs into
+# ~/.cargo/bin and adds it through ~/.cargo/env, which a shell sources only if its
+# profile has been loaded: a terminal opened before that line existed, or an IDE
+# that does not read the profile, hands this script an environment without cargo.
+# The two Homebrew prefixes are here for the same reason.
+TOOL_SEARCH_DIRS = (
+    Path.home() / ".cargo" / "bin",
+    Path("/opt/homebrew/bin"),
+    Path("/usr/local/bin"),
+    Path("/usr/bin"),
+)
+
+
+def resolve_tool(name: str) -> str | None:
+    """Find a build tool, on PATH or in the places it is usually installed.
+
+    Returning the absolute path matters for more than finding the file: the
+    failure this guards against used to be a Python traceback that named neither
+    the tool nor the fix, which tells a reader nothing they can act on.
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in TOOL_SEARCH_DIRS:
+        candidate = directory / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def require_tool(name: str, why: str) -> str:
+    """The path to a build tool, or a message that says what to do about it."""
+    path = resolve_tool(name)
+    if path is not None:
+        return path
+    searched = ", ".join(str(d) for d in TOOL_SEARCH_DIRS)
+    raise SystemExit(
+        f"{name} is not installed, or not where this script can find it.\n"
+        f"  needed to {why}\n"
+        f"  looked on PATH and in: {searched}\n"
+        f"  install it, or put it on PATH — for cargo, `source ~/.cargo/env`\n"
+        f"  see docs/runbooks/rust-build-failures.md"
+    )
+
+
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     print("+", " ".join(cmd))
-    return subprocess.run(cmd, cwd=str(ROOT), check=True, **kw)
+    try:
+        return subprocess.run(cmd, cwd=str(ROOT), check=True, **kw)
+    except FileNotFoundError as exc:
+        # A missing executable is a setup problem, not a traceback. This is the
+        # backstop for any command that did not go through require_tool.
+        raise SystemExit(
+            f"cannot run {cmd[0]!r}: not found. Install it or put it on PATH."
+        ) from exc
 
 
 def setup(cfg_path: Path, impl: str = DEFAULT_IMPL) -> None:
@@ -124,9 +177,11 @@ def setup(cfg_path: Path, impl: str = DEFAULT_IMPL) -> None:
         p = ROOT / cfg[key]
         p.parent.mkdir(parents=True, exist_ok=True)
     if impl == "rust":
-        run(["cargo", "build", "--release", "--manifest-path", str(ROOT / "rust" / "Cargo.toml")])
+        cargo = require_tool("cargo", "build the Rust workspace")
+        run([cargo, "build", "--release", "--manifest-path", str(ROOT / "rust" / "Cargo.toml")])
     else:
-        run(["make", "-C", str(ROOT), "all"])
+        make = require_tool("make", "build the C++ binaries")
+        run([make, "-C", str(ROOT), "all"])
     print("setup ok")
 
 
