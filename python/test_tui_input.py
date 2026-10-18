@@ -247,6 +247,10 @@ class TuiInput(unittest.TestCase):
             self.skipTest(f"build/feedd is missing; run `make` first ({name})")
 
         for attempt in range(3):
+            if self.feedd_log is not None:
+                # A second run in the same test opens a second log; the first
+                # one's file handle is not left to the collector.
+                self.feedd_log.close()
             self.feedd_log = open(self.workdir / "feedd.log", "wb")
             self.feedd = subprocess.Popen(
                 [str(daemon), str(self.config)],
@@ -628,6 +632,182 @@ class TuiInput(unittest.TestCase):
                 sock.close()
             except OSError:
                 pass
+
+    def test_the_window_re_attaches_when_the_feed_restarts(self):
+        """A feed that stops, and comes back on the same ring.
+
+        The reported stall, as a test. The window went to `feed=stalled` with a
+        39-second staleness; the feed was started again by hand and the window
+        stayed stalled, because nothing it could read said the run it was
+        attached to had ended. The daemon truncates the ring's header at
+        startup, so the write sequence begins again at zero while the reader's
+        cursor is a number from the run that ended, and `consume` reports
+        `Empty` on every frame. A window that does not handle that shows the
+        last book of a dead run for ever, which is indistinguishable from a feed
+        that never came back.
+
+        The restart here is what `make rust-feed` performs. The window has to
+        come back by itself: no keystroke, no relaunch, and the price rows have
+        to be the new run's rather than the old run's.
+
+        The feed is a socket this test drives, rather than the fixture file.
+        The window starts at the live end of the ring, so a feed that publishes
+        once, before the window has attached, leaves it nothing to consume and
+        nothing to report — a timing race that says nothing about re-attaching.
+        """
+        name, binary = TERMINALS[0]
+        reason = skip_reason(binary)
+        if reason is not None:
+            self.skipTest(reason)
+        self.start_feeder(name)
+
+        sys.path.insert(0, str(ROOT / "python"))
+        import feed_adapter as fa
+
+        def picture(symbol: str, base: float) -> bytes:
+            out = []
+            for side in (0, 1):
+                out.append(fa.pack_msg(side, 0.0, 0.0, symbol, fa.DEPTH_RESET))
+                for i in range(5):
+                    price = base + (i if side == 1 else -i)
+                    out.append(fa.pack_msg(side, price, 1.0 + i, symbol))
+            return b"".join(out)
+
+        def send(sock: socket.socket, base: float, stop: threading.Event) -> None:
+            """Publish until the daemon goes away or the test says stop."""
+            while not stop.is_set():
+                try:
+                    sock.sendall(picture("BTCUSDT", base))
+                except OSError:
+                    return
+                time.sleep(0.05)
+
+        def connect() -> socket.socket:
+            return socket.create_connection(("127.0.0.1", self.port), timeout=5)
+
+        stop = threading.Event()
+        sock = connect()
+        sender = threading.Thread(target=send, args=(sock, 65000.0, stop), daemon=True)
+        sender.start()
+
+        master, slave = pty.openpty()
+        initial = termios.tcgetattr(slave)
+        initial[3] |= termios.ICANON | termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, initial)
+        child = subprocess.Popen(
+            [str(binary), str(self.config)],
+            cwd=str(ROOT),
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+        )
+        os.close(slave)
+        try:
+            # 0. The window is fed, by the first run's prices.
+            first = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                first += self.drain(master, time.monotonic() + 0.4)
+                if "feed=live" in first and prices_on_screen(first):
+                    break
+            self.assertIn(
+                "feed=live",
+                first,
+                f"{name}: the window never went live. Got: {plain(first)[-400:]!r}",
+            )
+            self.assertTrue(
+                any(p.startswith("6") for p in prices_on_screen(first)),
+                f"{name}: the first run's prices are not on screen. "
+                f"Got {prices_on_screen(first)}",
+            )
+
+            # 1. The feed stops. This is the state the report showed.
+            self.feedd.terminate()
+            self.feedd.wait(timeout=EXIT_DEADLINE)
+            stalled = ""
+            deadline = time.monotonic() + FRAME_DEADLINE + 3.0
+            while time.monotonic() < deadline:
+                stalled += self.drain(master, time.monotonic() + 0.5)
+                if "Feed stalled." in stalled:
+                    break
+            self.assertIn(
+                "Feed stalled.",
+                stalled,
+                f"{name}: a stopped feed did not show as stalled. "
+                f"Got: {plain(stalled)[-400:]!r}",
+            )
+            self.assertIn(
+                "make rust-feed",
+                stalled,
+                f"{name}: the remedy for a stopped feed was not the command that "
+                f"starts one without closing the window. Got: {plain(stalled)[-400:]!r}",
+            )
+            self.assertIn(
+                "reattaches=0",
+                stalled,
+                "the window re-attached to a feed that had not restarted",
+            )
+
+            # 2. A new run over the same ring, which is what rust-feed does.
+            # The first sender's connection went with the daemon it wrote to,
+            # so it is closed before a second one is opened.
+            sock.close()
+            self.start_feeder(name)
+            sock = connect()
+            sender = threading.Thread(target=send, args=(sock, 95000.0, stop), daemon=True)
+            sender.start()
+
+            # 3. The window re-attaches by itself.
+            #
+            # The counter is the assertion that matters. A window that does not
+            # re-attach can still *appear* to recover: once the new run has
+            # published as many records as the old cursor had reached, `consume`
+            # finds a slot whose sequence matches and carries on from there. It
+            # has then silently lost the beginning of the run, which is the
+            # difference between a book that is being maintained and one built
+            # from the middle of a stream. Verified by disabling the check: the
+            # prices below come back on their own and only this counter does not.
+            back = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                back += self.drain(master, time.monotonic() + 0.5)
+                if "reattaches=1" in back:
+                    break
+            self.assertIn(
+                "reattaches=1",
+                back,
+                f"{name}: the window did not re-attach to the new run. "
+                f"Got: {plain(back)[-500:]!r}",
+            )
+
+            # Read a fresh window of frames, because everything drained above
+            # includes the stalled ones, which still carried the old prices.
+            after = self.drain(master, time.monotonic() + 1.5)
+            prices = prices_on_screen(after)
+            self.assertTrue(
+                any(p.startswith("9") for p in prices),
+                f"{name}: the new run's prices are not on screen. Got {prices}",
+            )
+            self.assertFalse(
+                any(p.startswith("6") for p in prices),
+                f"{name}: the dead run's prices survived the re-attach. Got {prices}",
+            )
+            self.assertIn(
+                "feed=live",
+                after,
+                f"{name}: the re-attached window is not being fed. "
+                f"Got: {plain(after)[-400:]!r}",
+            )
+        finally:
+            stop.set()
+            try:
+                sock.close()
+            except OSError:
+                pass
+            if child.poll() is None:
+                child.send_signal(signal.SIGKILL)
+                child.wait(timeout=EXIT_DEADLINE)
+            os.close(master)
 
     def test_a_signal_restores_the_terminal(self):
         """Ctrl-C must not leave the shell without echo.

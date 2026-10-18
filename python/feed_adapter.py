@@ -169,7 +169,65 @@ def send_all(sock: socket.socket, data: bytes) -> None:
 
 
 def log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
+    """One line, stamped.
+
+    The stamp used to be absent, which made the log useless for the question it
+    exists to answer. A window showing `feed stalled` cannot be matched to a line
+    saying why without one, and neither can two runs in the same file: the log is
+    append-only and shared, so an earlier session's lines sit above this one's.
+    """
+    print(f"{_stamp()} {msg}", file=sys.stderr, flush=True)
+
+
+def _stamp() -> str:
+    """Monotonic seconds since this process started, and the wall clock.
+
+    Monotonic for the differences, which is what a stall is measured in, and the
+    wall clock so a line can be matched against a window someone was watching.
+    """
+    up = time.monotonic() - _STARTED
+    return f"[+{up:9.3f}s {time.strftime('%H:%M:%S')}]"
+
+
+# When this process started, for the log's monotonic stamp.
+_STARTED = time.monotonic()
+
+# The file the adapter touches to say it is alive.
+#
+# The terminal reads it, because otherwise it cannot tell the two causes of a
+# stalled book apart: an exchange that has gone quiet, and no adapter at all.
+# Both look identical from the ring, and the second one is what a stopped session
+# leaves behind. A file rather than a socket, for the same reasons the watch list
+# is a file: the processes share a directory, and either can restart alone.
+HEARTBEAT_NAME = "adapter.heartbeat"
+
+
+def heartbeat_path(cfg: dict) -> Path:
+    """Where the liveness file lives, beside the bus like the watch list."""
+    explicit = cfg.get("heartbeat_path")
+    if explicit:
+        return Path(explicit)
+    return watch_path(cfg).parent / HEARTBEAT_NAME
+
+
+def beat(cfg: dict, note: str) -> None:
+    """Say we are alive, and what we are doing.
+
+    Written on every reconnect attempt and after every connect, so a reader can
+    tell "still trying" from "gave up" as well as "running" from "gone". Failure
+    is reported and not fatal: a heartbeat is a courtesy, and a lab that cannot
+    write one should still feed.
+    """
+    path = heartbeat_path(cfg)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Same trick as the watch file: write beside the target and rename, so a
+        # reader never sees a half-written line.
+        temp = path.with_suffix(".tmp")
+        temp.write_text(f"{os.getpid()} {int(time.time())} {note}\n")
+        os.replace(temp, path)
+    except OSError as exc:
+        log(f"cannot write the heartbeat {path}: {exc}")
 
 
 def connect_feedd(cfg: dict) -> socket.socket:
@@ -367,6 +425,8 @@ def run_live(cfg: dict, sock: socket.socket | None = None) -> None:
     the old adapter from exiting and leaving the TUI on a frozen book.
     """
     symbols = read_watch(cfg)
+    beat(cfg, "starting")
+    log(f"adapter starting, pid {os.getpid()}, watching {len(symbols)}")
     delay = 1
     # How often to look at the watch file while frames are arriving. Frames come
     # in every 100 ms per symbol, so this is checked thousands of times a second
@@ -381,6 +441,7 @@ def run_live(cfg: dict, sock: socket.socket | None = None) -> None:
                         sock = connect_feedd(cfg)
                     except OSError as exc:
                         log(f"feedd error: {exc}; redialing")
+                        beat(cfg, "no feedd; redialing")
                         close_quietly(sock)
                         sock = None
                 if sock is not None:
@@ -388,6 +449,7 @@ def run_live(cfg: dict, sock: socket.socket | None = None) -> None:
                     sink_dead = False
                     url = combined_url(cfg, symbols)
                     log(f"watching {len(symbols)}: {' '.join(symbols)}")
+                    beat(cfg, f"connected; watching {','.join(symbols)}")
                     for raw in ws_frames(url):
                         delay = 1
                         try:
@@ -417,6 +479,12 @@ def run_live(cfg: dict, sock: socket.socket | None = None) -> None:
                         now = time.monotonic()
                         if now >= next_check:
                             next_check = now + check_every
+                            # A beat per frame would be a write per frame; this is
+                            # the same timestamp, so the file says "alive" about
+                            # five times a second while frames are arriving, which
+                            # is what lets a reader tell a quiet feed from a dead
+                            # process within a second.
+                            beat(cfg, f"live; watching {len(symbols)}")
                             wanted = read_watch(cfg)
                             if wanted != symbols:
                                 log(
@@ -428,7 +496,13 @@ def run_live(cfg: dict, sock: socket.socket | None = None) -> None:
                     else:
                         log("ws closed; reconnecting")
             except Exception as exc:
-                log(f"ws error: {exc}; reconnecting")
+                log(f"ws error: {type(exc).__name__}: {exc}; reconnecting")
+                beat(cfg, f"ws error; retrying in {delay}s")
+            # The wait is logged, because a log that shows a failure and then
+            # nothing for thirty seconds reads like a hang. The number is the one
+            # that matters: a reader can see how long the gap will be.
+            if delay > 1:
+                log(f"waiting {delay}s before reconnecting")
             time.sleep(delay)
             delay = min(delay * 2, 30)
     finally:
@@ -472,7 +546,20 @@ def main() -> int:
         finally:
             close_quietly(sock)
     else:
-        run_live(cfg)
+        # Anything that escapes run_live ends the process, and a process that
+        # ended without saying why is what this change is about: the window showed
+        # a stalled book and the log showed nothing at all.
+        try:
+            run_live(cfg)
+        except BaseException as exc:
+            log(f"fatal: {type(exc).__name__}: {exc}")
+            raise
+        finally:
+            try:
+                heartbeat_path(cfg).unlink(missing_ok=True)
+            except OSError:
+                pass
+            log("adapter exiting")
     return 0
 
 
