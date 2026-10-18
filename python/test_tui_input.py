@@ -54,10 +54,12 @@ import pty
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 import unittest
 
@@ -89,6 +91,22 @@ def plain(text: str) -> str:
     import re
 
     return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+
+
+def prices_on_screen(frame: str) -> list[str]:
+    """The prices in a frame's book rows.
+
+    A book row is a price, a size, a price and a size, with the colour escapes
+    already stripped. Four fields with a decimal point in the first is the shape,
+    and it is specific enough that the header and help lines are not mistaken for
+    rows.
+    """
+    out = []
+    for line in plain(frame).split("\n"):
+        parts = line.split()
+        if len(parts) >= 4 and "." in parts[0]:
+            out.append(parts[0])
+    return out
 
 
 def newest_source_mtime() -> float:
@@ -505,6 +523,111 @@ class TuiInput(unittest.TestCase):
                 child.send_signal(signal.SIGKILL)
                 child.wait(timeout=EXIT_DEADLINE)
             os.close(master)
+
+    def test_two_tickers_keep_their_own_books(self):
+        """Two symbols in one ring, and only the selected one on screen.
+
+        The picker test proves the subscription follows the selection. This proves
+        the other half: that a book built from a ring carrying several symbols
+        contains one symbol's prices and not another's, which is what the filter in
+        the terminal's drain loop is for.
+
+        The records go straight to the daemon with the adapter's own packer rather
+        than through a websocket, so the test needs no network and still exercises
+        the real ingest path. The feed stays up while the terminal runs, because
+        the terminal starts at the live end of the ring: sending everything first
+        and then opening the window tests nothing.
+        """
+        name, binary = TERMINALS[0]
+        reason = skip_reason(binary)
+        if reason is not None:
+            self.skipTest(reason)
+        self.start_feeder(name)
+
+        sys.path.insert(0, str(ROOT / "python"))
+        import feed_adapter as fa
+
+        # Five levels each, at prices nothing else could produce.
+        def picture(symbol: str, base: float) -> bytes:
+            out = []
+            for side in (0, 1):
+                out.append(fa.pack_msg(side, 0.0, 0.0, symbol, fa.DEPTH_RESET))
+                for i in range(5):
+                    price = base + (i if side == 1 else -i)
+                    out.append(fa.pack_msg(side, price, 1.0 + i, symbol))
+            return b"".join(out)
+
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        stop = threading.Event()
+
+        def feed() -> None:
+            while not stop.is_set():
+                try:
+                    sock.sendall(picture("BTCUSDT", 65000.0))
+                    sock.sendall(picture("ETHUSDT", 3000.0))
+                except OSError:
+                    return
+                time.sleep(0.05)
+
+        sender = threading.Thread(target=feed, daemon=True)
+        sender.start()
+
+        master, slave = pty.openpty()
+        initial = termios.tcgetattr(slave)
+        initial[3] |= termios.ICANON | termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, initial)
+        child = subprocess.Popen(
+            [str(binary), str(self.config)],
+            cwd=str(ROOT),
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+        )
+        os.close(slave)
+        try:
+            self.drain(master, time.monotonic() + FRAME_DEADLINE)
+            first = self.drain(master, time.monotonic() + 1.5)
+            first_prices = prices_on_screen(first)
+            self.assertTrue(
+                any(p.startswith("6") for p in first_prices),
+                f"{name}: no BTC prices while BTCUSDT is selected. Got {first_prices}",
+            )
+            self.assertFalse(
+                any(p.startswith("3") for p in first_prices),
+                f"{name}: another symbol's prices appeared. Got {first_prices}",
+            )
+
+            # Switch. Drain until the header has followed, because the frames
+            # already in the pipe were drawn before the switch and would be read as
+            # though the old book had survived it.
+            os.write(master, b"ethusdt\r")
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                if "ETHUSDT" in (seen := self.drain(master, time.monotonic() + 0.4)):
+                    break
+            second = self.drain(master, time.monotonic() + 1.5)
+            second_prices = prices_on_screen(second)
+            self.assertTrue(
+                any(p.startswith("3") for p in second_prices),
+                f"{name}: no ETH prices after switching. Got {second_prices}",
+            )
+            self.assertFalse(
+                any(p.startswith("6") for p in second_prices),
+                f"{name}: the previous symbol's prices survived the switch. "
+                f"Got {second_prices}",
+            )
+            self.assertIn("ETHUSDT", second, "the header did not follow the switch")
+            self.assertIn("feed=live", second, "the switched book is not being fed")
+        finally:
+            stop.set()
+            if child.poll() is None:
+                child.send_signal(signal.SIGKILL)
+                child.wait(timeout=EXIT_DEADLINE)
+            os.close(master)
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def test_a_signal_restores_the_terminal(self):
         """Ctrl-C must not leave the shell without echo.
