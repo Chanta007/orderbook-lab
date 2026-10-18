@@ -24,6 +24,22 @@ What it asserts
    matters most: a program that leaves a terminal in non-canonical mode makes the
    shell look broken, and the only recovery is `stty sane`.
 
+A stale binary is not tested
+----------------------------
+
+The test drives a compiled artifact, so it checks the artifact is current first:
+if the binary is older than the newest file under `rust/*/src`, it skips and says
+to run `make rust-build`. A stale binary is worse than a missing one — missing
+skips, and stale fails or passes for a reason that has nothing to do with the
+source. That is not hypothetical: the frame assertions were added, the checkout's
+binary had not been rebuilt, and the new test failed against code that predated
+the change. It looked like flakiness for two runs, and the real cause was a test
+testing an old build.
+
+`make rust-test` depends on `rust-build`, so it always tests what is in the tree.
+`make test` does not, so on a checkout with a stale Rust binary it skips these two
+and says why.
+
 Scope
 -----
 
@@ -62,6 +78,40 @@ if os.environ.get("OB_TUI_TEST_BINARY"):
 # How long to wait for the book to say something, and for it to exit.
 FRAME_DEADLINE = 10.0
 EXIT_DEADLINE = 5.0
+
+
+def newest_source_mtime() -> float:
+    """The newest modification time under the Rust sources."""
+    newest = 0.0
+    for crate in ("ob", "ob-cli"):
+        root = ROOT / "rust" / crate / "src"
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.rs"):
+            newest = max(newest, path.stat().st_mtime)
+    return newest
+
+
+def skip_reason(binary: pathlib.Path) -> str | None:
+    """Why this binary cannot be trusted for the assertions below, or `None`.
+
+    A test that drives a compiled artifact has to check the artifact is current.
+    A stale binary is worse than a missing one: missing skips, and stale fails or
+    passes for a reason that has nothing to do with the source. Exactly that
+    happened — the frame assertions were added, the checkout's binary had not been
+    rebuilt, and the new test failed against code that predated the change. It
+    looked like flakiness for two runs.
+    """
+    if not binary.exists():
+        return f"{binary} is missing; run `make rust-build` first"
+    built = binary.stat().st_mtime
+    newest = newest_source_mtime()
+    if newest > built:
+        return (
+            f"{binary} is older than its sources, so it does not contain them; "
+            f"run `make rust-build` first"
+        )
+    return None
 
 
 def free_port() -> int:
@@ -218,10 +268,9 @@ class TuiInput(unittest.TestCase):
     def test_typed_input_survives_a_refresh(self):
         for name, binary in TERMINALS:
             with self.subTest(terminal=name):
-                if not binary.exists():
-                    self.skipTest(
-                        f"{binary} is missing; run `make rust-build` first"
-                    )
+                reason = skip_reason(binary)
+                if reason is not None:
+                    self.skipTest(reason)
                 self.start_feeder(name)
 
                 master, slave = pty.openpty()
@@ -349,8 +398,9 @@ class TuiInput(unittest.TestCase):
         it exists.
         """
         name, binary = TERMINALS[0]
-        if not binary.exists():
-            self.skipTest(f"{binary} is missing; run `make rust-build` first")
+        reason = skip_reason(binary)
+        if reason is not None:
+            self.skipTest(reason)
         self.start_feeder(name)
 
         master, slave = pty.openpty()
