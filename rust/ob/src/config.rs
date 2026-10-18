@@ -52,6 +52,12 @@ pub struct Config {
     /// Levels the terminal shows by default.
     pub levels: usize,
 
+    // --- the ticker picker ---------------------------------------------------
+    /// The file the terminal writes to say which symbols to subscribe to.
+    pub watch_path: String,
+    /// The list the picker suggests from.
+    pub tickers_path: String,
+
     // --- settings the C++ loader does not have -------------------------------
     /// Slots in the shared-memory ring. Must be a power of two.
     pub ring_capacity: u32,
@@ -92,6 +98,8 @@ impl Default for Config {
             symbol: "BTCUSDT".to_string(),
             allow_orders: false,
             levels: 5,
+            watch_path: "var/dev/watch.txt".to_string(),
+            tickers_path: "config/tickers.txt".to_string(),
             ring_capacity: crate::ring::DEFAULT_CAPACITY,
             sync_policy: crate::wal::SyncPolicy::Data,
             cache_symbols: 4096,
@@ -122,9 +130,20 @@ impl Config {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(body: &str) -> Result<Self> {
         let d = Config::default();
+        // The environment is read first, because two defaults depend on it.
+        let env = json_str(body, "env", &d.env);
+        let bus_path = json_str(body, "bus_path", &d.bus_path);
+        // The watch file sits **beside the bus**, derived from `bus_path` rather
+        // than from `env`, and the Python adapter derives it the same way. One
+        // rule, because two rules for one key is two files: the first version of
+        // this defaulted to `var/<env>/watch.txt` while the adapter looked beside
+        // the bus, so the terminal wrote one file and the adapter read another and
+        // nothing was ever subscribed to. A config with an absolute `bus_path`
+        // makes the difference visible, which is how it was found.
+        let watch_default = watch_path_beside(&bus_path);
         let c = Config {
-            env: json_str(body, "env", &d.env),
-            bus_path: json_str(body, "bus_path", &d.bus_path),
+            env,
+            bus_path,
             wal_path: json_str(body, "wal_path", &d.wal_path),
             log_path: json_str(body, "log_path", &d.log_path),
             listen_host: json_str(body, "listen_host", &d.listen_host),
@@ -132,6 +151,8 @@ impl Config {
             symbol: json_str(body, "symbol", &d.symbol),
             allow_orders: json_bool(body, "allow_orders", d.allow_orders),
             levels: json_u64(body, "levels", d.levels as u64) as usize,
+            watch_path: json_str(body, "watch_path", &watch_default),
+            tickers_path: json_str(body, "tickers_path", &d.tickers_path),
             ring_capacity: json_u64(body, "ring_capacity", d.ring_capacity as u64) as u32,
             sync_policy: match json_str(body, "sync_policy", "data").as_str() {
                 "none" => crate::wal::SyncPolicy::None,
@@ -262,6 +283,20 @@ pub fn json_str(body: &str, key: &str, default: &str) -> String {
         .map(|off| q + off)
         .unwrap_or(bytes.len());
     body[q..end].trim().to_string()
+}
+
+/// The watch file that belongs beside a bus.
+///
+/// One rule for both implementations: the directory holding the bus holds the
+/// watch list. Derived rather than configured so there is no second path to keep
+/// in step, and a config that moves the bus moves the watch list with it.
+pub fn watch_path_beside(bus_path: &str) -> String {
+    match std::path::Path::new(bus_path).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            parent.join("watch.txt").to_string_lossy().into_owned()
+        }
+        _ => "watch.txt".to_string(),
+    }
 }
 
 /// Read a key as an unsigned integer, falling back to `default`.
@@ -417,6 +452,49 @@ mod tests {
         assert_eq!(cache.symbols, 2048);
         assert_eq!(cache.queue, 1024);
         assert_eq!(cache.policy, crate::flow::DropPolicy::DropNewest);
+    }
+
+    #[test]
+    fn the_watch_file_defaults_to_sitting_beside_the_bus() {
+        // Derived from `bus_path`, which is the rule the Python adapter uses too.
+        // Two rules for one key means the terminal writes one file and the adapter
+        // reads another, and nothing is ever subscribed to.
+        assert_eq!(
+            Config::from_str(DEV).expect("dev").watch_path,
+            "var/dev/watch.txt"
+        );
+        // The shipped prod config's bus is in var/prod, so its watch file is too.
+        let prod = r#"{"env": "prod", "bus_path": "var/prod/bus"}"#;
+        std::env::set_var(ALLOW_PROD_ENV, "1");
+        let parsed = Config::from_str(prod).expect("prod");
+        std::env::remove_var(ALLOW_PROD_ENV);
+        assert_eq!(parsed.watch_path, "var/prod/watch.txt");
+
+        // An absolute bus carries its watch file with it, which is what a test or
+        // a second instance needs.
+        let absolute =
+            Config::from_str(r#"{"env": "dev", "bus_path": "/tmp/somewhere/bus"}"#).expect("abs");
+        assert_eq!(absolute.watch_path, "/tmp/somewhere/watch.txt");
+
+        // A bus with no directory at all still gets a usable name.
+        let bare = Config::from_str(r#"{"env": "dev", "bus_path": "bus"}"#).expect("bare");
+        assert_eq!(bare.watch_path, "watch.txt");
+
+        // An explicit path wins over the derivation.
+        let explicit =
+            Config::from_str(r#"{"env": "dev", "watch_path": "/tmp/w.txt"}"#).expect("explicit");
+        assert_eq!(explicit.watch_path, "/tmp/w.txt");
+    }
+
+    #[test]
+    fn the_ticker_catalog_path_has_a_default_and_can_be_replaced() {
+        assert_eq!(
+            Config::from_str(DEV).expect("dev").tickers_path,
+            "config/tickers.txt"
+        );
+        let other =
+            Config::from_str(r#"{"env": "dev", "tickers_path": "/tmp/mine.txt"}"#).expect("other");
+        assert_eq!(other.tickers_path, "/tmp/mine.txt");
     }
 
     #[test]

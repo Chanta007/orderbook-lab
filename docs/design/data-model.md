@@ -116,6 +116,29 @@ has its worst levels dropped and a counter incremented.
 The snapshot lane exists so a market snapshot is one linear pass instead of a
 pointer chase, and it is what made the kernel vectorizable.
 
+## 6a. The watch file
+
+The one piece of state that travels *from* the terminal *to* the adapter, and so
+the only place where the two processes disagree about direction.
+
+| Property | Value |
+|----------|-------|
+| Path | beside the bus: `bus_path`'s directory plus `watch.txt` |
+| Format | one symbol per line, `#` comments, same shape as `config/tickers.txt` |
+| Writer | the terminal, atomically: write `watch.tmp`, rename over the target |
+| Reader | the adapter, which polls it and reconnects when the set changes |
+
+**The path is derived from `bus_path`, in both implementations.** That is the rule
+that makes it work: an earlier version defaulted it from `env` on one side and
+derived it from `bus_path` on the other, so the terminal wrote one file and the
+adapter read another and nothing was ever subscribed to. Two derivations for one
+key is two files. `docs/optimization/ledger.jsonl` OPT-034.
+
+**Why a file rather than a socket.** The two processes already share a directory,
+a file needs no protocol, and either side can restart without the other noticing.
+It is also readable by hand: `cat var/dev/watch.txt` says what is being watched,
+and editing it changes the subscription without opening the terminal.
+
 ## 7. Configuration
 
 One schema, `config/*.json`, read by both implementations. `docs/design/rust-implementation.md`

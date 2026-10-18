@@ -135,12 +135,29 @@ consumer assumes.**
 |----|---------|--------|
 | OPT-031 | The terminal's lag was a count of records. It now reports the count **and** the span of feed time those records cover, plus the age of the newest published record. | A backlog in messages is not a latency. Every queue that reports a depth should also report the time that depth covers, because only the time can be compared against a threshold without knowing the arrival rate — and data staleness belongs beside it, since caught up on a dead feed is not caught up on a live one. |
 
+### Terminal behaviour
+
+| id | Finding | Lesson |
+|----|---------|--------|
+| OPT-036 | The ticker picker offers catalog matches for what has been typed, completes on Tab, moves the highlight with the arrows and switches on Enter. A symbol not in the catalog is **refused** rather than tried, with the file to edit and a `force` escape named in the message. | A convenience that silently accepts anything is a footgun when the cost of a bad value is shared: every watched symbol shares one websocket, so an unknown stream name in a combined URL can take the connection down. Refusing by default with a named way past it costs one message and removes a failure that would look like the feed dying. |
+
 ### Verification habits
+
+| id | Finding | Lesson |
+|----|---------|--------|
+| OPT-037 | The soak reported `evicted=48090` where earlier runs reported zero, and the branch was suspected. The branch changes nothing the soak exercises, and three repeat runs on it gave zero: the first run was taken with the machine loaded, so the subscriber was not scheduled enough and the producer evicted into a full queue. | An eviction counter measures the machine as much as the code. Before diagnosing a regression from a counter, check whether the branch touches the path it measures, and repeat the run. |
 
 | id | Finding | Lesson |
 |----|---------|--------|
 | OPT-032 | A local sweep piped `make rust-test` through `grep -c` and reported nine passing suites while the target was exiting 2 on a formatting failure. Without `set -o pipefail` a pipeline reports the **last** command's status, so the chain continued. CI, which runs the target directly, caught it. | Appending a filter to a check turns it into a check that cannot fail. Use `set -o pipefail`, and prefer running a gate directly over parsing its output. A green local sweep beside a red pipeline is the signature of a filter standing between you and the exit code. |
 | OPT-033 | `make test` failed twice and passed on a retry. The terminal test was failing against a **stale** `rust/target/release/tui` that predated the assertions it was being run against. It now skips when the binary is older than its sources, naming the build to run. | A test that drives a build artifact must check the artifact is current: a stale binary is worse than a missing one, because missing skips and stale fails or passes for a reason unrelated to the source. When a test fails once and passes on a retry, check what it was actually running before calling it flaky. |
+
+### Interfaces between two implementations
+
+| id | Finding | Lesson |
+|----|---------|--------|
+| OPT-034 | A new `watch_path` key defaulted to `var/<env>/watch.txt` in the Rust loader and was derived from `bus_path` in the Python adapter, so the terminal wrote one file and the adapter read another and nothing was ever subscribed to. Both derive it the same way now. | A derived value needs one derivation. Two defaults for one key is two files, two ports or two paths, and the failure is silence: each side works and they never meet. A test whose config uses an absolute path makes the difference visible. |
+| OPT-035 | The Rust side truncated a symbol to seven characters to keep a NUL terminator; the Python adapter used all eight. Every eight-character pair — DOGEUSDT, AVAXUSDT, PEPEUSDT and many more — was mangled by one path and not the other. | A fixed-width field is not a C string, and a terminator bought at the cost of a byte costs you every name that fills the field. Check the width in every language that writes it. |
 
 ### Platform
 
