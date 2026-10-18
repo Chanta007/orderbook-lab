@@ -14,6 +14,11 @@ A pid file can outlive its process, and a second `start` used to overwrite
 the pid files of the instance already running: the first feedd and adapter
 then ran with nothing pointing at them and the port stayed bound. `start`
 now refuses that state instead of creating it, and `stop` says what it did.
+
+The pid files and the process logs are keyed by the config file, under
+`var/run/<config>/`, so two configs never reach each other's processes.
+See `run_dir`, and OPT-038 in docs/optimization/ledger.jsonl for what a
+shared directory cost.
 """
 from __future__ import annotations
 
@@ -173,6 +178,7 @@ def setup(cfg_path: Path, impl: str = DEFAULT_IMPL) -> None:
     """Create the data directories and compile. Does not start processes."""
     cfg = load(cfg_path)
     guard(cfg)
+    run_dir(cfg_path).mkdir(parents=True, exist_ok=True)
     for key in ("bus_path", "wal_path", "log_path"):
         p = ROOT / cfg[key]
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -185,12 +191,26 @@ def setup(cfg_path: Path, impl: str = DEFAULT_IMPL) -> None:
     print("setup ok")
 
 
-def pid_file(name: str) -> Path:
-    return ROOT / "var" / "run" / f"{name}.pid"
+def run_dir(cfg_path: Path) -> Path:
+    """Where one config's pid files and process logs live.
+
+    Keyed by the config file's name, not by its `env`. Two configs can share an
+    env and must not share a pid file: config/test.json is `env: dev`, and the
+    instance it runs must not be reachable by the same `stop` as the window
+    somebody has open. Before this every config used `var/run`, so `make e2e` —
+    a test — signalled the live session's feedd and adapter, and the window it
+    left behind was stalled with nothing to feed it. See
+    docs/optimization/ledger.jsonl OPT-038.
+    """
+    return ROOT / "var" / "run" / Path(cfg_path).stem
 
 
-def log_file(name: str) -> Path:
-    return ROOT / "var" / "run" / f"{name}.log"
+def pid_file(name: str, cfg_path: Path) -> Path:
+    return run_dir(cfg_path) / f"{name}.pid"
+
+
+def log_file(name: str, cfg_path: Path) -> Path:
+    return run_dir(cfg_path) / f"{name}.log"
 
 
 def pid_alive(pid: int) -> bool:
@@ -297,13 +317,13 @@ def owns(pid: int, name: str) -> bool:
     return any(m in command for m in markers(name))
 
 
-def read_pid(name: str) -> int | None:
+def read_pid(name: str, cfg_path: Path) -> int | None:
     """The pid in the file, or None when it is missing, unreadable, or not a pid.
 
     Zero and negatives are rejected on purpose: os.kill treats 0 and -1 as a
     process group, so a corrupt pid file must not reach the signal path.
     """
-    path = pid_file(name)
+    path = pid_file(name, cfg_path)
     if not path.is_file():
         return None
     try:
@@ -313,9 +333,9 @@ def read_pid(name: str) -> int | None:
     return pid if pid > 0 else None
 
 
-def tracked(name: str) -> int | None:
+def tracked(name: str, cfg_path: Path) -> int | None:
     """The pid file's process, when it is alive and still ours."""
-    pid = read_pid(name)
+    pid = read_pid(name, cfg_path)
     if pid is not None and pid_alive(pid) and owns(pid, name):
         return pid
     return None
@@ -353,17 +373,17 @@ def port_refusal(host: str, port: int, cfg_path: Path) -> str:
         probe.close()
 
 
-def log_offset(name: str) -> int:
+def log_offset(name: str, cfg_path: Path) -> int:
     try:
-        return log_file(name).stat().st_size
+        return log_file(name, cfg_path).stat().st_size
     except OSError:
         return 0
 
 
-def new_log_lines(name: str, offset: int, keep: int = 5) -> str:
+def new_log_lines(name: str, cfg_path: Path, offset: int, keep: int = 5) -> str:
     """The last few lines this run wrote, so a dead child can speak for itself."""
     try:
-        with open(log_file(name), "rb") as f:
+        with open(log_file(name, cfg_path), "rb") as f:
             f.seek(offset)
             text = f.read().decode("utf-8", "replace")
     except OSError:
@@ -371,7 +391,9 @@ def new_log_lines(name: str, offset: int, keep: int = 5) -> str:
     return "\n".join(text.strip().splitlines()[-keep:])
 
 
-def await_started(name: str, proc: subprocess.Popen, offset: int, marker: str, ceiling: float) -> None:
+def await_started(
+    name: str, cfg_path: Path, proc: subprocess.Popen, offset: int, marker: str, ceiling: float
+) -> None:
     """Wait for the child's ready line, or report why it is not coming.
 
     The child is watched through its own handle, never through the pid. A
@@ -381,15 +403,15 @@ def await_started(name: str, proc: subprocess.Popen, offset: int, marker: str, c
     """
     deadline = time.monotonic() + ceiling
     while time.monotonic() < deadline:
-        if marker in new_log_lines(name, offset):
+        if marker in new_log_lines(name, cfg_path, offset):
             return
         if proc.poll() is not None:
             break
         time.sleep(0.05)
-    if marker in new_log_lines(name, offset):
+    if marker in new_log_lines(name, cfg_path, offset):
         return
-    pid_file(name).unlink(missing_ok=True)
-    detail = new_log_lines(name, offset)
+    pid_file(name, cfg_path).unlink(missing_ok=True)
+    detail = new_log_lines(name, cfg_path, offset)
     # Three different failures used to produce the same unhelpful line. A child
     # that is still running but silent is not the same as one that died, and a
     # child that died without writing anything is not the same as one that wrote
@@ -408,25 +430,25 @@ def await_started(name: str, proc: subprocess.Popen, offset: int, marker: str, c
     raise SystemExit(
         f"{name} did not start (pid={proc.pid}): {why}.\n"
         f"  ready line looked for: {marker!r}\n"
-        f"  log: {log_file(name)}\n"
+        f"  log: {log_file(name, cfg_path)}\n"
         f"{(chr(10) + detail) if detail else ''}"
     )
 
 
-def spawn(name: str, cmd: list[str]) -> subprocess.Popen:
-    """Background process, new session, pid file under var/run.
+def spawn(name: str, cfg_path: Path, cmd: list[str]) -> subprocess.Popen:
+    """Background process, new session, pid file in this config's run dir.
 
     start_new_session means the child is not killed when this script execs
     the TUI. stop reads the pid file later. The handle is returned so the
     caller can see the child exit, which the pid cannot show.
     """
-    pid_file(name).parent.mkdir(parents=True, exist_ok=True)
-    log = open(log_file(name), "ab")
+    pid_file(name, cfg_path).parent.mkdir(parents=True, exist_ok=True)
+    log = open(log_file(name, cfg_path), "ab")
     try:
         proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=log, stderr=log, start_new_session=True)
     finally:
         log.close()
-    pid_file(name).write_text(str(proc.pid))
+    pid_file(name, cfg_path).write_text(str(proc.pid))
     print(f"started {name} pid={proc.pid}")
     return proc
 
@@ -447,7 +469,7 @@ def preflight(cfg: dict, cfg_path: Path) -> None:
     `localhost` passes here and feedd dies at the bind.
     """
     for name in ("feedd", "adapter"):
-        pid = tracked(name)
+        pid = tracked(name, cfg_path)
         if pid is not None:
             raise SystemExit(
                 f"already running: {name} pid={pid}. "
@@ -505,15 +527,17 @@ def start(cfg_path: Path, fixture: str, with_tui: bool, impl: str = DEFAULT_IMPL
     # adapter dials it. A failure here stops whatever this run started, so a
     # refused start never leaves half the pair running.
     try:
-        feedd_offset = log_offset("feedd")
-        feedd = spawn("feedd", [str(binary_path("feedd", impl)), cfg_abs])
-        await_started("feedd", feedd, feedd_offset, "feedd listen", START_CEILING)
-        adapter_offset = log_offset("adapter")
-        proc = spawn("adapter", adapter)
-        await_started("adapter", proc, adapter_offset, "adapter connected", START_CEILING)
+        feedd_offset = log_offset("feedd", cfg_path)
+        feedd = spawn("feedd", cfg_path, [str(binary_path("feedd", impl)), cfg_abs])
+        await_started("feedd", cfg_path, feedd, feedd_offset, "feedd listen", START_CEILING)
+        adapter_offset = log_offset("adapter", cfg_path)
+        proc = spawn("adapter", cfg_path, adapter)
+        await_started(
+            "adapter", cfg_path, proc, adapter_offset, "adapter connected", START_CEILING
+        )
     except SystemExit:
         for name in ("adapter", "feedd"):
-            kill_pid(name)
+            kill_pid(name, cfg_path, why="obctl start rollback after a failed start")
         raise
     # exec only when stdin is a terminal. make e2e is not, so it stays headless.
     if with_tui and sys.stdin.isatty():
@@ -522,7 +546,28 @@ def start(cfg_path: Path, fixture: str, with_tui: bool, impl: str = DEFAULT_IMPL
     print("start ok (no tui)")
 
 
-def kill_pid(name: str) -> int | None:
+def note_stop(name: str, cfg_path: Path, pid: int, why: str) -> None:
+    """Append who stopped this process to its own log, before it exits.
+
+    SIGTERM carries no sender, so a stopped daemon is otherwise silent about
+    it. That is what made the reported stall expensive to diagnose: `make e2e`
+    from a second worktree signalled a live session's feedd, and the log it
+    wrote said only that it had stopped. The caller's pid and working directory
+    are what separate the two cases a reader has to tell apart — a person
+    stopping the feed, and a test doing it from another checkout.
+    """
+    try:
+        with open(log_file(name, cfg_path), "a", encoding="utf-8") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {why}: "
+                f"{name} pid={pid} signalled by obctl pid={os.getpid()} cwd={Path.cwd()}\n"
+            )
+    except OSError:
+        # A missing or unwritable log must not turn a stop into a failure.
+        pass
+
+
+def kill_pid(name: str, cfg_path: Path, why: str = "obctl stop") -> int | None:
     """SIGTERM the tracked process and confirm it went away.
 
     Returns the pid when it is still alive after the grace period, so stop can
@@ -537,8 +582,8 @@ def kill_pid(name: str) -> int | None:
     a zombie until it is collected, and signal 0 succeeds for a zombie, so a
     pid check would report every successful stop as a failure.
     """
-    path = pid_file(name)
-    pid = read_pid(name)
+    path = pid_file(name, cfg_path)
+    pid = read_pid(name, cfg_path)
     if pid is None:
         path.unlink(missing_ok=True)
         return None
@@ -559,6 +604,7 @@ def kill_pid(name: str) -> int | None:
     except OSError as exc:
         print(f"cannot signal {name} pid={pid}: {exc}")
         return pid
+    note_stop(name, cfg_path, pid, why)
     deadline = time.monotonic() + STOP_CEILING
     while time.monotonic() < deadline:
         running = proc_running(pid)
@@ -571,17 +617,24 @@ def kill_pid(name: str) -> int | None:
     return pid
 
 
-def stop(_cfg_path: Path) -> None:
+def stop(cfg_path: Path) -> None:
+    """Stop the instance this config started.
+
+    Named rather than global: the pid files are this config's, so a stop from a
+    config no window is using reaches nothing of that window's. The directory
+    is printed, because a stop that found nothing and a stop that found the
+    wrong thing look the same until you know where it looked.
+    """
     stuck: list[str] = []
     for name in ("tui", "adapter", "feedd"):
-        pid = kill_pid(name)
+        pid = kill_pid(name, cfg_path)
         if pid is not None:
             stuck.append(f"{name} pid={pid}")
     if stuck:
         print("not confirmed stopped: " + ", ".join(stuck))
         print("These may still hold the port. Send SIGKILL, or close the window that owns them.")
         raise SystemExit(1)
-    print("stop ok")
+    print(f"stop ok (pid files in {run_dir(cfg_path)})")
 
 
 def parser() -> argparse.ArgumentParser:

@@ -249,7 +249,26 @@ pub struct RingReader {
     map: Mapping,
     capacity: u32,
     wseq: *const AtomicU64,
+    /// The file this reader mapped, as `(device, inode)`.
+    ///
+    /// A mapping follows the inode it was made from, so a ring that is replaced
+    /// at the path — removed and created again, or written by a `setup` that
+    /// unlinks — leaves this reader attached to a file nothing else has open.
+    /// Comparing this with [`file_identity`] is how a reader notices, because
+    /// there is no way to see it from the bytes: the bytes are a valid empty
+    /// ring.
+    identity: (u64, u64),
     _file: File,
+}
+
+/// The `(device, inode)` of the file at `path`, or `None` when it is not there.
+///
+/// The pair rather than the inode alone: inode numbers are unique per device,
+/// and a temporary directory on a different filesystem is a real case.
+pub fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
 }
 
 // SAFETY: as for `Ring`. Readers only load `wseq` and read slots, and the
@@ -282,10 +301,12 @@ impl RingReader {
             .read(true)
             .open(path)
             .map_err(|e| Error::io("open ring for reading", e))?;
-        let len = file
-            .metadata()
-            .map_err(|e| Error::io("stat ring", e))?
-            .len() as usize;
+        let meta = file.metadata().map_err(|e| Error::io("stat ring", e))?;
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        let len = meta.len() as usize;
         if len < HEADER_SIZE {
             return Err(Error::Bus(format!("ring file is {len} bytes, too short")));
         }
@@ -304,8 +325,18 @@ impl RingReader {
             map,
             capacity,
             wseq,
+            identity,
             _file: file,
         })
+    }
+
+    /// Whether the ring at `path` is no longer the file this reader mapped.
+    ///
+    /// True when the file has been replaced, and true when it is gone. The
+    /// caller's move is the same either way: open the path again and start the
+    /// cursor over, because nothing this reader holds still describes it.
+    pub fn replaced(&self, path: &Path) -> bool {
+        file_identity(path) != Some(self.identity)
     }
 
     /// The `wseq` counter.
@@ -462,6 +493,104 @@ mod tests {
         assert_eq!(len as usize, HEADER_SIZE + 8 * MSG_SIZE);
         assert_eq!(len as usize, file_size(8));
         drop(ring);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_reader_of_the_old_run_is_empty_until_it_starts_over() {
+        // What a window shows after the feed is restarted: the writer truncates
+        // the header and begins at sequence zero, while the reader's cursor is a
+        // number from the run that ended. `consume` cannot tell an old cursor
+        // from a caught-up one, and reports `Empty` for ever, which is exactly
+        // the "the feed came back and the window never noticed" report. The
+        // check the caller needs is `published() < cursor`.
+        let path = scratch("restart");
+        let first = Ring::create(&path, 8).expect("create");
+        let reader = RingReader::open(&path).expect("open");
+        for i in 0..20 {
+            first.publish(&mut depth(100 + i, Side::Bid));
+        }
+        let mut cursor = 0u64;
+        let mut out = Msg::default();
+        // Twenty records into eight slots, so the reader is lapped on the way:
+        // resynchronise, take what is there, and end at the write sequence.
+        while let Consume::Fresh | Consume::Resynchronised | Consume::Stale =
+            reader.consume(&mut cursor, &mut out)
+        {}
+        assert_eq!(cursor, 20);
+
+        // A second run over the same file, as `Ring::create` does at startup.
+        drop(first);
+        let second = Ring::create(&path, 8).expect("create again");
+        assert_eq!(second.published(), 0);
+        assert!(
+            reader.published() < cursor,
+            "the reader cannot see the reset"
+        );
+        assert!(
+            !reader.replaced(&path),
+            "truncating in place keeps the inode, so this is not a replacement"
+        );
+        second.publish(&mut depth(200, Side::Ask));
+        assert_eq!(
+            reader.consume(&mut cursor, &mut out),
+            Consume::Empty,
+            "an old cursor is not stale, it is ahead of the writer"
+        );
+
+        // Which is why the caller resets the cursor rather than trusting the
+        // ring to resynchronise it.
+        cursor = 0;
+        assert_eq!(reader.consume(&mut cursor, &mut out), Consume::Fresh);
+        assert_eq!(out.px_e8, 200, "the new run's first record");
+
+        drop(second);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_replaced_ring_is_noticed_by_identity() {
+        // A reader's mapping follows the inode. A file removed and created again
+        // leaves the reader on the old one, with no way to tell from the bytes:
+        // they are a valid, empty ring. The identity is the only signal.
+        let path = scratch("replace");
+        let ring = Ring::create(&path, 8).expect("create");
+        let before = file_identity(&path).expect("identity");
+        let reader = RingReader::open(&path).expect("open");
+        let mut cursor = 0u64;
+        let mut out = Msg::default();
+        ring.publish(&mut depth(100, Side::Bid));
+        assert_eq!(reader.consume(&mut cursor, &mut out), Consume::Fresh);
+        assert!(!reader.replaced(&path));
+
+        drop(ring);
+        std::fs::remove_file(&path).expect("unlink");
+        assert!(reader.replaced(&path), "the path is gone");
+        assert_eq!(file_identity(&path), None);
+
+        let fresh = Ring::create(&path, 8).expect("create again");
+        let after = file_identity(&path).expect("identity");
+        assert_ne!(before, after, "a new file has a new inode");
+        assert!(reader.replaced(&path), "the reader is on the old inode");
+        fresh.publish(&mut depth(300, Side::Ask));
+        assert_eq!(
+            reader.consume(&mut cursor, &mut out),
+            Consume::Empty,
+            "the old mapping cannot see the new file's records"
+        );
+
+        // What the caller does about it.
+        let reattached = RingReader::open(&path).expect("re-open");
+        assert!(!reattached.replaced(&path));
+        let mut fresh_cursor = 0u64;
+        assert_eq!(
+            reattached.consume(&mut fresh_cursor, &mut out),
+            Consume::Fresh
+        );
+        assert_eq!(out.px_e8, 300);
+
+        drop(reattached);
+        drop(fresh);
         let _ = std::fs::remove_file(&path);
     }
 

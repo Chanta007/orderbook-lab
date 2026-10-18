@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -65,7 +66,11 @@ class BookkeepingTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        (self.root / "var" / "run").mkdir(parents=True)
+        # The config names the run directory the pid files live in, so the tests
+        # pass one: `obctl.pid_file` takes the config rather than assuming a
+        # single shared directory, which is the defect these tests exist around.
+        self.cfg = Path("config/dev.json")
+        (self.root / "var" / "run" / "dev").mkdir(parents=True)
         patcher = mock.patch.object(obctl, "ROOT", self.root)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -75,7 +80,7 @@ class BookkeepingTest(unittest.TestCase):
         self.addCleanup(self.quiet.__exit__, None, None, None)
 
     def write_pid(self, name: str, pid: int) -> None:
-        obctl.pid_file(name).write_text(str(pid))
+        obctl.pid_file(name, self.cfg).write_text(str(pid))
 
     def wait_for(self, path: Path, seconds: float = 5.0) -> None:
         end = time.monotonic() + seconds
@@ -103,10 +108,10 @@ class BookkeepingTest(unittest.TestCase):
         self.addCleanup(stranger.stop)
         self.write_pid("feedd", stranger.pid)
 
-        obctl.stop(Path("config/dev.json"))
+        obctl.stop(self.cfg)
 
         self.assertTrue(obctl.pid_alive(stranger.pid), "stop killed a process it does not own")
-        self.assertFalse(obctl.pid_file("feedd").exists())
+        self.assertFalse(obctl.pid_file("feedd", self.cfg).exists())
 
     def test_stale_pid_file_is_removed_without_a_signal(self) -> None:
         gone = FakeProc("build/feedd")
@@ -115,9 +120,9 @@ class BookkeepingTest(unittest.TestCase):
         self.assertFalse(obctl.pid_alive(pid))
         self.write_pid("feedd", pid)
 
-        obctl.stop(Path("config/dev.json"))
+        obctl.stop(self.cfg)
 
-        self.assertFalse(obctl.pid_file("feedd").exists())
+        self.assertFalse(obctl.pid_file("feedd", self.cfg).exists())
 
     def test_an_unreadable_command_line_keeps_its_pid_file(self) -> None:
         ours = FakeProc("build/feedd")
@@ -125,11 +130,11 @@ class BookkeepingTest(unittest.TestCase):
         self.write_pid("feedd", ours.pid)
 
         with mock.patch.object(obctl, "proc_command", return_value=None):
-            survivor = obctl.kill_pid("feedd")
+            survivor = obctl.kill_pid("feedd", self.cfg)
 
         self.assertEqual(survivor, ours.pid)
         self.assertTrue(obctl.pid_alive(ours.pid), "an unverified process must not be signalled")
-        self.assertTrue(obctl.pid_file("feedd").exists(), "the pid file is the only handle left")
+        self.assertTrue(obctl.pid_file("feedd", self.cfg).exists(), "the pid file is the only handle left")
 
     def test_kill_pid_reports_a_process_that_ignores_sigterm(self) -> None:
         ready = self.root / "stubborn-ready"
@@ -139,12 +144,12 @@ class BookkeepingTest(unittest.TestCase):
         self.write_pid("feedd", stubborn.pid)
 
         with mock.patch.object(obctl, "STOP_CEILING", 0.3):
-            survivor = obctl.kill_pid("feedd")
+            survivor = obctl.kill_pid("feedd", self.cfg)
 
         self.assertEqual(survivor, stubborn.pid)
         # The pid file stays so the next stop, and the preflight that refuses
         # the next start, can still name this process.
-        self.assertTrue(obctl.pid_file("feedd").exists())
+        self.assertTrue(obctl.pid_file("feedd", self.cfg).exists())
 
     def test_stop_fails_when_a_tracked_process_survives(self) -> None:
         ready = self.root / "survivor-ready"
@@ -155,7 +160,7 @@ class BookkeepingTest(unittest.TestCase):
 
         with mock.patch.object(obctl, "STOP_CEILING", 0.3):
             with self.assertRaises(SystemExit):
-                obctl.stop(Path("config/dev.json"))
+                obctl.stop(self.cfg)
 
         self.assertTrue(obctl.pid_alive(stubborn.pid))
 
@@ -165,7 +170,7 @@ class BookkeepingTest(unittest.TestCase):
         self.write_pid("feedd", ours.pid)
 
         with self.assertRaises(SystemExit) as caught:
-            obctl.preflight({"listen_host": "127.0.0.1", "listen_port": 0}, Path("config/dev.json"))
+            obctl.preflight({"listen_host": "127.0.0.1", "listen_port": 0}, self.cfg)
 
         self.assertIn("already running", str(caught.exception))
         self.assertTrue(obctl.pid_alive(ours.pid), "preflight must not touch the running instance")
@@ -176,7 +181,7 @@ class BookkeepingTest(unittest.TestCase):
         self.write_pid("feedd", stubborn.pid)
 
         with self.assertRaises(SystemExit) as caught:
-            obctl.preflight({"listen_host": "127.0.0.1", "listen_port": 0}, Path("config/dev.json"))
+            obctl.preflight({"listen_host": "127.0.0.1", "listen_port": 0}, self.cfg)
 
         self.assertIn(f"feedd pid={stubborn.pid}", str(caught.exception))
 
@@ -189,7 +194,7 @@ class BookkeepingTest(unittest.TestCase):
         port = holder.getsockname()[1]
 
         with self.assertRaises(SystemExit) as caught:
-            obctl.preflight({"listen_host": "127.0.0.1", "listen_port": port}, Path("config/dev.json"))
+            obctl.preflight({"listen_host": "127.0.0.1", "listen_port": port}, self.cfg)
 
         self.assertIn("already in use", str(caught.exception))
 
@@ -197,26 +202,175 @@ class BookkeepingTest(unittest.TestCase):
         # src/feedd.cpp parses listen_host with inet_addr, which takes a
         # numeric IPv4 address. Python's bind would resolve the name.
         with self.assertRaises(SystemExit) as caught:
-            obctl.preflight({"listen_host": "localhost", "listen_port": 0}, Path("config/dev.json"))
+            obctl.preflight({"listen_host": "localhost", "listen_port": 0}, self.cfg)
 
         self.assertIn("inet_addr", str(caught.exception))
 
     def test_preflight_refuses_a_port_that_is_not_a_number(self) -> None:
         with self.assertRaises(SystemExit) as caught:
-            obctl.preflight({"listen_host": "127.0.0.1", "listen_port": "nine"}, Path("config/dev.json"))
+            obctl.preflight({"listen_host": "127.0.0.1", "listen_port": "nine"}, self.cfg)
 
         self.assertIn("is not a number", str(caught.exception))
 
     def test_preflight_passes_on_a_clean_state(self) -> None:
-        obctl.preflight({"listen_host": "127.0.0.1", "listen_port": 0}, Path("config/dev.json"))
+        obctl.preflight({"listen_host": "127.0.0.1", "listen_port": 0}, self.cfg)
 
     def test_a_corrupt_pid_file_is_never_signalled(self) -> None:
         for junk in ("0", "-1", "", "not-a-pid"):
             with self.subTest(junk=junk):
-                obctl.pid_file("feedd").write_text(junk)
-                self.assertIsNone(obctl.read_pid("feedd"))
-                obctl.stop(Path("config/dev.json"))
-                self.assertFalse(obctl.pid_file("feedd").exists())
+                obctl.pid_file("feedd", self.cfg).write_text(junk)
+                self.assertIsNone(obctl.read_pid("feedd", self.cfg))
+                obctl.stop(self.cfg)
+                self.assertFalse(obctl.pid_file("feedd", self.cfg).exists())
+
+
+class RunDirectoryTest(unittest.TestCase):
+    """One config cannot stop another's processes.
+
+    The reported incident: a window was open on the live config, a harness test
+    ran `make e2e`, and the window went to `feed=stalled` with a 39-second
+    staleness and never recovered. `stop` reads a pid file, and every config
+    wrote to the same `var/run`, so the test's stop signalled the live
+    session's feedd and adapter. Nothing in the test was wrong except where it
+    kept its pid files.
+
+    The two shipped configs also have to stay apart: the config a test runs on
+    must not be the config a person runs on, in paths or in port.
+    """
+
+    REPO = Path(__file__).resolve().parents[1]
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / "config").mkdir(parents=True)
+        patcher = mock.patch.object(obctl, "ROOT", self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.quiet = contextlib.redirect_stdout(io.StringIO())
+        self.quiet.__enter__()
+        self.addCleanup(self.quiet.__exit__, None, None, None)
+        self.dev = self.config("dev")
+        self.test = self.config("test")
+
+    def config(self, name: str) -> Path:
+        path = self.root / "config" / f"{name}.json"
+        path.write_text('{"env": "dev", "listen_host": "127.0.0.1", "listen_port": 0}')
+        return path
+
+    def write_pid(self, name: str, pid: int, cfg: Path) -> None:
+        path = obctl.pid_file(name, cfg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(pid))
+
+    def test_two_configs_do_not_share_a_pid_file(self) -> None:
+        for name in ("feedd", "adapter", "tui"):
+            with self.subTest(name=name):
+                self.assertNotEqual(
+                    obctl.pid_file(name, self.dev),
+                    obctl.pid_file(name, self.test),
+                    "two configs sharing a pid file is how one stops the other",
+                )
+                self.assertNotEqual(
+                    obctl.log_file(name, self.dev), obctl.log_file(name, self.test)
+                )
+
+    def test_a_stop_on_one_config_leaves_the_other_running(self) -> None:
+        live = FakeProc("build/feedd")
+        self.addCleanup(live.stop)
+        self.write_pid("feedd", live.pid, self.dev)
+
+        obctl.stop(self.test)
+
+        self.assertTrue(
+            obctl.pid_alive(live.pid),
+            "a stop on the test config killed the daemon the live config started",
+        )
+        self.assertTrue(
+            obctl.pid_file("feedd", self.dev).exists(),
+            "the live config's pid file was removed by a stop that was not its",
+        )
+
+    def test_a_stop_on_the_same_config_reaches_it(self) -> None:
+        # The other half: keying by config must not turn stop into a no-op.
+        live = FakeProc("build/feedd")
+        self.addCleanup(live.stop)
+        self.write_pid("feedd", live.pid, self.dev)
+
+        obctl.stop(self.dev)
+
+        # Asked of ps, not of the pid: this test's child is a zombie until it is
+        # reaped, and signal 0 succeeds for a zombie.
+        self.assertFalse(obctl.proc_running(live.pid), "the config's own daemon was not stopped")
+        self.assertFalse(obctl.pid_file("feedd", self.dev).exists())
+
+    def test_the_shipped_test_config_is_not_the_shipped_live_config(self) -> None:
+        dev = obctl.load(self.REPO / "config" / "dev.json")
+        test = obctl.load(self.REPO / "config" / "test.json")
+        for key in ("bus_path", "wal_path", "log_path", "listen_port"):
+            with self.subTest(key=key):
+                self.assertNotEqual(
+                    dev.get(key),
+                    test.get(key),
+                    f"{key} is shared between the live and test configs, so a test "
+                    f"run reaches a session's ring or its port",
+                )
+        # The config file names are what the run directories are keyed by, and
+        # these two are the ones the Makefile points at.
+        self.assertNotEqual(obctl.run_dir(self.REPO / "config" / "dev.json").name, "test")
+
+    def heartbeat_name(self) -> str:
+        """The heartbeat's name as the adapter defines it.
+
+        Read rather than repeated here, so a rename on either side fails this
+        test instead of being mirrored into it.
+        """
+        text = (self.REPO / "python" / "feed_adapter.py").read_text()
+        found = re.search(r'^HEARTBEAT_NAME = "([^"]+)"', text, re.MULTILINE)
+        self.assertIsNotNone(found, "the adapter no longer defines HEARTBEAT_NAME")
+        return found.group(1)
+
+    def test_the_heartbeat_name_is_the_same_on_both_sides(self) -> None:
+        """The adapter writes it and the window reads it, in two languages.
+
+        A one-word divergence here is invisible: the window finds no file, reports
+        `Absent`, and loses the distinction between a quiet exchange and a dead
+        adapter — which is the whole reason the file exists. The watch file's path
+        was derived independently on the two sides and disagreed once (OPT-034), so
+        the name is pinned across both rather than only in the language that
+        happens to be tested.
+        """
+        name = self.heartbeat_name()
+        window = (self.REPO / "rust" / "ob-cli" / "src" / "lib.rs").read_text()
+        self.assertIn(
+            f'HEARTBEAT_NAME: &str = "{name}"',
+            window,
+            "the window's heartbeat name does not match the adapter's",
+        )
+
+    def test_the_window_reads_the_heartbeat_beside_the_watch_file(self) -> None:
+        # The other half of the same agreement: which directory. The adapter puts
+        # it beside the watch list, and the window has to look in the same place.
+        window = (self.REPO / "rust" / "ob-cli" / "src" / "bin" / "tui.rs").read_text()
+        self.assertIn("watch_path.with_file_name(HEARTBEAT_NAME)", window)
+
+    def test_stopping_a_process_says_who_did_it(self) -> None:
+        # SIGTERM has no sender, and the reported stall left a log that said a
+        # process had stopped but not what stopped it. The caller's pid and
+        # working directory are what tell a person apart from a harness test in
+        # another checkout.
+        live = FakeProc("build/feedd")
+        self.addCleanup(live.stop)
+        self.write_pid("feedd", live.pid, self.dev)
+
+        obctl.stop(self.dev)
+
+        log = obctl.log_file("feedd", self.dev).read_text()
+        self.assertIn("obctl stop", log)
+        self.assertIn(f"pid={live.pid}", log)
+        self.assertIn(f"signalled by obctl pid={os.getpid()}", log)
+        self.assertIn(f"cwd={Path.cwd()}", log)
 
 
 class ImplementationSwitchTest(unittest.TestCase):
@@ -233,7 +387,8 @@ class ImplementationSwitchTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        (self.root / "var" / "run").mkdir(parents=True)
+        self.cfg = Path("config/dev.json")
+        (self.root / "var" / "run" / "dev").mkdir(parents=True)
         (self.root / "config").mkdir(parents=True)
         patcher = mock.patch.object(obctl, "ROOT", self.root)
         patcher.start()
@@ -243,7 +398,7 @@ class ImplementationSwitchTest(unittest.TestCase):
         self.addCleanup(self.quiet.__exit__, None, None, None)
 
     def write_pid(self, name: str, pid: int) -> None:
-        obctl.pid_file(name).write_text(str(pid))
+        obctl.pid_file(name, self.cfg).write_text(str(pid))
 
     def test_each_marker_matches_only_its_own_build(self) -> None:
         for name in ("feedd", "tui"):
@@ -282,9 +437,9 @@ class ImplementationSwitchTest(unittest.TestCase):
         self.addCleanup(ours.stop)
         self.write_pid("feedd", ours.pid)
 
-        obctl.stop(Path("config/dev.json"))
+        obctl.stop(self.cfg)
 
-        self.assertFalse(obctl.pid_file("feedd").exists(), "the rust instance was left running")
+        self.assertFalse(obctl.pid_file("feedd", self.cfg).exists(), "the rust instance was left running")
 
     def test_impl_defaults_to_cpp(self) -> None:
         self.assertEqual(obctl.parser().parse_args(["setup"]).impl, "cpp")
@@ -322,7 +477,7 @@ class ImplementationSwitchTest(unittest.TestCase):
             binary.chmod(0o755)
         commands: list[list[str]] = []
 
-        def record(name: str, cmd: list[str]) -> subprocess.Popen:
+        def record(name: str, cfg_path: Path, cmd: list[str]) -> subprocess.Popen:
             commands.append(cmd)
             raise SystemExit("stop here")
 
@@ -350,7 +505,8 @@ class AwaitStartedTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        (self.root / "var" / "run").mkdir(parents=True)
+        self.cfg = Path("config/dev.json")
+        (self.root / "var" / "run" / "dev").mkdir(parents=True)
         patcher = mock.patch.object(obctl, "ROOT", self.root)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -364,22 +520,24 @@ class AwaitStartedTest(unittest.TestCase):
         proc.wait(timeout=5)
 
     def test_a_child_that_exits_at_once_is_not_reported_as_started(self) -> None:
-        offset = obctl.log_offset("feedd")
+        offset = obctl.log_offset("feedd", self.cfg)
         proc = obctl.spawn(
             "feedd",
+            self.cfg,
             [sys.executable, "-c", "import sys; sys.stderr.write('bind failed\\n'); sys.exit(1)"],
         )
 
         with self.assertRaises(SystemExit) as caught:
-            obctl.await_started("feedd", proc, offset, "feedd listen", 1.0)
+            obctl.await_started("feedd", self.cfg, proc, offset, "feedd listen", 1.0)
 
         self.assertIn("bind failed", str(caught.exception))
-        self.assertFalse(obctl.pid_file("feedd").exists())
+        self.assertFalse(obctl.pid_file("feedd", self.cfg).exists())
 
     def test_a_child_that_prints_its_ready_line_is_reported_as_started(self) -> None:
-        offset = obctl.log_offset("feedd")
+        offset = obctl.log_offset("feedd", self.cfg)
         proc = obctl.spawn(
             "feedd",
+            self.cfg,
             [
                 sys.executable,
                 "-c",
@@ -389,19 +547,19 @@ class AwaitStartedTest(unittest.TestCase):
         )
         self.addCleanup(self.reap, proc)
 
-        obctl.await_started("feedd", proc, offset, "feedd listen", 1.0)
+        obctl.await_started("feedd", self.cfg, proc, offset, "feedd listen", 1.0)
 
-        self.assertTrue(obctl.pid_file("feedd").exists())
+        self.assertTrue(obctl.pid_file("feedd", self.cfg).exists())
 
     def test_a_child_that_stays_silent_past_the_ceiling_fails(self) -> None:
-        offset = obctl.log_offset("feedd")
+        offset = obctl.log_offset("feedd", self.cfg)
         proc = obctl.spawn(
-            "feedd", [sys.executable, "-c", "import time; time.sleep(30)"]
+            "feedd", self.cfg, [sys.executable, "-c", "import time; time.sleep(30)"]
         )
         self.addCleanup(self.reap, proc)
 
         with self.assertRaises(SystemExit):
-            obctl.await_started("feedd", proc, offset, "feedd listen", 0.3)
+            obctl.await_started("feedd", self.cfg, proc, offset, "feedd listen", 0.3)
 
 
 class StartCleanupTest(unittest.TestCase):
@@ -411,7 +569,7 @@ class StartCleanupTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        (self.root / "var" / "run").mkdir(parents=True)
+        (self.root / "var" / "run" / "dev").mkdir(parents=True)
         (self.root / "config").mkdir(parents=True)
         self.cfg = self.root / "config" / "dev.json"
         self.cfg.write_text(
@@ -429,7 +587,7 @@ class StartCleanupTest(unittest.TestCase):
     def test_a_failed_adapter_check_stops_feedd(self) -> None:
         children: list[subprocess.Popen] = []
 
-        def fake_spawn(name: str, cmd: list[str]) -> subprocess.Popen:
+        def fake_spawn(name: str, cfg_path: Path, cmd: list[str]) -> subprocess.Popen:
             # A stand-in whose command line carries the marker, so the
             # ownership check treats it as this lab's process.
             proc = subprocess.Popen(
@@ -437,10 +595,17 @@ class StartCleanupTest(unittest.TestCase):
                 start_new_session=True,
             )
             children.append(proc)
-            obctl.pid_file(name).write_text(str(proc.pid))
+            obctl.pid_file(name, cfg_path).write_text(str(proc.pid))
             return proc
 
-        def fake_await(name: str, proc: subprocess.Popen, offset: int, marker: str, ceiling: float) -> None:
+        def fake_await(
+            name: str,
+            cfg_path: Path,
+            proc: subprocess.Popen,
+            offset: int,
+            marker: str,
+            ceiling: float,
+        ) -> None:
             if name == "adapter":
                 raise SystemExit("adapter did not start")
 
@@ -464,7 +629,7 @@ class StartCleanupTest(unittest.TestCase):
                 proc.poll(), "a child was left running after a failed start"
             )
         for name in ("feedd", "adapter"):
-            self.assertFalse(obctl.pid_file(name).exists())
+            self.assertFalse(obctl.pid_file(name, self.cfg).exists())
 
     def test_a_missing_rust_build_is_refused_by_path(self) -> None:
         # Nothing has built rust/target/release in this temporary ROOT, so

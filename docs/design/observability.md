@@ -40,6 +40,24 @@ nothing on that path can allocate or panic. A line that would overflow the buffe
 is truncated with a marker rather than allocating, because a log call must never
 be the thing that fails under pressure.
 
+A process this lab stops gets a line written into its own log by the thing that
+stopped it, after the signal is sent:
+
+```text
+2026-10-18T19:12:04 obctl stop: feedd pid=4718 signalled by obctl pid=9982 cwd=/Users/me/other-checkout
+```
+
+SIGTERM carries no sender, so without this a stopped daemon is silent about it. A
+feed that stopped because a person ran `stop` and a feed that stopped because a
+harness test did, from a different directory, read the same. The caller's pid and
+working directory are what tell them apart, and the third field is what makes the
+second one worth having.
+
+Each config's process logs and pid files are in `var/run/<config>/`: keyed by the
+config file rather than by its `env`, because two configs can share an env (the
+shipped test config is `env: dev`) and a shared pid file is one config's `stop`
+reaching another's daemon. `docs/optimization/ledger.jsonl` OPT-038.
+
 ## 4. The numbers that matter
 
 ### 4.1 Latency, in stages
@@ -101,7 +119,7 @@ it shows all three:
 
 ```text
 ring=4096  lag=0 records (0ns of feed time)  staleness=5.236s
-consumed=20 records  resyncs=0  age=4.910s
+consumed=20 records  resyncs=1  reattaches=1  age=4.910s
 ```
 
 | Field | Unit | Question it answers |
@@ -111,6 +129,7 @@ consumed=20 records  resyncs=0  age=4.910s
 | `staleness` | time | how old the newest published record is |
 | `age` | time | how long since this reader last applied a record |
 | `resyncs` | count | how many times the writer lapped this reader |
+| `reattaches` | count | how many times this window attached itself to a feed that had restarted |
 
 **Why the lag is shown as a count and a span.** A count of records means nothing
 without the feed's rate: forty records behind is a disaster at a hundred per
@@ -132,7 +151,79 @@ could not show that at all.
 All three are the **reader's** view. None of them is the exchange's latency, which
 this lab cannot measure; §4.1 says what is and is not measured.
 
-### 4.4 The ticker picker and the status line
+### 4.4 What a stalled window is attached to
+
+`feed=stalled` is one state with three causes, and the window distinguishes them
+rather than leaving the operator to guess. The state itself is simple: no record
+applied for `STALL_AFTER` (two seconds), from an `Instant` taken at the last
+apply. What it cannot say on its own is *why*, because from inside the ring the
+two cases that matter look identical — records stop arriving. A quiet exchange and
+a daemon that has exited both leave a valid ring whose newest record is old.
+
+The missing fact is whether anything is still trying to write. The adapter
+publishes it:
+
+```text
+var/<env>/adapter.heartbeat     "<pid> <unix seconds> <note>"
+```
+
+Written on every reconnect attempt and after every connect, at up to five times a
+second while frames arrive, by writing a temporary file and renaming it, so a
+reader never sees half a line. It is removed on a clean exit. The notes are
+`starting`, `connected; watching A,B`, `live; watching N`, `no feedd; redialing`,
+and `ws error; retrying in Ns`, so a reader can tell "still trying" from "gave up"
+as well as "running" from "gone".
+
+`ob_cli::read_heartbeat` classifies it as `Live`, `Stale` or `Absent`, with a
+three-second window (`HEARTBEAT_STALE_S`) — far longer than the adapter's own
+interval and far shorter than a person's patience. The window then says which case
+it is:
+
+| Heartbeat | Line under the book | What it rules out |
+|-----------|--------------------|-------------------|
+| fresh | the adapter is alive, so the exchange has gone quiet | this host: a restart would not help |
+| stale | the adapter has exited, with its pid and how long ago | the exchange |
+| absent | nothing is feeding this ring at all | a process that died without a heartbeat |
+
+When the displayed symbol has never been applied, that is a fourth case and it is
+said differently: `Nothing for SYMBOL yet`, followed by the same statement about
+the adapter. `age` is the window's own, so it starts counting at the attach or the
+switch, and without this the first two seconds after a switch to a symbol the
+exchange is not sending would read as a feed failure. Here the selection is the
+suspect, not the feed.
+
+A heartbeat is a courtesy, not a contract: a lab that cannot write one still
+feeds, and the window reports it as absent rather than failing.
+
+### 4.5 Re-attaching to a feed that restarted
+
+A window attached to a ring does not stay attached by itself. Two things end the
+attachment and neither is visible in the bytes the window reads:
+
+- **The writer restarts.** `Ring::create` truncates the header and the write
+  sequence begins again at zero. The reader's cursor is a number from the run that
+  ended, so it is *ahead* of the writer, `consume` returns `Empty` on every frame,
+  and the window shows the last book of a dead run for ever.
+- **The file is replaced.** A mapping follows the inode it was made from. A ring
+  file that is removed and created again leaves the window reading a file nothing
+  writes, and the bytes of that file are a valid, empty ring.
+
+Both look like a healthy ring with nothing new in it, which is why a window has to
+check rather than infer. Every `RING_CHECK` (250 ms) the window asks two questions:
+is the file at the path still the inode it mapped (`RingReader::replaced`), and has
+the write sequence gone backwards below its cursor. Either one is a re-attach: the
+ring is opened again, the cursor goes to zero, the book is rebuilt from the new
+run and the counters restart. The header counts it in `reattaches=`, so the state
+is visible rather than inferred from prices that happen to have changed.
+
+The prices are not sufficient evidence on their own. A window that never notices
+still *appears* to recover once the new run has published as many records as the
+old cursor had reached, because the slot's sequence then matches and `consume`
+carries on — from the middle of a stream, having silently lost its start.
+
+`docs/runbooks/feed-stalled.md` is the operator's side of §4.4 and §4.5.
+
+### 4.6 The ticker picker and the status line
 
 Two parts of the frame report state rather than measurements:
 
@@ -149,9 +240,9 @@ that merely contains those letters.
 The header also carries the displayed symbol, the count of watched symbols, and
 the size of the subscription, because a book that never updates has three possible
 causes and they are told apart by what is on that line: the wrong symbol selected,
-the symbol not watched, or the feed stalled.
+the symbol not watched, or the feed stalled. §4.4 is how the window says which.
 
-### 4.5 Durability counters
+### 4.7 Durability counters
 
 `wal_records`, `wal_rejected`, `wal_torn_bytes` and `ring_published` come out of
 the headless checker, which reads both the ring and the log. A torn tail is
@@ -202,5 +293,6 @@ rather than stopping.
 
 - `docs/design/ticker-cache.md` §4 — the latency, slippage and pressure model
 - `docs/design/vec-optimization.md` — the kernel measurements
+- `docs/runbooks/feed-stalled.md` — what to do when the window says the feed stopped
 - `docs/optimization/ledger.jsonl` — the record of what each change cost
 - `docs/telemetry/SCHEMA-v1.md` — the harness's own telemetry schema

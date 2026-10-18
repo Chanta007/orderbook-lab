@@ -46,6 +46,26 @@
 //!   that says whether *this window* is being fed.
 //!
 //! All three are this reader's view, not the exchange's.
+//!
+//! # Losing the feed, and getting it back
+//!
+//! `feed=stalled` is one state with three causes, and the window says which: an
+//! adapter that is alive and an exchange that has gone quiet, an adapter that has
+//! exited, or no adapter at all. That comes from
+//! `var/<env>/adapter.heartbeat`, which the adapter rewrites as it works
+//! ([`ob_cli::read_heartbeat`]).
+//!
+//! A window does not stay attached to a ring by itself. The daemon truncates the
+//! ring's header when it starts, so the write sequence begins again at zero while
+//! this cursor is a number from the run that ended; and a mapping follows the
+//! inode it was made from, so a replaced ring file leaves the window reading a
+//! file nothing writes. Both look like a healthy ring with nothing new in it, so
+//! the window checks ([`reattach`]) rather than infers, and rebuilds its view when
+//! either has happened. `reattaches=` in the header counts it.
+//!
+//! The remedy the window prints for a stopped feed is `make rust-feed`, which
+//! starts the feed and the adapter and no window. It used to print `make stop`
+//! first, and `stop` signals this process as well.
 
 use ob::book::{Book, Level};
 use ob::clock;
@@ -55,6 +75,7 @@ use ob::ring::RingReader;
 use ob_cli::tickers::Catalog;
 use ob_cli::watch::Watch;
 use ob_cli::{load_config, CliError, CliResult};
+use ob_cli::{read_heartbeat, Liveness, HEARTBEAT_NAME};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -66,6 +87,14 @@ const STALL_AFTER: Duration = Duration::from_secs(2);
 
 /// How often a frame is drawn.
 const FRAME: Duration = Duration::from_millis(100);
+
+/// How often the window checks that the ring it mapped is still the ring at the
+/// path, and that the writer has not started a new run.
+///
+/// A stat is cheap enough for every frame, and the check is not: it decides
+/// whether the window is attached to the feed that is running now. A quarter of
+/// a second is the longest a person would call immediate.
+const RING_CHECK: Duration = Duration::from_millis(250);
 
 /// How many suggestions the picker offers at once.
 const SUGGESTIONS: usize = 8;
@@ -182,9 +211,12 @@ fn run() -> CliResult {
     let cfg = load_config(cfg_path)?;
     let levels = args.number::<usize>("--levels", cfg.levels)?;
 
-    let ring = RingReader::open(std::path::Path::new(&cfg.bus_path))?;
+    let ring_path = PathBuf::from(&cfg.bus_path);
+    let mut ring = RingReader::open(&ring_path)?;
     let catalog = Catalog::load(&PathBuf::from(&cfg.tickers_path))?;
     let watch_path = PathBuf::from(&cfg.watch_path);
+    // Beside the watch list, because that is where the adapter looks for it.
+    let heartbeat_path = watch_path.with_file_name(HEARTBEAT_NAME);
     let mut watch = Watch::load(&watch_path, &cfg.symbol)?;
     // The terminal is the authority on what is watched while it runs, so write the
     // set it opened with. Without this the adapter would keep whatever was there
@@ -209,6 +241,8 @@ fn run() -> CliResult {
     let mut saw_any = false;
     let mut consumed = 0u64;
     let mut resyncs = 0u64;
+    let mut reattaches = 0u64;
+    let mut last_ring_check = Instant::now();
     let mut displayed = watch.current().to_string();
 
     let stdout = std::io::stdout();
@@ -278,6 +312,47 @@ fn run() -> CliResult {
             }
         }
 
+        // Is this window still attached to the feed that is running?
+        //
+        // Two ways to stop being attached, and neither is visible in the bytes
+        // the window reads. The daemon truncates the ring's header when it
+        // starts a fresh run, so the sequence begins again at zero while this
+        // cursor is a number from the run that ended: `consume` cannot tell an
+        // old cursor from a caught-up one, reports `Empty` on every frame, and
+        // the window sits on the last book of a run that is over — which is
+        // what a user sees as a window that never reconnects. And a mapping
+        // follows the inode it was made from, so a ring file that is removed
+        // and created again leaves the window reading a file nothing writes.
+        if last_ring_check.elapsed() >= RING_CHECK {
+            last_ring_check = Instant::now();
+            let restarted = match reattach(&mut ring, &ring_path, cursor) {
+                Attached::Current => false,
+                Attached::Restarted => true,
+                Attached::Failed(message) => {
+                    status = message;
+                    false
+                }
+            };
+            if restarted {
+                // The whole view belongs to the run that ended, so it all goes:
+                // the cursor, the book, and the counts, which would otherwise
+                // describe two runs as one. Starting at zero replays whatever
+                // the new run has already published, and `consume_batch`
+                // resynchronises to the oldest record still in the ring.
+                cursor = 0;
+                book = Book::new(cfg.cache_depth.max(levels + 1));
+                last_record = Instant::now();
+                saw_any = false;
+                consumed = 0;
+                resyncs = 0;
+                reattaches += 1;
+                status = format!(
+                    "the feed restarted; re-attached at seq {}",
+                    ring.published()
+                );
+            }
+        }
+
         // Drain the ring, applying only the displayed symbol's records.
         let n = ring.consume_batch(&mut cursor, &mut out);
         if n > 0 {
@@ -303,7 +378,9 @@ fn run() -> CliResult {
             &Frame {
                 levels: level_count.load(Ordering::Relaxed),
                 live: saw_any && last_record.elapsed() < STALL_AFTER,
+                fed: saw_any,
                 symbol: &displayed,
+                config_path: cfg_path,
                 ring_capacity: ring.capacity(),
                 lag: ring.lag(cursor),
                 backlog_ns: backlog_ns(&ring, cursor),
@@ -311,7 +388,15 @@ fn run() -> CliResult {
                 age: last_record.elapsed(),
                 consumed,
                 resyncs,
+                reattaches,
                 watched: watch.len(),
+                adapter: read_heartbeat(
+                    &heartbeat_path,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                ),
                 status: &status,
                 suggestions: &suggestions,
                 highlighted: highlighted.min(suggestions.len().saturating_sub(1)),
@@ -458,6 +543,46 @@ fn first_token(line: &str) -> String {
     line.split_whitespace().next().unwrap_or("").to_string()
 }
 
+/// What a re-attach check found.
+#[derive(Debug)]
+enum Attached {
+    /// The ring at the path is the one this window has, and it is the same run.
+    Current,
+    /// A new run wrote this ring, or a new file is at the path. Either way the
+    /// cursor and the book belong to a run that is over.
+    Restarted,
+    /// A new file is at the path and it cannot be opened as a ring.
+    Failed(String),
+}
+
+/// Re-attach the window to the ring at `path`, when it is no longer the one it
+/// was reading.
+///
+/// Split out of the loop so the decision can be read without the drawing around
+/// it, and because it is the whole answer to "the feed came back and the window
+/// did not": nothing else in this program can notice, since both failures look
+/// like a valid ring with nothing new in it.
+fn reattach(ring: &mut RingReader, path: &Path, cursor: u64) -> Attached {
+    if ring.replaced(path) {
+        match RingReader::open(path) {
+            Ok(fresh) => *ring = fresh,
+            Err(e) => {
+                return Attached::Failed(format!(
+                    "the ring at {} was replaced and cannot be opened: {e}",
+                    path.display()
+                ));
+            }
+        }
+        return Attached::Restarted;
+    }
+    // The writer truncates the header it created, so the sequence going
+    // backwards is a new run over the same file.
+    if ring.published() < cursor {
+        return Attached::Restarted;
+    }
+    Attached::Current
+}
+
 /// Feed time between the oldest record not yet taken and the newest published.
 fn backlog_ns(ring: &RingReader, cursor: u64) -> Option<u64> {
     let newest = ring.published().checked_sub(1)?;
@@ -481,8 +606,13 @@ fn staleness_ns(ring: &RingReader) -> Option<u64> {
 struct Frame<'a> {
     levels: usize,
     live: bool,
+    /// Whether a record for the displayed symbol has ever been applied, which is
+    /// what separates "nothing yet" from "it stopped".
+    fed: bool,
     /// The symbol on screen.
     symbol: &'a str,
+    /// The config this window was opened with, so a remedy can name it.
+    config_path: &'a str,
     ring_capacity: u32,
     lag: u64,
     backlog_ns: Option<u64>,
@@ -490,8 +620,12 @@ struct Frame<'a> {
     age: Duration,
     consumed: u64,
     resyncs: u64,
+    /// How many times this window re-attached to a feed that restarted.
+    reattaches: u64,
     /// How many symbols are being watched.
     watched: usize,
+    /// What the adapter's heartbeat says.
+    adapter: Liveness,
     /// The last thing that happened, for the user to read.
     status: &'a str,
     /// What the picker is offering.
@@ -542,9 +676,10 @@ fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame<'_>) -> C
         frame.ring_capacity, frame.lag
     ));
     buf.push_str(&format!(
-        "consumed={} records  resyncs={}  age={}\x1b[K\n",
+        "consumed={} records  resyncs={}  reattaches={}  age={}\x1b[K\n",
         frame.consumed,
         frame.resyncs,
+        frame.reattaches,
         ob_cli::duration_ns(frame.age.as_nanos().min(u128::from(u64::MAX)) as u64)
     ));
     buf.push_str("Bid prices are red. Ask prices are green.\x1b[K\n");
@@ -568,11 +703,66 @@ fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame<'_>) -> C
     if !frame.status.is_empty() {
         buf.push_str(&format!("{}{RESET}\x1b[K\n", frame.status));
     }
-    if !frame.live && frame.consumed == 0 {
-        buf.push_str(
-            "Nothing for this symbol yet. If it never arrives, check that the \
-             adapter is watching it: `watch` lists the set.\x1b[K\n",
-        );
+    if !frame.live {
+        // The adapter's own account of itself, which is what tells apart the two
+        // causes that look identical from the ring: an exchange that has gone
+        // quiet and a process that has exited. Before this the window had one
+        // line for both, and the one it could not name is the one a user cannot
+        // fix by waiting. A window stalled because the exchange went quiet and a
+        // window whose daemon was stopped from another session were the same
+        // frame, and the second is what happened.
+        let (adapter, quiet, restartable) = match &frame.adapter {
+            Liveness::Live { age_s, note, .. } => (
+                format!("The adapter is alive ({note}, {age_s}s ago)"),
+                ", so the exchange has gone quiet rather than this host",
+                false,
+            ),
+            Liveness::Stale { pid, age_s, .. } => (
+                format!(
+                    "The adapter (pid {pid}) last wrote {age_s}s ago and has not \
+                     since: it has exited, and this window cannot restart it"
+                ),
+                "",
+                true,
+            ),
+            Liveness::Absent => (
+                "No adapter heartbeat at all, so nothing is feeding this ring".to_string(),
+                "",
+                true,
+            ),
+        };
+        if !frame.fed {
+            // A symbol selected a moment ago has no book yet, and that is a
+            // different situation from a feed that stopped: `age` is this
+            // window's own, so it starts counting at the attach or the switch
+            // and the first two seconds after a switch would otherwise read as a
+            // stall. Here the selection is the suspect, not the feed.
+            buf.push_str(&format!(
+                "Nothing for {} yet. {adapter}. If it never arrives, check that \
+                 the adapter is watching it: `watch` lists the set.\x1b[K\n",
+                frame.symbol
+            ));
+        } else {
+            let stalled =
+                ob_cli::duration_ns(frame.age.as_nanos().min(u128::from(u64::MAX)) as u64);
+            buf.push_str(&format!(
+                "Feed stalled. {adapter}{quiet}. This window last applied a record \
+                 {stalled} ago.\x1b[K\n"
+            ));
+        }
+        if restartable {
+            // The remedy has to be a command that starts the feed without
+            // closing this window. It used to be `make stop` and then
+            // `make rust-start`, and `stop` signals the tui as well: the advice
+            // for a window that could not reach its feed was to close the
+            // window. Starting the feed is now the whole of it, because the
+            // window re-attaches by itself once a writer is at the ring again.
+            buf.push_str(&format!(
+                "Start the feed again in another window: make rust-feed CONFIG={}\x1b[K\n",
+                frame.config_path
+            ));
+            buf.push_str("This window re-attaches by itself; `make stop` would close it.\x1b[K\n");
+        }
     }
     buf.push_str(&format!(
         "{RED}{:>12} {:>12}{RESET}    {GREEN}{:>12} {:>12}{RESET}\x1b[K\n",

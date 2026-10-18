@@ -180,6 +180,76 @@ pub fn ms(ns: u64) -> String {
     format!("{:.3}", ns as f64 / 1_000_000.0)
 }
 
+/// The file the adapter writes to say it is alive.
+///
+/// The name is shared with `python/feed_adapter.py`'s `HEARTBEAT_NAME`, and the
+/// two have to agree: if they do not, a reader finds no file, reports `Absent`,
+/// and the window loses the distinction this whole mechanism exists for. It is
+/// the same shape of defect as the watch file's path, which was derived twice and
+/// disagreed once (`docs/optimization/ledger.jsonl` OPT-034). The name lives here
+/// so there is one place per side rather than one literal per call site, and
+/// `python/test_obctl.py` asserts the two strings match.
+pub const HEARTBEAT_NAME: &str = "adapter.heartbeat";
+
+/// What a heartbeat file says about a process that should be running.
+///
+/// Two causes of a stalled book look identical from the ring: an exchange that
+/// has gone quiet, and no adapter at all. The second is what a stopped session
+/// leaves behind, and it is the one a window cannot recover from on its own, so it
+/// has to be told apart from the first and said out loud.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Liveness {
+    /// The file is there and recent, with the note the process wrote.
+    Live {
+        /// The process id it reported.
+        pid: u32,
+        /// Seconds since it last wrote.
+        age_s: u64,
+        /// What it said it was doing.
+        note: String,
+    },
+    /// The file is there and stale: the process wrote, then stopped.
+    Stale {
+        /// The process id it reported.
+        pid: u32,
+        /// Seconds since it last wrote.
+        age_s: u64,
+        /// The last note it left.
+        note: String,
+    },
+    /// No file at all, so nothing has written one this run.
+    Absent,
+}
+
+/// How stale a heartbeat may be before it stops counting as live.
+///
+/// The adapter writes one about five times a second while frames arrive, so a
+/// couple of seconds is far longer than its own interval and far shorter than a
+/// person's patience.
+pub const HEARTBEAT_STALE_S: u64 = 3;
+
+/// Read a heartbeat file and classify it.
+pub fn read_heartbeat(path: &std::path::Path, now_unix_s: u64) -> Liveness {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Liveness::Absent;
+    };
+    // `pid` unix_seconds note...; anything else is a file this program does not
+    // understand, and saying nothing is better than saying something wrong.
+    let mut parts = text.splitn(3, ' ');
+    let pid = parts.next().and_then(|p| p.trim().parse::<u32>().ok());
+    let stamped = parts.next().and_then(|p| p.trim().parse::<u64>().ok());
+    let note = parts.next().unwrap_or("").trim().to_string();
+    let (Some(pid), Some(stamped)) = (pid, stamped) else {
+        return Liveness::Absent;
+    };
+    let age_s = now_unix_s.saturating_sub(stamped);
+    if age_s <= HEARTBEAT_STALE_S {
+        Liveness::Live { pid, age_s, note }
+    } else {
+        Liveness::Stale { pid, age_s, note }
+    }
+}
+
 /// Format a duration for a report, choosing the unit by magnitude.
 ///
 /// Nanoseconds below a microsecond, microseconds below a millisecond, and so on,
@@ -296,6 +366,61 @@ mod tests {
         let err = bad.number::<usize>("symbols", 10).expect_err("must fail");
         assert_eq!(err.code, 2);
         assert!(err.message.contains("expects a number"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_heartbeat_reads_back_with_its_note_and_age() {
+        let dir = std::env::temp_dir().join(format!("ob-beat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("adapter.heartbeat");
+
+        // Nothing written yet.
+        assert_eq!(read_heartbeat(&path, 1000), Liveness::Absent);
+
+        // Two seconds old is inside the window.
+        std::fs::write(&path, "4242 998 live; watching 3\n").expect("write");
+        match read_heartbeat(&path, 1000) {
+            Liveness::Live { pid, age_s, note } => {
+                assert_eq!(pid, 4242);
+                assert_eq!(age_s, 2);
+                assert_eq!(note, "live; watching 3");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Five seconds old is outside it: the process wrote and then stopped.
+        std::fs::write(&path, "4242 995 live; watching 3\n").expect("write");
+        match read_heartbeat(&path, 1000) {
+            Liveness::Stale { pid, age_s, .. } => {
+                assert_eq!(pid, 4242);
+                assert_eq!(age_s, 5);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Exactly at the threshold still counts as live, so the boundary is a
+        // decision rather than an accident.
+        std::fs::write(&path, format!("4242 {} live\n", 1000 - HEARTBEAT_STALE_S)).expect("write");
+        assert!(matches!(read_heartbeat(&path, 1000), Liveness::Live { .. }));
+
+        // A file this program does not understand says nothing rather than
+        // something wrong.
+        std::fs::write(&path, "not a heartbeat").expect("write");
+        assert_eq!(read_heartbeat(&path, 1000), Liveness::Absent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_heartbeat_from_the_future_is_treated_as_live_not_as_negative() {
+        // A clock that stepped backwards must not produce a huge age.
+        let dir = std::env::temp_dir().join(format!("ob-beat2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("adapter.heartbeat");
+        std::fs::write(&path, "1 2000 live\n").expect("write");
+        match read_heartbeat(&path, 1000) {
+            Liveness::Live { age_s, .. } => assert_eq!(age_s, 0, "saturated rather than wrapping"),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

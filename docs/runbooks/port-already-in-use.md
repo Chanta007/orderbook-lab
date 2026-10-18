@@ -4,7 +4,8 @@
 
 - `make start` prints `refusing to start: 127.0.0.1:9001 is already in use, so feedd cannot bind.`
 - `make start` prints `feedd did not start (pid=...). Last lines:` followed by `bind failed`.
-- `var/run/feedd.log` ends with `bind failed`.
+- `var/run/dev/feedd.log` ends with `bind failed`. The directory is named
+  after the config file, so `make e2e` reads and writes `var/run/test/`.
 - The window opens but stays on `feed=stalled`, and `seq=` does not climb.
 - `make e2e` reports a book that does not match `e2e/fixture.jsonl`.
 
@@ -41,7 +42,7 @@ lsof -nP -iTCP:9001 -sTCP:LISTEN
 ```
 
 A `feedd` line means a feedd is running. Compare its pid with
-`cat var/run/feedd.pid`. When they differ, the pid file belongs to another
+`cat var/run/dev/feedd.pid`. When they differ, the pid file belongs to another
 worktree or to a process that has since exited.
 
 ### 3. Check for a second worktree
@@ -77,7 +78,12 @@ and tells you which one was stale.
 ## Prevention
 
 - Run `make stop` before `make start`, or let `start` refuse.
-- `make e2e` calls `stop` first, so it is safe to run while a window is open.
-  The window will show `feed=stalled` until the next `make start`.
+- `make e2e` calls `stop` first, and it does so on `config/test.json`, whose
+  port, ring, WAL, pid files and logs are its own. It cannot reach a window's
+  processes. That was not always true: it ran on `config/dev.json` and stopped
+  the session's feedd and adapter. `docs/optimization/ledger.jsonl` OPT-038.
+- A second window gets its own everything by overriding the config:
+  `make rust-start CONFIG=config/dev2.json`, with that file's own `bus_path`,
+  `wal_path`, `log_path` and `listen_port`.
 - Do not run two worktrees in dev at the same time unless one of them has its
   own `listen_port` and `bus_path`.

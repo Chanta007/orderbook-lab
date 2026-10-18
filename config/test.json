@@ -1,0 +1,14 @@
+{
+  "env": "dev",
+  "bus_path": "var/test/bus",
+  "wal_path": "var/test/wal.bin",
+  "log_path": "var/test/async.log",
+  "watch_path": "var/test/watch.txt",
+  "listen_host": "127.0.0.1",
+  "listen_port": 9201,
+  "symbol": "BTCUSDT",
+  "stream": "btcusdt@depth5@100ms",
+  "ws_url": "wss://data-stream.binance.vision:443/ws/btcusdt@depth5@100ms",
+  "allow_orders": false,
+  "levels": 5
+}
