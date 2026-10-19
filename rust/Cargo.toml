@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ob", "ob-cli"]
+members = ["ob", "ob-view", "ob-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ authors = ["orderbook-lab"]
 
 [workspace.dependencies]
 ob = { path = "ob" }
+ob-view = { path = "ob-view" }
 
 # The release profile is tuned for the hot path, and it is also the profile the
 # vectorization audit compiles with: an audit of a -O0 build would prove nothing.

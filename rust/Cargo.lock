@@ -11,4 +11,12 @@ name = "ob-cli"
 version = "0.1.0"
 dependencies = [
  "ob",
+ "ob-view",
+]
+
+[[package]]
+name = "ob-view"
+version = "0.1.0"
+dependencies = [
+ "ob",
 ]

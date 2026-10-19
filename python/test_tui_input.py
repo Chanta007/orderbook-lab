@@ -84,12 +84,90 @@ EXIT_DEADLINE = 5.0
 
 
 def plain(text: str) -> str:
-    """The text without the cursor and colour escapes.
+    """The text without the cursor and colour escapes, one row per line.
 
-    A failure message that quotes a raw frame is a wall of `\x1b[K` and unreadable.
-    Stripping them is what makes an assertion failure something you can act on.
+    A failure message that quotes a raw frame is a wall of `\x1b[K` and unreadable,
+    and the frame writes each row where the cursor was moved to rather than ending it
+    with a newline: a newline on the last row of the screen scrolls the screen, and
+    every later row is then in the wrong place. So a cursor move becomes the row
+    break here, which is what a terminal shows and what an assertion about a row
+    needs.
     """
+    text = re.sub(r"\x1b\[\d+;\d+H", "\n", text)
     return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+
+
+sys.path.insert(0, str(ROOT / "python"))
+import feed_adapter as fa  # noqa: E402  (the path has to be set up first)
+
+
+def depth_picture(symbol: str, base: float, levels: int = 5) -> bytes:
+    """One full picture for `symbol`: a reset per side, then `levels` levels each.
+
+    Straight to the daemon with the adapter's own packer, so a test needs no
+    websocket and still exercises the real ingest path.
+    """
+    out = []
+    for side in (0, 1):
+        out.append(fa.pack_msg(side, 0.0, 0.0, symbol, fa.DEPTH_RESET))
+        for i in range(levels):
+            price = base + (i if side == 1 else -i)
+            out.append(fa.pack_msg(side, price, 1.0 + i, symbol))
+    return b"".join(out)
+
+
+class Screen:
+    """What a terminal would be showing, given the stream the book wrote.
+
+    The book writes only the rows that changed, so a slice of the stream is not a
+    frame — it is the difference between two frames. A test that asserted on a slice
+    would be asserting on the diff, and would pass or fail according to whether a
+    price happened to move. This applies the stream to a screen the way a terminal
+    does: a cursor move selects a row, the text after it replaces that row, and a
+    clear empties everything.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[int, str] = {}
+
+    def feed(self, stream: str) -> None:
+        """Apply a chunk of the stream."""
+        import re
+
+        row = 1
+        pos = 0
+        while True:
+            move = re.search(r"\x1b\[(\d+);(\d+)H", stream[pos:])
+            if move is None:
+                self._write(row, stream[pos:])
+                return
+            self._write(row, stream[pos : pos + move.start()])
+            row = int(move.group(1))
+            pos += move.end()
+
+    def _write(self, row: int, text: str) -> None:
+        import re
+
+        if "\x1b[2J" in text:
+            self.rows.clear()
+        erased = "\x1b[K" in text
+        plain_text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+        if not plain_text and not erased:
+            # A bare cursor move. The frame ends by placing the cursor on the prompt,
+            # and that is not a row being written: treating it as one would erase the
+            # prompt it just drew.
+            return
+        # Every row is written whole, so the text is the row; an erase with no text
+        # after it empties the row, which is what a shorter frame does to the rows it
+        # no longer has.
+        self.rows[row] = plain_text.rstrip()
+
+    def text(self) -> str:
+        """The screen, one row per line."""
+        if not self.rows:
+            return ""
+        height = max(self.rows)
+        return "\n".join(self.rows.get(i, "") for i in range(1, height + 1))
 
 
 def prices_on_screen(frame: str) -> list[str]:
@@ -176,6 +254,7 @@ class TuiInput(unittest.TestCase):
         self.write_config()
         self.feedd = None
         self.feedd_log = None
+        self.screen = Screen()
 
     def write_config(self):
         """Write a config this test owns: its own ring, WAL and port.
@@ -296,8 +375,17 @@ class TuiInput(unittest.TestCase):
             "feedd could not be started in three attempts; last output:\n" + text
         )
 
+    def reset_screen(self) -> None:
+        """Start a new screen, for a test that opens a second window."""
+        self.screen = Screen()
+
     def drain(self, master: int, deadline: float) -> str:
-        """Read everything the child has drawn until the deadline."""
+        """Read until the deadline, and return what the screen shows.
+
+        What comes back is the screen, not the bytes since the last call: the book
+        writes only the rows that changed, so a slice of the stream is a diff. The
+        screen is what a person reads, and what every assertion here is about.
+        """
         out = []
         while time.monotonic() < deadline:
             ready, _, _ = select.select([master], [], [], 0.2)
@@ -310,7 +398,8 @@ class TuiInput(unittest.TestCase):
             if not chunk:
                 break
             out.append(chunk.decode("utf-8", "replace"))
-        return "".join(out)
+        self.screen.feed("".join(out))
+        return self.screen.text()
 
     def test_typed_input_survives_a_refresh(self):
         for name, binary in TERMINALS:
@@ -319,6 +408,7 @@ class TuiInput(unittest.TestCase):
                 if reason is not None:
                     self.skipTest(reason)
                 self.start_feeder(name)
+                self.reset_screen()
 
                 master, slave = pty.openpty()
                 # Start from the state an interactive shell is in, so the test
@@ -369,19 +459,23 @@ class TuiInput(unittest.TestCase):
                         header += self.drain(master, time.monotonic() + 0.4)
                         if "of feed time" in header and "staleness=" in header:
                             break
+                    # Read the rows rather than the raw stream: a row now carries
+                    # one escape per span, so a regex over the raw bytes would be
+                    # matching the writer's styling rather than what a person sees.
+                    header_text = plain(header)
                     self.assertIn(
                         "of feed time",
-                        header,
+                        header_text,
                         f"{name}: the header does not report the lag in time. "
-                        f"Got: {header[-500:]!r}",
+                        f"Got: {header_text[-500:]!r}",
                     )
                     self.assertRegex(
-                        header,
+                        header_text,
                         r"lag=\d+ records \([0-9.]+(ns|us|ms|s) of feed time\)",
                         f"{name}: the lag span is not a formatted duration",
                     )
                     self.assertRegex(
-                        header,
+                        header_text,
                         r"staleness=[0-9.]+(ns|us|ms|s)",
                         f"{name}: staleness is not a formatted duration. It reads "
                         f"`-` when the ring is empty, so the fixture did not reach it",
@@ -402,20 +496,32 @@ class TuiInput(unittest.TestCase):
                         f"is being erased by the refresh. Got: {typed[-600:]!r}",
                     )
 
-                    # 4. The command takes effect: the frame reports the new depth.
+                    # 4. The command takes effect: seven price rows, counted. The
+                    #    frame does not print a sentence about the depth any more —
+                    #    the depth is the rows, and a test that counts them tests
+                    #    what a person sees rather than a status line that could
+                    #    agree with itself. The fixture's pictures carry three
+                    #    levels, so a deeper book is sent over the socket: seven
+                    #    rows cannot be asserted from a book that has three.
                     os.write(master, b"\r")
-                    after = ""
-                    deadline = time.monotonic() + FRAME_DEADLINE
-                    while time.monotonic() < deadline:
-                        after += self.drain(master, time.monotonic() + 0.4)
-                        if "Showing 7 levels." in after:
-                            break
-                    self.assertIn(
-                        "Showing 7 levels",
-                        after,
-                        f"{name}: `levels 7` did not take effect. Got: "
-                        f"{plain(after)[-300:]!r}",
-                    )
+                    sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+                    stop = threading.Event()
+                    try:
+                        for _ in range(40):
+                            sock.sendall(depth_picture("BTCUSDT", 65000.0, levels=9))
+                            time.sleep(0.05)
+                            rows = prices_on_screen(self.drain(master, time.monotonic() + 0.2))
+                            if len(rows) == 7:
+                                break
+                        self.assertEqual(
+                            len(rows),
+                            7,
+                            f"{name}: `levels 7` did not produce seven price rows. "
+                            f"Got {rows}",
+                        )
+                    finally:
+                        stop.set()
+                        sock.close()
 
                     # 5. Quitting works, and the terminal is handed back.
                     os.write(master, b"quit\r")
@@ -451,6 +557,7 @@ class TuiInput(unittest.TestCase):
             self.skipTest(reason)
         self.start_feeder(name)
         self.feed_fixture()
+        self.reset_screen()
 
         master, slave = pty.openpty()
         initial = termios.tcgetattr(slave)
@@ -562,27 +669,15 @@ class TuiInput(unittest.TestCase):
             self.skipTest(reason)
         self.start_feeder(name)
 
-        sys.path.insert(0, str(ROOT / "python"))
-        import feed_adapter as fa
-
         # Five levels each, at prices nothing else could produce.
-        def picture(symbol: str, base: float) -> bytes:
-            out = []
-            for side in (0, 1):
-                out.append(fa.pack_msg(side, 0.0, 0.0, symbol, fa.DEPTH_RESET))
-                for i in range(5):
-                    price = base + (i if side == 1 else -i)
-                    out.append(fa.pack_msg(side, price, 1.0 + i, symbol))
-            return b"".join(out)
-
         sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
         stop = threading.Event()
 
         def feed() -> None:
             while not stop.is_set():
                 try:
-                    sock.sendall(picture("BTCUSDT", 65000.0))
-                    sock.sendall(picture("ETHUSDT", 3000.0))
+                    sock.sendall(depth_picture("BTCUSDT", 65000.0))
+                    sock.sendall(depth_picture("ETHUSDT", 3000.0))
                 except OSError:
                     return
                 time.sleep(0.05)
@@ -675,23 +770,11 @@ class TuiInput(unittest.TestCase):
             self.skipTest(reason)
         self.start_feeder(name)
 
-        sys.path.insert(0, str(ROOT / "python"))
-        import feed_adapter as fa
-
-        def picture(symbol: str, base: float) -> bytes:
-            out = []
-            for side in (0, 1):
-                out.append(fa.pack_msg(side, 0.0, 0.0, symbol, fa.DEPTH_RESET))
-                for i in range(5):
-                    price = base + (i if side == 1 else -i)
-                    out.append(fa.pack_msg(side, price, 1.0 + i, symbol))
-            return b"".join(out)
-
         def send(sock: socket.socket, base: float, stop: threading.Event) -> None:
             """Publish until the daemon goes away or the test says stop."""
             while not stop.is_set():
                 try:
-                    sock.sendall(picture("BTCUSDT", base))
+                    sock.sendall(depth_picture("BTCUSDT", base))
                 except OSError:
                     return
                 time.sleep(0.05)
@@ -1044,9 +1127,11 @@ class TuiInput(unittest.TestCase):
                 plain(after),
                 f"{name}: a unique prefix did not switch. Got: {plain(after)[-300:]!r}",
             )
+            # The status wraps to the window, so a sentence can span two rows: the
+            # assertion is about the words, not about where the wrap fell.
             self.assertIn(
                 "the only symbol starting with it",
-                plain(after),
+                " ".join(plain(after).split()),
                 f"{name}: the completion was not explained. Got: {plain(after)[-300:]!r}",
             )
             self.assertNotIn(
@@ -1103,6 +1188,111 @@ class TuiInput(unittest.TestCase):
         """Where this config's watch list lives: beside the bus, as both sides
         derive it."""
         return self.workdir / "watch.txt"
+
+    def test_the_reference_is_below_the_prompt_and_the_status_panel_is_a_command(self):
+        """The command reference and the dashboard, both behind commands.
+
+        The reference used to be eleven rows in the middle of the frame, between the
+        header and the book, which is where it was read least and cost the most: it
+        pushed the prices down the screen and could not be turned off. It is now
+        behind `help`, drawn below the prompt, and the same slot takes a second
+        panel — `status`, the feed, the queues, the consumers and the tick rates —
+        so the frame has one place for "something else" rather than one per feature.
+        """
+        name, binary = TERMINALS[0]
+        reason = skip_reason(binary)
+        if reason is not None:
+            self.skipTest(reason)
+        self.start_feeder(name)
+        self.feed_fixture()
+        self.reset_screen()
+
+        master, slave = pty.openpty()
+        initial = termios.tcgetattr(slave)
+        initial[3] |= termios.ICANON | termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, initial)
+        child = subprocess.Popen(
+            [str(binary), str(self.config)],
+            cwd=str(ROOT),
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+        )
+        os.close(slave)
+
+        def wait_for(predicate, seconds: float = FRAME_DEADLINE) -> str:
+            """Drain until the screen satisfies the predicate, then return it."""
+            deadline = time.monotonic() + seconds
+            screen_now = self.drain(master, time.monotonic() + 0.4)
+            while time.monotonic() < deadline:
+                if predicate(screen_now):
+                    break
+                screen_now = self.drain(master, time.monotonic() + 0.4)
+            return screen_now
+
+        try:
+            # 1. The reference is not in the frame until it is asked for, and the
+            #    prices are not pushed down the screen by it.
+            first = wait_for(lambda t: "BID PX" in t)
+            self.assertIn("BID PX", first, f"{name}: no book. Got {first[:300]!r}")
+            self.assertNotIn(
+                "leave this window",
+                first,
+                f"{name}: the reference is in the frame by default, which is what "
+                f"this change moved. Got: {first[:400]!r}",
+            )
+
+            # 2. `help` puts it below the prompt, where the input line is the last
+            #    thing above it.
+            os.write(master, b"help\r")
+            shown = wait_for(lambda t: "leave this window" in t)
+            self.assertIn("leave this window", shown, f"{name}: {shown[-400:]!r}")
+            rows = shown.split("\n")
+            prompt_at = max(i for i, row in enumerate(rows) if row.startswith(">"))
+            reference_at = min(i for i, row in enumerate(rows) if "leave this window" in row)
+            self.assertGreater(
+                reference_at,
+                prompt_at,
+                f"{name}: the reference is not below the prompt. Rows: {rows!r}",
+            )
+            self.assertIn("status", shown, "the reference names the new commands")
+            self.assertIn("book", shown)
+
+            # 3. `help` again hides it, so the frame is a keypress away from clean.
+            os.write(master, b"help\r")
+            hidden = wait_for(lambda t: "leave this window" not in t)
+            self.assertNotIn(
+                "leave this window",
+                hidden,
+                f"{name}: `help` did not hide the reference. Got: {hidden[-400:]!r}",
+            )
+
+            # 4. `status` is the dashboard: the ring, this reader, the ticks and the
+            #    daemon's own report, and no price table.
+            os.write(master, b"status\r")
+            panel = wait_for(lambda t: "slots," in t)
+            self.assertIn("slots,", panel, f"{name}: no ring bar. Got: {panel[-500:]!r}")
+            self.assertIn("reader", panel)
+            self.assertIn("ticks", panel)
+            self.assertIn("BTCUSDT", panel, "the tick table names what it counted")
+            self.assertIn("adapter", panel)
+            self.assertIn("daemon", panel)
+            self.assertNotIn(
+                "BID PX",
+                panel,
+                f"{name}: the price table is still drawn in the status panel",
+            )
+
+            # 5. `book` brings the table back.
+            os.write(master, b"book\r")
+            back = wait_for(lambda t: "BID PX" in t)
+            self.assertIn("BID PX", back, f"{name}: `book` did not return to the table")
+            self.assertNotIn("slots,", back, "and the dashboard is gone")
+        finally:
+            if child.poll() is None:
+                child.send_signal(signal.SIGKILL)
+                child.wait(timeout=EXIT_DEADLINE)
+            os.close(master)
 
     def test_a_signal_restores_the_terminal(self):
         """Ctrl-C must not leave the shell without echo.

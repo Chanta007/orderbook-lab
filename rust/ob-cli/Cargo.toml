@@ -8,6 +8,9 @@ license.workspace = true
 
 [dependencies]
 ob = { workspace = true }
+# What one frame is, as data. The terminal, the web page and the `view` binary all
+# render the same composed frame, so none of them owns what it says.
+ob-view = { workspace = true }
 
 # Five binaries, each with one job. Named to match the C++ build so `make e2e`
 # and `python/obctl.py` can drive either implementation from one config file.
@@ -30,6 +33,12 @@ path = "src/bin/obsoak.rs"
 [[bin]]
 name = "vecbench"
 path = "src/bin/vecbench.rs"
+
+# The same frame as the terminal, printed: text or JSON, once or streaming. This is
+# the CLI API over the view layer, and the proof that the layer is not the terminal.
+[[bin]]
+name = "view"
+path = "src/bin/view.rs"
 
 [lib]
 name = "ob_cli"

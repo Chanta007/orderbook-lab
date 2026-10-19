@@ -22,6 +22,37 @@
 
 use crate::sys;
 
+/// Format a duration for a report, choosing the unit by magnitude.
+///
+/// Nanoseconds below a microsecond, microseconds below a millisecond, and so on,
+/// always with three decimals, so a value keeps nanosecond resolution in every
+/// unit it is shown in. A lag of a few hundred nanoseconds is normal on a live
+/// feed and a lag of milliseconds is not, and a display that only offers whole
+/// seconds cannot tell those apart — which is why the terminal used to report a
+/// lag as a count of records and nothing else.
+///
+/// Seconds is the largest unit. A duration of minutes is reported as hundreds of
+/// seconds, which is honest and keeps the function total.
+///
+/// This lives here, next to the clock that produced the number, rather than in the
+/// binary that prints it: the terminal, the web page and the headless report all
+/// show durations, and two formatters for one unit is two answers to "is 400
+/// microseconds slow".
+pub fn duration_ns(ns: u64) -> String {
+    const US: u64 = 1_000;
+    const MS: u64 = 1_000_000;
+    const S: u64 = 1_000_000_000;
+    if ns < US {
+        format!("{ns}ns")
+    } else if ns < MS {
+        format!("{:.3}us", ns as f64 / US as f64)
+    } else if ns < S {
+        format!("{:.3}ms", ns as f64 / MS as f64)
+    } else {
+        format!("{:.3}s", ns as f64 / S as f64)
+    }
+}
+
 /// Read the monotonic clock, in nanoseconds.
 ///
 /// # Cost
@@ -120,5 +151,23 @@ mod tests {
             assert!(next >= prev, "clock went backwards: {prev} then {next}");
             prev = next;
         }
+    }
+
+    #[test]
+    fn a_duration_picks_the_unit_that_shows_its_size() {
+        assert_eq!(duration_ns(0), "0ns");
+        assert_eq!(duration_ns(1), "1ns");
+        assert_eq!(duration_ns(999), "999ns");
+        // The boundary belongs to the larger unit, and three decimals keep
+        // nanosecond resolution in every one of them.
+        assert_eq!(duration_ns(1_000), "1.000us");
+        assert_eq!(duration_ns(1_234), "1.234us");
+        assert_eq!(duration_ns(999_999), "999.999us");
+        assert_eq!(duration_ns(1_000_000), "1.000ms");
+        assert_eq!(duration_ns(1_500_000), "1.500ms");
+        assert_eq!(duration_ns(1_000_000_000), "1.000s");
+        assert_eq!(duration_ns(90_500_000_000), "90.500s");
+        // A value past the largest unit stays in seconds rather than inventing one.
+        assert_eq!(duration_ns(3_600_000_000_000), "3600.000s");
     }
 }
