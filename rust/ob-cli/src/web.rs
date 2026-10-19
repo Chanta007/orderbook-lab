@@ -91,7 +91,11 @@ pub const PAGE: &str = r#"<!doctype html>
 const screen = document.getElementById("screen");
 const stats = document.getElementById("stats");
 const cmd = document.getElementById("cmd");
-let frames = 0, dropped = 0, bytes = 0, first = null;
+// `seq` is the server's frame number; `frames` counts the ones this page drew. They
+// are different numbers, and the status line used to print the first under the second
+// one's name: a page that had drawn two frames read `4671 frames · 3.1 KB`, which
+// cannot both be true.
+let seq = 0, frames = 0, dropped = 0, bytes = 0, first = null;
 
 function row(node) {
   const div = document.createElement("div");
@@ -114,15 +118,16 @@ function draw(frame) {
   screen.replaceChildren(frag);
 }
 
-function show(seq) {
+function show(next) {
   // The first frame a page sees is not a frame it missed: the server has been
   // publishing since before this browser connected, and counting that gap as a drop
   // would make every viewer report a lag on opening.
-  if (first === null) first = seq;
-  else if (seq > frames + 1) dropped += seq - frames - 1;
-  frames = seq;
-  stats.textContent = frames + " frames · " + dropped + " dropped · " +
-                      (bytes / 1024).toFixed(1) + " KB";
+  if (first === null) first = next;
+  else if (next > seq + 1) dropped += next - seq - 1;
+  seq = next;
+  frames += 1;
+  stats.textContent = "seq " + seq + " · " + frames + " frames · " +
+                      dropped + " dropped · " + (bytes / 1024).toFixed(1) + " KB";
   stats.className = dropped > 0 ? "behind" : "";
 }
 

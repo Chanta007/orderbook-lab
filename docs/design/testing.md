@@ -167,6 +167,14 @@ prompt and off by default, the cursor sits past what is typed, a stalled feed sa
 which of the three causes it is, the status panel shows the ring and the ticks and not
 the table, and no frame ever exceeds the rows it was given).
 
+A note on timing, because two tests in this suite have failed once each in a full
+sweep and passed on their own. Both waited a fixed number of seconds for something that
+depends on another process — the daemon accepting a socket and publishing records, or a
+restarted feed coming back. Both now drain until the condition holds, with the deadline
+as a bound rather than as the wait: a fixed window is a test that measures the machine
+rather than the program. The same rule applies to the `view` test, which normalises
+durations away including their unit — `843ns` and `1.234us` are the same frame.
+
 The tests that matter most are the ones about *fitting*: a frame that writes one row
 past the bottom of the terminal scrolls it, and a scrolled screen makes every later
 frame's rows wrong. That rule is asserted in three places — the cache, the

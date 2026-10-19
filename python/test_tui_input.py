@@ -698,9 +698,18 @@ class TuiInput(unittest.TestCase):
         )
         os.close(slave)
         try:
+            # Drain until the book has prices in it, rather than for a fixed time:
+            # the daemon has to accept the socket, read the records and publish them,
+            # and a loaded machine can take longer than any constant a test picks. A
+            # fixed window made this test fail once in a full sweep and pass on its
+            # own, which is the shape of a flake rather than a defect.
             self.drain(master, time.monotonic() + FRAME_DEADLINE)
+            deadline = time.monotonic() + FRAME_DEADLINE
             first = self.drain(master, time.monotonic() + 1.5)
             first_prices = prices_on_screen(first)
+            while time.monotonic() < deadline and not first_prices:
+                first = self.drain(master, time.monotonic() + 1.0)
+                first_prices = prices_on_screen(first)
             self.assertTrue(
                 any(p.startswith("6") for p in first_prices),
                 f"{name}: no BTC prices while BTCUSDT is selected. Got {first_prices}",
