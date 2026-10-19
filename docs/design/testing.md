@@ -14,7 +14,7 @@ this repository honest.
 | Rust unit tests | `make rust-test` | 175 + 38 + 9 | the library, the CLI, and the ingest reader |
 | C++ unit tests | `make test` | 1 binary | the book, the ring and the log |
 | Python tests | `make test` | 53 | the control script's process handling, the run directory, and the adapter's frames |
-| Terminal behaviour | `make rust-test` | 5 | the book's input line, its terminal mode, the picker, two books in one ring, and re-attaching to a restarted feed, through a real pty |
+| Terminal behaviour | `make rust-test` | 7 | the book's input line, its terminal mode, the picker, the escape key, a prefix of a listed symbol, two books in one ring, and re-attaching to a restarted feed, through a real pty |
 | Fixture e2e, C++ | `make e2e` | — | the fixture to a book and a log, through the C++ daemon |
 | Fixture e2e, Rust | `make rust-e2e` | — | the same fixture through the Rust daemon |
 | Interop | `make rust-interop` | — | each implementation's daemon with the other's reader |
@@ -114,7 +114,7 @@ fails on `ICANON is still set`, and pointed at the Rust one it passes. **A test 
 a bug that was fixed has to be shown failing before it is believed**, and the
 override is what makes that repeatable rather than a claim.
 
-One of the five cases is a recovery, and it is worth saying why the assertion is
+One of the seven cases is a recovery, and it is worth saying why the assertion is
 the counter rather than the prices. `test_the_window_re_attaches_when_the_feed_restarts`
 feeds a window, stops the daemon, starts a second daemon over the same ring, and
 requires the window to come back on its own with `reattaches=1`. A window that did
@@ -142,6 +142,16 @@ after the feed was started again. Both halves are fixed and both have a test:
 file, that a stop on one leaves the other's process running, and that the two
 shipped configs share no path or port; the terminal test above asserts the
 recovery. `docs/optimization/ledger.jsonl` OPT-038 has the evidence.
+
+Two more cases in that file are about keys rather than about the screen, and both
+were written from a single report ("after typing a symbol that does not exist I
+cannot change the ticker any more"). One asserts that the keys typed after a bare
+`Escape` reach the line and that `Escape` clears it; the other that a prefix of one
+listed symbol is used and explained while a name matching nothing is still refused.
+Neither can be tested without a terminal, and the first cannot be tested without
+*being* the terminal either: the wait for the rest of an escape sequence is a `poll`
+of the descriptor, and the unit test needed that wait moved behind a small trait
+before it could exercise the loop the defect lived in. `OPT-039` is the finding.
 
 ### 3.6 The soak
 

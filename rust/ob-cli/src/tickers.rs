@@ -142,6 +142,27 @@ impl Catalog {
     pub fn complete(&self, query: &str) -> Option<&str> {
         self.suggest(query, 1).first().copied()
     }
+
+    /// The listed symbols that *start with* `query`, in file order, at most
+    /// `limit`.
+    ///
+    /// Prefixes only, unlike [`Catalog::suggest`], because this answers a
+    /// different question: which symbol did somebody mean by typing part of a
+    /// name. An interior match is not what they typed — `usdt` may be inside
+    /// `BTCUSDT`, and substituting it there would answer a request for a symbol
+    /// with a different one — so this deliberately finds nothing for it.
+    pub fn prefixed(&self, query: &str, limit: usize) -> Vec<&str> {
+        let query = query.trim().to_ascii_uppercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        self.symbols
+            .iter()
+            .filter(|s| s.starts_with(&query))
+            .take(limit)
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +227,18 @@ mod tests {
         assert_eq!(c.complete("eth"), Some("ETHUSDT"));
         assert_eq!(c.complete("ET"), Some("ETHUSDT"));
         assert_eq!(c.complete(""), Some("BTCUSDT"));
+    }
+
+    #[test]
+    fn a_prefix_query_finds_only_what_starts_with_it() {
+        let c = catalog(&["BETACOIN", "ETHUSDT", "ETCUSDT", "BTCUSDT"]);
+        assert_eq!(c.prefixed("ET", 8), vec!["ETHUSDT", "ETCUSDT"]);
+        assert_eq!(c.prefixed("eth", 8), vec!["ETHUSDT"]);
+        // The whole point of the difference from `suggest`: a name that merely
+        // contains the query is not what was typed, so nothing is returned.
+        assert!(c.prefixed("usdt", 8).is_empty());
+        assert!(c.prefixed("", 8).is_empty());
+        assert_eq!(c.prefixed("ET", 1), vec!["ETHUSDT"]);
     }
 
     #[test]

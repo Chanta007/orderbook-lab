@@ -3,6 +3,34 @@
 <!-- ENTRIES BELOW -->
 
 ---
+id: 28843d352694bd
+title: Fit the terminal frame to the window height
+source-path: inline:tui-refusal
+source-section: inline capture 2026-10-18
+status: open
+priority: medium
+i: 4
+c: 4
+e: 2
+revisit-when: somebody reports the header scrolling off, or a run needs a 80x24 terminal
+created: 2026-10-19
+---
+
+Fit the terminal frame to the window height
+
+The frame is a fixed set of rows: three header rows, the colour key, eleven help
+rows, the levels line, the status line, up to three lines of stall diagnosis, the
+price table, and the prompt. With five levels and a stalled feed that is about 27
+rows, so a 24-row terminal scrolls the header — the one line that says which symbol
+and whether the feed is live — out of view. `levels 3` fits today, and the frame
+grew by one row again in OPT-039.
+
+Adapting it needs the terminal's height (`ioctl(TIOCGWINSZ)`, or the `COLUMNS`/`LINES`
+the shell exports) and a decision about what to drop first: the help block, the
+colour key, or the explanatory rows for lag/staleness/age. The last two are the ones
+a person reads once.
+
+---
 id: 14157259cc0fe9
 title: Call CTest from CI
 source-path: inline:first-test-run

@@ -51,6 +51,7 @@ once that is fixed.
 import os
 import pathlib
 import pty
+import re
 import select
 import shutil
 import signal
@@ -88,8 +89,6 @@ def plain(text: str) -> str:
     A failure message that quotes a raw frame is a wall of `\x1b[K` and unreadable.
     Stripping them is what makes an assertion failure something you can act on.
     """
-    import re
-
     return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
 
 
@@ -107,6 +106,21 @@ def prices_on_screen(frame: str) -> list[str]:
         if len(parts) >= 4 and "." in parts[0]:
             out.append(parts[0])
     return out
+
+
+def prompt_of(frame: str) -> str:
+    """What is on the input line, from the last frame that drew one.
+
+    The prompt is the last row of every frame, written as `> <line>` followed by
+    `erase to end of line`. It is preceded by the erase-below marker when nothing
+    is being offered and by the picker's last row when something is, so both are
+    accepted — a pattern that only matched after a picker row read the prompt from
+    the last frame that had one, which is how a cleared line was reported as still
+    holding what had been typed. This reads the **raw** frame: stripping is what
+    removes `\\x1b[K`, and without it the capture runs on into the next frame.
+    """
+    matches = re.findall(r"(?:\x1b\[J|\n)> ([^\x1b\r\n]*)", frame)
+    return matches[-1] if matches else ""
 
 
 def newest_source_mtime() -> float:
@@ -728,7 +742,11 @@ class TuiInput(unittest.TestCase):
             deadline = time.monotonic() + FRAME_DEADLINE + 3.0
             while time.monotonic() < deadline:
                 stalled += self.drain(master, time.monotonic() + 0.5)
-                if "Feed stalled." in stalled:
+                # The remedy, not the first line of the diagnosis: a frame is one
+                # write, but a pty splits a write that does not fit its buffer, and
+                # stopping at the first line reads a frame whose tail is still in
+                # flight.
+                if "make rust-feed" in stalled:
                     break
             self.assertIn(
                 "Feed stalled.",
@@ -808,6 +826,283 @@ class TuiInput(unittest.TestCase):
                 child.send_signal(signal.SIGKILL)
                 child.wait(timeout=EXIT_DEADLINE)
             os.close(master)
+
+    def test_escape_neither_eats_the_keys_that_follow_nor_leaves_the_line(self):
+        """The reported bug: type an unlisted symbol, and then type a real one.
+
+        The input thread read the rest of an escape sequence with a two-byte
+        blocking read. A terminal in non-canonical mode sends a bare `Escape` as one
+        byte, so that call waited for the next two keystrokes and then consumed them
+        whatever they were — never added to the line, and an `Enter` among them
+        never seen as one. A person who backed out of a refusal with `Escape` and
+        typed `ethusdt` watched `et` disappear; repeating it, `husdt` disappeared,
+        and no key they pressed produced a symbol. From outside it is a window that
+        has stopped listening, and it was reported as "after typing a symbol that
+        does not exist I cannot change the ticker any more".
+
+        Both halves are checked here: `Escape` clears what is on the line, and the
+        keys after it arrive intact. The second assertion is the one that fails
+        against the unfixed binary.
+        """
+        name, binary = TERMINALS[0]
+        reason = skip_reason(binary)
+        if reason is not None:
+            self.skipTest(reason)
+        self.start_feeder(name)
+
+        sys.path.insert(0, str(ROOT / "python"))
+        import feed_adapter as fa
+
+        def picture(symbol: str, base: float) -> bytes:
+            out = []
+            for side in (0, 1):
+                out.append(fa.pack_msg(side, 0.0, 0.0, symbol, fa.DEPTH_RESET))
+                for i in range(5):
+                    out.append(fa.pack_msg(side, base + (i if side == 1 else -i), 1.0 + i, symbol))
+            return b"".join(out)
+
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        stop = threading.Event()
+
+        def feed() -> None:
+            while not stop.is_set():
+                try:
+                    sock.sendall(picture("BTCUSDT", 65000.0))
+                    sock.sendall(picture("ETHUSDT", 3000.0))
+                except OSError:
+                    return
+                time.sleep(0.05)
+
+        threading.Thread(target=feed, daemon=True).start()
+
+        master, slave = pty.openpty()
+        initial = termios.tcgetattr(slave)
+        initial[3] |= termios.ICANON | termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, initial)
+        child = subprocess.Popen(
+            [str(binary), str(self.config)],
+            cwd=str(ROOT),
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+        )
+        os.close(slave)
+        try:
+            live = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                live += self.drain(master, time.monotonic() + 0.4)
+                if "feed=live" in live:
+                    break
+            self.assertIn("feed=live", live, plain(live)[-300:])
+
+            # 1. A symbol that is not in the catalog: refused, with the way past it.
+            os.write(master, b"SYMBOL\r")
+            refused = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                refused += self.drain(master, time.monotonic() + 0.4)
+                if "not in config/tickers.txt" in refused:
+                    break
+            self.assertIn(
+                "not in config/tickers.txt",
+                refused,
+                f"{name}: an unlisted symbol was not refused. Got: {plain(refused)[-300:]!r}",
+            )
+
+            # 2. Part of a name on the line, then Escape: the line goes.
+            os.write(master, b"eth")
+            typed = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                typed += self.drain(master, time.monotonic() + 0.4)
+                if "> eth" in plain(typed):
+                    break
+            self.assertIn("> eth", plain(typed), f"{name}: {plain(typed)[-200:]!r}")
+
+            os.write(master, b"\x1b")
+            cleared = self.drain(master, time.monotonic() + 0.6)
+            self.assertEqual(
+                prompt_of(cleared),
+                "",
+                f"{name}: Escape did not clear the line. Got {prompt_of(cleared)!r}",
+            )
+
+            # 3. And what is typed next arrives intact. Against the unfixed binary
+            #    the first two characters are eaten and this never switches.
+            os.write(master, b"ethusdt\r")
+            after = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                after += self.drain(master, time.monotonic() + 0.5)
+                if "ETHUSDT" in plain(after) and "feed=live" in after:
+                    break
+            self.assertIn(
+                "ETHUSDT",
+                plain(after),
+                f"{name}: the keys typed after Escape were eaten, so the ticker never "
+                f"changed. Got: {plain(after)[-300:]!r}",
+            )
+            # A fresh window of frames: everything drained above includes the ones
+            # drawn before the switch, which still carried the old prices.
+            fresh = self.drain(master, time.monotonic() + 1.5)
+            prices = prices_on_screen(fresh)
+            self.assertTrue(
+                any(p.startswith("3") for p in prices),
+                f"{name}: ETHUSDT is selected but its prices are not on screen. "
+                f"Got {prices}",
+            )
+            self.assertFalse(
+                any(p.startswith("6") for p in prices),
+                f"{name}: the previous symbol's prices survived the switch. Got {prices}",
+            )
+        finally:
+            stop.set()
+            try:
+                sock.close()
+            except OSError:
+                pass
+            if child.poll() is None:
+                child.send_signal(signal.SIGKILL)
+                child.wait(timeout=EXIT_DEADLINE)
+            os.close(master)
+
+    def test_a_prefix_of_one_listed_symbol_switches_to_it(self):
+        """Typing `eth` and pressing Enter means ETHUSDT.
+
+        The other half of the same report. The picker was already showing the name
+        the person meant, so answering `ETH is not in config/tickers.txt` told them
+        their own shortcut was wrong. Now a name that exactly one listed symbol
+        starts with is used, and the frame says so. What has *not* changed is the
+        refusal: a name matching nothing is still refused, because every watched
+        symbol shares one websocket and an unlisted stream name can take the whole
+        connection down.
+        """
+        name, binary = TERMINALS[0]
+        reason = skip_reason(binary)
+        if reason is not None:
+            self.skipTest(reason)
+        self.start_feeder(name)
+
+        sys.path.insert(0, str(ROOT / "python"))
+        import feed_adapter as fa
+
+        def picture(symbol: str, base: float) -> bytes:
+            out = []
+            for side in (0, 1):
+                out.append(fa.pack_msg(side, 0.0, 0.0, symbol, fa.DEPTH_RESET))
+                for i in range(5):
+                    out.append(fa.pack_msg(side, base + (i if side == 1 else -i), 1.0 + i, symbol))
+            return b"".join(out)
+
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        stop = threading.Event()
+
+        def feed() -> None:
+            while not stop.is_set():
+                try:
+                    sock.sendall(picture("BTCUSDT", 65000.0))
+                    sock.sendall(picture("ETHUSDT", 3000.0))
+                except OSError:
+                    return
+                time.sleep(0.05)
+
+        threading.Thread(target=feed, daemon=True).start()
+
+        master, slave = pty.openpty()
+        initial = termios.tcgetattr(slave)
+        initial[3] |= termios.ICANON | termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, initial)
+        child = subprocess.Popen(
+            [str(binary), str(self.config)],
+            cwd=str(ROOT),
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+        )
+        os.close(slave)
+        try:
+            live = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                live += self.drain(master, time.monotonic() + 0.4)
+                if "feed=live" in live:
+                    break
+            self.assertIn("feed=live", live, plain(live)[-300:])
+
+            # 1. A prefix that only one listed symbol starts with: it is used, and
+            #    the frame says which name it stood for.
+            os.write(master, b"eth\r")
+            after = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                after += self.drain(master, time.monotonic() + 0.5)
+                if "ETHUSDT" in plain(after) and "feed=live" in after:
+                    break
+            self.assertIn(
+                "ETHUSDT",
+                plain(after),
+                f"{name}: a unique prefix did not switch. Got: {plain(after)[-300:]!r}",
+            )
+            self.assertIn(
+                "the only symbol starting with it",
+                plain(after),
+                f"{name}: the completion was not explained. Got: {plain(after)[-300:]!r}",
+            )
+            self.assertNotIn(
+                "\nETH\n",
+                self.watch_file().read_text(),
+                "the prefix itself reached the watch file, which the adapter subscribes to",
+            )
+            self.assertIn("ETHUSDT", self.watch_file().read_text())
+
+            # 2. A prefix several listed symbols start with names them instead of
+            #    guessing between them.
+            os.write(master, b"et\r")
+            several = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                several += self.drain(master, time.monotonic() + 0.5)
+                if "start with" in plain(several):
+                    break
+            text = plain(several)
+            self.assertIn("ETCUSDT", text, f"{name}: the matches were not named. Got {text[-300:]!r}")
+            self.assertIn("force ET", text, f"{name}: the way past it was not named")
+
+            # 3. `only` goes through the same check, because it replaces the whole
+            #    subscription rather than adding to it.
+            os.write(master, b"only zzztusdt\r")
+            only = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                only += self.drain(master, time.monotonic() + 0.5)
+                if "not in config/tickers.txt" in plain(only):
+                    break
+            self.assertIn(
+                "not in config/tickers.txt",
+                plain(only),
+                f"{name}: `only` accepted an unlisted symbol. Got: {plain(only)[-300:]!r}",
+            )
+            self.assertNotIn(
+                "ZZZTUSDT",
+                [line for line in self.watch_file().read_text().splitlines() if not line.startswith("#")],
+                "an unlisted symbol reached the watch file through `only`",
+            )
+        finally:
+            stop.set()
+            try:
+                sock.close()
+            except OSError:
+                pass
+            if child.poll() is None:
+                child.send_signal(signal.SIGKILL)
+                child.wait(timeout=EXIT_DEADLINE)
+            os.close(master)
+
+    def watch_file(self) -> pathlib.Path:
+        """Where this config's watch list lives: beside the bus, as both sides
+        derive it."""
+        return self.workdir / "watch.txt"
 
     def test_a_signal_restores_the_terminal(self):
         """Ctrl-C must not leave the shell without echo.
