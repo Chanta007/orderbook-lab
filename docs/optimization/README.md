@@ -144,6 +144,15 @@ consumer assumes.**
 |----|---------|--------|
 | OPT-036 | The ticker picker offers catalog matches for what has been typed, completes on Tab, moves the highlight with the arrows and switches on Enter. A symbol not in the catalog is **refused** rather than tried, with the file to edit and a `force` escape named in the message. | A convenience that silently accepts anything is a footgun when the cost of a bad value is shared: every watched symbol shares one websocket, so an unknown stream name in a combined URL can take the connection down. Refusing by default with a named way past it costs one message and removes a failure that would look like the feed dying. |
 
+### The view layer
+
+| id | Finding | Lesson |
+|----|---------|--------|
+| OPT-039 | The terminal rewrote every row of every frame. It now hashes each composed row and writes only the ones that changed: 8 of 11 rows and 707 bytes per frame against 11 of 11 and 851 bytes with `--no-diff`, and 23.5 KB against 51.8 KB to the terminal over six seconds on the same feed. | A writer that positions the cursor can skip what did not change, and on a mostly-static screen that is most of it. The measurement needs its own control, which is why `--no-diff` exists: the same program writing every row, on the same terminal, rather than a number remembered from before. Skipping also changes what a test can see — a slice of the output is a difference between frames, not a frame — so the pty tests apply the stream to a screen the way a terminal does. |
+| OPT-040 | Composition costs 5.3-5.4 µs per frame for a 17-row frame, measured by a command in the binary (`view --bench`). | A pure composition that allocates per frame is affordable when it is three orders of magnitude below the I/O it produces. Measure before reaching for retained buffers: a widget tree would have cost more code than it saves nanoseconds. |
+| OPT-041 | The window's level buffers were sized once at startup, so `levels 7` drew four rows while the frame said `Showing 7 levels.` | A command that changes a number has to change every structure sized from it, and a test that asserts the sentence a frame prints can pass over a defect in what it draws. Assert the rendering, not the claim about it. |
+| OPT-042 | Eleven rows of command reference sat between the header and the book. It is behind `help`/`?` now, drawn below the prompt, and the same slot takes the `status` panel: the ring as a bar, the reader's rate, per-symbol ticks with sparklines, the adapter's heartbeat, and the daemon's queues and consumers parsed from the log lines it already writes. | Reference material in a live view costs the thing it is next to. Put it behind a command and spend the slot on something that changes — and show what the programs already publish rather than adding a channel for it. |
+
 ### Verification habits
 
 | id | Finding | Lesson |

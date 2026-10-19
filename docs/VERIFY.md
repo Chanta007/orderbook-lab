@@ -17,7 +17,7 @@ make test && make rust-test && make rust-vec-audit && make e2e && make rust-e2e
 | id | description | type | applies_when | command | expected |
 |----|-------------|------|--------------|---------|----------|
 | `cpp-core-tests` | The C++ book, ring and WAL checks | shell-command | always | `make test` | exit 0; prints `ok` then `OK` |
-| `rust-unit-tests` | The Rust library and CLI tests | shell-command | always | `cargo test --manifest-path rust/Cargo.toml` | exit 0; every suite reports `ok` |
+| `rust-unit-tests` | The Rust library and CLI tests, including the view layer's | shell-command | always | `cargo test --manifest-path rust/Cargo.toml` | exit 0; every suite reports `ok` |
 | `rust-format` | Formatting is normalized | shell-command | rust changed | `cargo fmt --all --manifest-path rust/Cargo.toml --check` | exit 0 |
 | `rust-lint` | Clippy with warnings denied | shell-command | rust changed | `cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings` | exit 0 |
 | `cpp-e2e` | The fixture reaches the C++ book and the log | shell-command | always | `make e2e` | exit 0; `bids=` and `asks=` non-zero |
@@ -25,7 +25,10 @@ make test && make rust-test && make rust-vec-audit && make e2e && make rust-e2e
 | `interop` | Each implementation reads the other's ring and log | shell-command | wire format or bus changed | `make rust-interop` | exit 0; two `PASS:` lines |
 | `vec-audit` | The kernels that should vectorize still do | shell-command | hot kernel changed | `make rust-vec-audit` | exit 0; `PASS every required kernel emitted vector operations` |
 | `tui-picker` | The ticker picker completes, switches, writes the watch file, and refuses an unlisted symbol | shell-command | tickers or watch changed | `python3 -m unittest python.test_tui_input` | exit 0; every test ok |
-| `tui-input` | The terminal book's input line survives a refresh, and the terminal is handed back | shell-command | tui changed | `python3 -m unittest python.test_tui_input` | exit 0; every test ok |
+| `tui-input` | The terminal book's input line survives a refresh, the reference is below the prompt, and the status panel is a command | shell-command | tui changed | `python3 -m unittest python.test_tui_input` | exit 0; every test ok |
+| `view-cli` | The printed frame is the drawn frame, and a command from the shell is the command from the terminal | shell-command | view layer or a frontend changed | `make view-check` | exit 0; 8 tests ok |
+| `frame-budget` | No frame is ever longer or wider than the terminal, and the cursor is on the prompt | shell-command | composition changed | `cargo test --manifest-path rust/Cargo.toml -p ob-view` | exit 0; `the_frame_never_exceeds_the_rows_it_was_given` passes |
+| `frame-cost` | The composition cost has a command that reports it | data-check | composition changed | `rust/target/release/view config/test.json --bench 2000 --levels 5` | exit 0; prints `ns per frame` |
 | `tui-reattach` | A window re-attaches by itself when a feed restarts, and says which remedy does not close it | shell-command | tui, ring or adapter changed | `python3 -m unittest python.test_tui_input.TuiInput.test_the_window_re_attaches_when_the_feed_restarts` | exit 0; `OK`. Shown failing first with the re-attach check disabled |
 | `tui-keys` | The keys typed after a bare `Escape` reach the line, `Escape` clears it, and a prefix of one listed symbol is used | shell-command | tui or tickers changed | `python3 -m unittest python.test_tui_input.TuiInput.test_escape_neither_eats_the_keys_that_follow_nor_leaves_the_line python.test_tui_input.TuiInput.test_a_prefix_of_one_listed_symbol_switches_to_it` | exit 0; `OK`. Shown failing first with the two-byte escape read restored |
 | `run-isolation` | A stop on one config reaches nothing of another's, and the shipped test config shares no path or port with the live one | shell-command | obctl, config or Makefile changed | `python3 -m unittest python.test_obctl.RunDirectoryTest` | exit 0; `OK` |

@@ -153,7 +153,33 @@ Neither can be tested without a terminal, and the first cannot be tested without
 of the descriptor, and the unit test needed that wait moved behind a small trait
 before it could exercise the loop the defect lived in. `OPT-039` is the finding.
 
-### 3.6 The soak
+### 3.6 The view layer's own tests
+
+`ob-view` is a crate of pure functions, so its tests are ordinary unit tests and there
+are 47 of them: the four renderers (including that a style is both named and coloured,
+and that HTML escapes a symbol so it cannot inject markup), the line cache (the first
+frame writes every row, an unchanged frame writes none, a resize clears, and never
+more rows than the terminal has), the block bars (a present value is never an empty
+cell, a fraction outside zero to one is clamped rather than panicking), the daemon
+report parser (a real block, the stage 2 group not confused with stage 1's, an absent
+field is `None` and never zero), and the composition (the reference is below the
+prompt and off by default, the cursor sits past what is typed, a stalled feed says
+which of the three causes it is, the status panel shows the ring and the ticks and not
+the table, and no frame ever exceeds the rows it was given).
+
+The tests that matter most are the ones about *fitting*: a frame that writes one row
+past the bottom of the terminal scrolls it, and a scrolled screen makes every later
+frame's rows wrong. That rule is asserted in three places — the cache, the
+composition and the pty test — because it is the one failure that looks like
+corruption several frames later.
+
+`python/test_view.py` (8 tests, `make view-check`) drives the second frontend: it
+asserts that the JSON and text renderings of one frame agree row for row, that
+`--panel status` draws the dashboard and not the table, that `--act "levels 7"` deepens
+the book the way typing it does, and that a usage error exits 2. That file is the layer's
+contract test: if a second frontend cannot be driven from a shell, the layer is not one.
+
+### 3.7 The soak
 
 `obsoak` drives the cache with a thousand symbols and reports what it cost:
 latency by stage, slippage split into its latency and depth causes, and the

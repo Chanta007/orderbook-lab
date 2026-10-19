@@ -80,13 +80,29 @@ python3 python/obctl.py stop  --config config/dev.json
 
 `start` refuses when an instance is already running. It names the pid, or the address when something else holds the port. The refusal is deliberate: a second `start` used to overwrite the pid files of the instance already running, which left a feedd holding the port with nothing pointing at it. `stop` signals only a process whose command line still looks like this lab's, waits for it to exit, and reports any that did not. If a bind failure is reported, see [`docs/runbooks/port-already-in-use.md`](docs/runbooks/port-already-in-use.md).
 
-In the window, type a command and press Enter. The picture refreshes ten times a second, so the letters you type may not stay visible.
+In the window, type a command and press Enter. The picture refreshes ten times a second; the window owns the input line, so what you type stays where you put it.
 
 | Command | What it does |
 |---------|----------------|
 | `quit` or `q` | Leave the window. The feed keeps running until `obctl stop`. |
-| `levels N` | Show 1 to 20 price levels. |
-| `help` | The list is already on the screen. |
+| `help` or `?` | Show or hide the command reference, below the prompt. |
+| `status` | The feed, the queues, the consumers and the tick rates, as a dashboard. |
+| `book` | Back to the price table. |
+| `levels N` | Show 1 to 64 price levels. |
+| `SYMBOL` | Switch to it and watch it. A unique prefix works; Tab completes, the arrows pick from the list. |
+| `watch`, `only SYMBOL`, `unwatch SYMBOL` | What is being watched, and what should be. |
+| `lag`, `staleness`, `age` | The three times, each explained where you are reading it. |
+
+The same frame is available without a terminal, which is what makes it a layer rather than a drawing:
+
+```bash
+rust/target/release/view config/dev.json --once              # one frame, as text
+rust/target/release/view config/dev.json --once --json       # the same frame, as JSON
+rust/target/release/view config/dev.json --once --panel status
+rust/target/release/view config/dev.json --act "levels 7" --once
+```
+
+`view --act` runs a command through the same dispatcher the window uses, so a script can do anything a keystroke can. `docs/design/view-layer.md` is what the frame is, and what the three frontends over it are.
 
 `feed=stalled` means no new message has arrived for about two seconds. The adapter reconnects on its own. The book stays on the last update until the next picture arrives. The window says which of the two causes it is: an adapter that is alive and an exchange that has gone quiet, or an adapter that has exited. When a feed is started again, the window re-attaches by itself and counts it in the header; `make rust-feed` starts the feed and the adapter without opening or closing a window.
 
@@ -191,8 +207,9 @@ A CMake file can build the same binaries. `make` and GitHub Actions (`.github/wo
 include/ob/    message, ring, book, WAL, config, trace
 src/           feedd, tui, headless
 python/        obctl, feed adapter, tests
-rust/          Cargo workspace: ob library, ob-cli binaries
-config/        dev.json, prod.json
+rust/          Cargo workspace: ob library, ob-view (what a frame is),
+               ob-cli (feedd, tui, view, headless, obsoak, vecbench)
+config/        dev.json, test.json, prod.json
 e2e/           fixture.jsonl
 docs/images/   the window at the top of this file
 .github/       CI
