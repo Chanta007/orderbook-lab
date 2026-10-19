@@ -44,7 +44,7 @@ CONFIG ?= config/dev.json
 # The test config. Never the live one, for the reason in the header above.
 TEST_CONFIG ?= config/test.json
 
-.PHONY: all test e2e clean setup start stop rust-build rust-test rust-e2e rust-soak rust-interop rust-vec-audit rust-start rust-feed
+.PHONY: all test e2e clean setup start stop rust-build rust-test rust-e2e rust-soak rust-interop rust-vec-audit rust-start rust-feed view-check
 
 all: $(BUILD)/feedd $(BUILD)/tui $(BUILD)/headless $(BUILD)/test_core
 
@@ -112,6 +112,12 @@ rust-e2e: rust-build
 
 rust-soak: rust-build
 	$(RUST)/obsoak --symbols 1000 --ticks 200
+
+# The view layer's second frontend: the same frame the terminal draws, printed as
+# text or JSON, once or streaming. It needs a ring and a daemon, so it starts its own
+# on the test config, which is why it depends on both builds.
+view-check: all rust-build
+	python3 -m unittest discover -s python -p 'test_view.py'
 
 # Each half fails the make run when its headless exits non-zero, which is
 # the whole check: a reader that cannot parse the other writer's ring or

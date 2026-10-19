@@ -35,5 +35,10 @@ jobs:
         run: make rust-test
       - name: e2e
         run: make rust-e2e
+      # The second frontend over the same composition: the frame the terminal draws,
+      # printed. It runs the C++ daemon, so it also proves the two builds agree about
+      # the ring.
+      - name: view cli
+        run: make view-check
       - name: vectorization audit
         run: make rust-vec-audit
