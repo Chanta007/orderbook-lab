@@ -33,7 +33,7 @@ The workspace [`rust/Cargo.toml`](rust/Cargo.toml) holds two crates: `ob` (the l
 | Binary | What it does |
 |--------|--------------|
 | `feedd` | Reads 72-byte records from a socket, publishes the ring, appends the WAL, updates the cache. |
-| `tui` | Draws the terminal book from the ring, ten times a second. Watches several tickers and switches between them from a typed prefix. |
+| `tui` | Draws the terminal book from the ring, ten times a second. Watches several tickers and switches between them from a typed prefix — a prefix that only one listed symbol starts with is taken as that symbol, and the frame says so. `Escape` clears the line. |
 | `headless` | Drains the ring and replays the WAL, prints the check line, exits. |
 | `obsoak` | Soaks the multi-symbol ticker cache and prints the latency, slippage and backpressure report. |
 | `vecbench` | Times the hot kernels against the shapes they replaced. |

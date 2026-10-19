@@ -19,9 +19,15 @@
 //!
 //! While there is something on the input line, the terminal offers the catalog's
 //! matching symbols below the book and above the prompt. `Tab` completes to the
-//! best match, the arrow keys move the highlight, and `Enter` takes the
-//! highlighted one. Ranking lives in [`ob_cli::tickers`]: a prefix beats an
-//! interior match, and the file's order breaks ties.
+//! best match, the arrow keys move the highlight, `Enter` takes the highlighted
+//! one, and `Escape` clears the line. Ranking lives in [`ob_cli::tickers`]: a
+//! prefix beats an interior match, and the file's order breaks ties.
+//!
+//! A name that is not in the catalog is resolved rather than refused outright
+//! ([`resolve`]): when exactly one listed symbol starts with it, that symbol is
+//! used and the frame says so, because the picker was already showing it. A name
+//! that matches nothing is still refused, and `force` is still the explicit way
+//! past that.
 //!
 //! # Why this owns the input line
 //!
@@ -101,6 +107,195 @@ const SUGGESTIONS: usize = 8;
 
 /// Bytes the input thread may hold, so a paste cannot grow it without bound.
 const INPUT_LIMIT: usize = 64;
+
+/// How long to wait for the rest of an escape sequence after an `Escape` byte.
+///
+/// A terminal writes the three bytes of an arrow key back to back, so the rest of
+/// a sequence is either already queued or is not coming. This wait is the only
+/// thing that separates a bare `Escape` from `Escape [ A`, and 30 ms is the
+/// middle of the range every other terminal reader uses — ncurses ships 1000 ms
+/// (and every application sets it to 25), mpv waits 100 ms, elvish 10 ms. Longer
+/// than this and a bare `Escape` feels broken; shorter and a sequence split by a
+/// slow link is misread as two keys.
+const ESCAPE_WAIT_MS: i32 = 30;
+
+/// How many bytes of an escape sequence are read before the rest is left alone.
+///
+/// `Escape [ A` is three bytes including the `Escape`; four covers a parameter
+/// byte as well, and no sequence this program acts on is longer.
+const ESCAPE_TAIL_BYTES: usize = 4;
+
+/// Where a polled read lives, for the wait above.
+const POLLIN: i16 = 0x0001;
+
+/// One `struct pollfd`, identical on Darwin and Linux.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    /// `nfds_t` is `unsigned int` on Darwin and `unsigned long` on glibc, which is
+    /// the one platform difference in this call. Passing a 32-bit count where a
+    /// 64-bit one is read works only because the upper half happens to be zero in
+    /// a register the callee ignores; the signature is spelled per platform so it
+    /// is stated rather than relied on. Same class of trap as `MS_SYNC`
+    /// (`docs/optimization/ledger.jsonl` OPT-023).
+    fn poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32;
+}
+
+#[cfg(not(target_os = "macos"))]
+extern "C" {
+    /// See the Darwin declaration above for why this is not one signature.
+    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+}
+
+/// Whether stdin has a byte ready, waiting up to `ms`.
+///
+/// `poll` rather than a blocking read, so the wait for the rest of an escape
+/// sequence can be a wait rather than a demand.
+fn input_waiting(ms: i32) -> bool {
+    let mut fd = PollFd {
+        fd: 0,
+        events: POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one initialised `PollFd`, and the count says one. The call writes
+    // only `revents` in that structure.
+    let ready = unsafe { poll(&mut fd, 1, ms) };
+    ready > 0 && fd.revents & POLLIN != 0
+}
+
+/// What a byte of `Escape` turned out to introduce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Escape {
+    /// Nothing followed within the wait: the key itself.
+    Bare,
+    /// An up or down arrow, which the picker uses.
+    Arrow(isize),
+    /// A sequence this program does not use, consumed whole.
+    ///
+    /// Consumed rather than typed: the bytes of a cursor-movement sequence are
+    /// printable, and putting `[C` on the input line because the right arrow was
+    /// pressed would be worse than ignoring the key.
+    Sequence,
+    /// Text that happened to arrive during the wait, so nothing is lost.
+    Text(Vec<u8>),
+}
+
+/// Decide what an escape sequence is, from the bytes after the `Escape`.
+///
+/// Pure, so the table of cases can be read and tested without a terminal.
+fn classify_escape(tail: &[u8]) -> Escape {
+    match tail {
+        [] => Escape::Bare,
+        // CSI: `Escape [`, optional parameters, then a final byte. `A` and `B` are
+        // the arrows; the final byte decides even when parameters came first, so
+        // `Escape [ 1 ; 5 A` is Ctrl+Up and moves the highlight like Up. Anything
+        // else is a key this program does not act on.
+        [b'[', rest @ ..] => match rest.last() {
+            Some(b'A') => Escape::Arrow(-1),
+            Some(b'B') => Escape::Arrow(1),
+            _ => Escape::Sequence,
+        },
+        // SS3, which is how a terminal in application cursor mode sends the same
+        // keys. Treating it as text would put `OA` on the line.
+        [b'O', rest @ ..] => match rest.first() {
+            Some(b'A') => Escape::Arrow(-1),
+            Some(b'B') => Escape::Arrow(1),
+            _ => Escape::Sequence,
+        },
+        // Anything else is what the person typed next, arriving quickly — `Escape`
+        // followed straight away by `e`. Losing it would be the defect this
+        // function exists to prevent.
+        tail => Escape::Text(
+            tail.iter()
+                .copied()
+                .filter(|b| (0x20..=0x7e).contains(b))
+                .collect(),
+        ),
+    }
+}
+
+/// A byte source for the input thread: reads, and says whether more is waiting.
+///
+/// The wait is the whole difficulty here — the bytes of one key arrive together
+/// and the bytes of the next do not — so the source is what answers for it. A
+/// terminal can be asked (`poll`); a test cannot, and a test that had to fake a
+/// terminal would not exercise the loop that had the bug.
+trait Keys: Read {
+    /// Whether another byte is available within `ms`.
+    ///
+    /// The default suits a source whose bytes are all present: a `read` at the end
+    /// returns zero, which ends the loop, so a wrong "yes" costs one call and can
+    /// never spin.
+    fn waiting(&mut self, ms: i32) -> bool {
+        let _ = ms;
+        true
+    }
+}
+
+/// Read whatever follows an `Escape` byte, waiting a moment for the rest.
+///
+/// This used to be a `read_exact` of two bytes, which is the mistake that made a
+/// window look dead: a terminal in non-canonical mode sends a bare `Escape` as one
+/// byte, so the call blocked until the next two keystrokes arrived and then
+/// consumed them whatever they were. Both were discarded, and an `Enter` among
+/// them was never seen as one. A person who backed out of a refusal with `Escape`
+/// and typed `ethusdt` watched `et` disappear; repeating it, `husdt` disappeared.
+/// Reported as "after typing a symbol that does not exist I cannot change the
+/// ticker any more" — which is what a reader that eats every other pair of
+/// keystrokes looks like from the outside.
+fn read_escape<H: Keys>(handle: &mut H) -> Escape {
+    let mut tail = Vec::with_capacity(ESCAPE_TAIL_BYTES);
+    while tail.len() < ESCAPE_TAIL_BYTES {
+        if !handle.waiting(ESCAPE_WAIT_MS) {
+            break;
+        }
+        let mut byte = [0u8; 1];
+        match handle.read(&mut byte) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => tail.push(byte[0]),
+        }
+        // `Escape [` or `Escape O` plus one byte is a complete sequence for every
+        // key this program looks at, so there is nothing more to wait for.
+        if matches!(tail.as_slice(), [b'[', _] | [b'O', _]) {
+            break;
+        }
+    }
+    classify_escape(&tail)
+}
+
+/// Stdin, read one syscall at a time.
+///
+/// Not `std::io::stdin()`: that is buffered, and its first read takes everything
+/// the terminal has queued — so the `[A` of an arrow key would be sitting in the
+/// buffer, where [`input_waiting`] cannot see it, and the wait for the rest of the
+/// sequence would always expire. Reading the descriptor directly keeps one queue,
+/// which is the one being polled.
+#[derive(Debug)]
+struct RawStdin;
+
+impl Read for RawStdin {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: `from_raw_fd` takes ownership of the descriptor, so the file is
+        // held in `ManuallyDrop`: fd 0 belongs to the process and must outlive this
+        // reader. Nothing else here reads stdin.
+        let mut file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) });
+        file.read(buf)
+    }
+}
+
+impl Keys for RawStdin {
+    fn waiting(&mut self, ms: i32) -> bool {
+        input_waiting(ms)
+    }
+}
 
 /// The run flag. The signal handler is a bare `extern "C"` function and cannot
 /// capture anything, so this is the one place it can write.
@@ -480,12 +675,21 @@ fn act(text: &str, catalog: &Catalog, watch: &mut Watch, watch_path: &Path) -> A
         };
     }
     if let Some(rest) = line.strip_prefix("only ") {
-        return match watch.only(rest) {
+        // Through the same resolution as a bare symbol, because this writes the
+        // watch file too: `only eth` used to put the literal string `ETH` in it,
+        // and an unlisted stream name in the combined URL can take the whole
+        // subscription down. That check was on the bare-symbol path only, so the
+        // form that replaces the entire subscription was the one without it.
+        let (canonical, remark) = match resolve(rest, false, catalog) {
+            Resolution::Symbol { canonical, remark } => (canonical, remark),
+            Resolution::Refused(text) => return Action::Note(text),
+        };
+        return match watch.only(&canonical) {
             Ok(()) => match watch.save(watch_path) {
                 Ok(()) => Action::Switched {
                     added: false,
                     symbol: watch.current().to_string(),
-                    remark: None,
+                    remark,
                 },
                 Err(e) => Action::Note(e.message),
             },
@@ -508,24 +712,12 @@ fn act(text: &str, catalog: &Catalog, watch: &mut Watch, watch_path: &Path) -> A
             "{symbol:?} is not a command and does not fit the 8-byte symbol field"
         ));
     }
-    // A symbol the catalog does not list is refused rather than tried, because of
-    // what it can do to everything else: all the watched symbols share one
-    // websocket, and an unknown stream name in a combined URL can take the whole
-    // connection down, so one typo would stop the feed for every other pair. The
-    // escape is explicit and says what it risks.
-    // The canonical form, so a message and the watch file agree even when the user
-    // typed lower case.
-    let canonical = symbol.to_ascii_uppercase();
-    if !forced && !catalog.contains(&canonical) {
-        return Action::Note(format!(
-            "{canonical} is not in config/tickers.txt. Add it there, or type \
-             `force {canonical}` to try it anyway: an unknown stream name can \
-             break the subscription for every symbol."
-        ));
-    }
-    let remark = forced.then(|| format!("{canonical} is not in the catalog; forced anyway"));
+    let (canonical, remark) = match resolve(symbol, forced, catalog) {
+        Resolution::Symbol { canonical, remark } => (canonical, remark),
+        Resolution::Refused(text) => return Action::Note(text),
+    };
 
-    match watch.select(symbol) {
+    match watch.select(&canonical) {
         Ok(added) => match watch.save(watch_path) {
             Ok(()) => Action::Switched {
                 added,
@@ -535,6 +727,85 @@ fn act(text: &str, catalog: &Catalog, watch: &mut Watch, watch_path: &Path) -> A
             Err(e) => Action::Note(e.message),
         },
         Err(e) => Action::Note(e.message),
+    }
+}
+
+/// What a typed name resolved to.
+#[derive(Debug)]
+enum Resolution {
+    /// A symbol to act on, and anything worth saying about how it was arrived at.
+    Symbol {
+        /// The canonical form: upper case, and from the catalog when it was
+        /// completed from one.
+        canonical: String,
+        /// Empty unless the name was completed or forced.
+        remark: Option<String>,
+    },
+    /// Nothing to act on, with the reason to print.
+    Refused(String),
+}
+
+/// Turn what was typed into a symbol the watch file may hold.
+///
+/// A name the catalog does not list is **refused rather than tried**, because all
+/// the watched symbols share one websocket and an unknown stream name in a
+/// combined URL can take the whole connection down: one typo would stop the feed
+/// for every other pair. That has not changed. What changed is what happens to a
+/// name that is *most of* a listed one:
+///
+/// - exactly one listed symbol starts with it: use that symbol, and say so. The
+///   picker was already showing the name the person meant, so refusing `eth` told
+///   them their own shortcut was wrong;
+/// - more than one: refuse and name them, because guessing between `ETHUSDT` and
+///   `ETCUSDT` is not a choice to make for somebody;
+/// - none: refuse as before, with `force` and its risk named;
+/// - `force` skips the whole question, including the completion: it means "this
+///   exact string", which is the point of it.
+///
+/// Only a *prefix* is completed, never an interior match: `usdt` appears inside
+/// `BTCUSDT`, and substituting that would answer a request for one symbol with a
+/// different one. [`Catalog::prefixed`] is that rule, and it is tested.
+fn resolve(symbol: &str, forced: bool, catalog: &Catalog) -> Resolution {
+    let typed = symbol.trim().to_ascii_uppercase();
+    if forced {
+        return Resolution::Symbol {
+            remark: Some(format!("{typed} is not in the catalog; forced anyway")),
+            canonical: typed,
+        };
+    }
+    if catalog.contains(&typed) {
+        return Resolution::Symbol {
+            canonical: typed,
+            remark: None,
+        };
+    }
+    match catalog.prefixed(&typed, SUGGESTIONS + 1).as_slice() {
+        [only] => Resolution::Symbol {
+            remark: Some(format!(
+                "{typed} is not listed; {only} is the only symbol starting with it"
+            )),
+            canonical: (*only).to_string(),
+        },
+        [] => Resolution::Refused(format!(
+            "{typed} is not in config/tickers.txt. Add it there, or type \
+             `force {typed}` to try it anyway: an unknown stream name can \
+             break the subscription for every symbol."
+        )),
+        several => {
+            let more = if several.len() > SUGGESTIONS {
+                " (and more)"
+            } else {
+                ""
+            };
+            let listed: Vec<&str> = several.iter().take(SUGGESTIONS).copied().collect();
+            Resolution::Refused(format!(
+                "{typed} is not in config/tickers.txt, and {} symbols start with \
+                 it: {}{more}. Type more of the name, or `force {typed}` to try it \
+                 anyway.",
+                several.len(),
+                listed.join(", ")
+            ))
+        }
     }
 }
 
@@ -686,8 +957,9 @@ fn draw(out: &mut impl Write, cfg: &Config, book: &Book, frame: &Frame<'_>) -> C
     buf.push_str("  q | quit        leave this window\x1b[K\n");
     buf.push_str("  levels N        show N price levels, from 1 to 64\x1b[K\n");
     buf.push_str(
-        "  SYMBOL          switch to it and watch it. Tab completes; arrows pick from the list\x1b[K\n",
+        "  SYMBOL          switch and watch; a unique prefix works; Tab, then arrows\x1b[K\n",
     );
+    buf.push_str("  Escape          clear what you have typed\x1b[K\n");
     buf.push_str("  watch           list what is being watched\x1b[K\n");
     buf.push_str("  only SYMBOL     watch just that one\x1b[K\n");
     buf.push_str("  unwatch SYMBOL  stop watching one\x1b[K\n");
@@ -839,8 +1111,7 @@ fn spawn_input_thread(input: Arc<Mutex<Input>>) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("input".to_string())
         .spawn(move || {
-            let stdin = std::io::stdin();
-            let mut handle = stdin.lock();
+            let mut handle = RawStdin;
             let mut byte = [0u8; 1];
             loop {
                 match handle.read(&mut byte) {
@@ -864,46 +1135,61 @@ fn spawn_input_thread(input: Arc<Mutex<Input>>) -> std::thread::JoinHandle<()> {
                         RUNNING.store(false, Ordering::Relaxed);
                         return;
                     }
-                    b'\r' | b'\n' => {
-                        let line = std::mem::take(&mut guard.line);
-                        guard.highlighted = 0;
-                        guard.pending = Some(Command::Submit(line));
-                    }
-                    b'\t' => guard.pending = Some(Command::Complete),
-                    0x7f | 0x08 => {
-                        guard.line.pop();
-                        guard.highlighted = 0;
-                    }
-                    // An escape sequence. The arrow keys are how the picker is
-                    // driven, so they are read rather than ignored: ESC, then
-                    // `[`, then a letter for the ones that matter.
-                    0x1b => {
-                        drop(guard);
-                        let mut rest = [0u8; 2];
-                        if handle.read_exact(&mut rest).is_err() {
-                            return;
-                        }
-                        if rest[0] == b'[' {
-                            let delta = match rest[1] {
-                                b'A' => -1,
-                                b'B' => 1,
-                                _ => 0,
-                            };
-                            if delta != 0 {
-                                if let Ok(mut g) = input.lock() {
-                                    g.pending = Some(Command::MoveHighlight(delta));
-                                }
-                            }
-                        }
-                        continue;
-                    }
                     0x20..=0x7e => {
                         if guard.line.len() < INPUT_LIMIT {
                             guard.line.push(byte[0] as char);
                         }
                         guard.highlighted = 0;
                     }
-                    _ => {}
+                    0x7f | 0x08 => {
+                        guard.line.pop();
+                        guard.highlighted = 0;
+                    }
+                    b'\r' | b'\n' => {
+                        let line = std::mem::take(&mut guard.line);
+                        guard.highlighted = 0;
+                        guard.pending = Some(Command::Submit(line));
+                    }
+                    b'\t' => guard.pending = Some(Command::Complete),
+                    // The escape key reads more bytes, so the lock is released
+                    // first: the draw loop must not wait on this thread. Every
+                    // other control byte is ignored, which is what it was before.
+                    _ => {
+                        drop(guard);
+                        if byte[0] != 0x1b {
+                            continue;
+                        }
+                        match read_escape(&mut handle) {
+                            // `Escape` on its own means "forget this line". The
+                            // refusal for an unlisted symbol used to be the end of
+                            // the road for anyone who backed out with `Escape`, and
+                            // the key did nothing at all; now it is the way out of
+                            // what has been typed, and the help block says so.
+                            Escape::Bare => {
+                                if let Ok(mut g) = input.lock() {
+                                    g.line.clear();
+                                    g.highlighted = 0;
+                                }
+                            }
+                            Escape::Arrow(delta) => {
+                                if let Ok(mut g) = input.lock() {
+                                    g.pending = Some(Command::MoveHighlight(delta));
+                                }
+                            }
+                            Escape::Sequence => {}
+                            Escape::Text(bytes) => {
+                                if let Ok(mut g) = input.lock() {
+                                    for b in bytes {
+                                        if g.line.len() < INPUT_LIMIT {
+                                            g.line.push(b as char);
+                                        }
+                                    }
+                                    g.highlighted = 0;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                 }
             }
         })
@@ -931,6 +1217,19 @@ pub const LEVELS_MAX: usize = 64;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A byte source for the reader's tests: the bytes are all there, and the end
+    /// of them is what ends the wait.
+    #[derive(Debug)]
+    struct FakeKeys(std::io::Cursor<Vec<u8>>);
+
+    impl Read for FakeKeys {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Keys for FakeKeys {}
 
     #[test]
     fn levels_parses_within_range_and_rejects_outside_it() {
@@ -1100,6 +1399,173 @@ mod tests {
         assert!(catalog.contains("ETHUSDT"));
         match act("ethusdt", &catalog, &mut w, &path) {
             Action::Switched { remark, .. } => assert!(remark.is_none(), "{remark:?}"),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_follows_an_escape_byte_decides_what_the_key_was() {
+        // The table the reader consults, without a terminal. The first two rows
+        // are the whole point: nothing after the byte is the key itself, and
+        // anything that is not a sequence is text that must not be dropped.
+        assert_eq!(classify_escape(&[]), Escape::Bare);
+        assert_eq!(classify_escape(b"e"), Escape::Text(vec![b'e']));
+        assert_eq!(
+            classify_escape(b"ethusdt"),
+            Escape::Text(b"ethusdt".to_vec())
+        );
+        // The arrows, in both the CSI and the application-cursor form.
+        assert_eq!(classify_escape(b"[A"), Escape::Arrow(-1));
+        assert_eq!(classify_escape(b"[B"), Escape::Arrow(1));
+        assert_eq!(classify_escape(b"OA"), Escape::Arrow(-1));
+        assert_eq!(classify_escape(b"OB"), Escape::Arrow(1));
+        // Sequences this program does not use are consumed, not typed: `[C` is
+        // the right arrow, and its bytes are printable.
+        assert_eq!(classify_escape(b"[C"), Escape::Sequence);
+        // Parameters before the final byte: `Escape [ 1 ; 5 A` is Ctrl+Up, and a
+        // modified arrow is still that arrow.
+        assert_eq!(classify_escape(b"[1;5A"), Escape::Arrow(-1));
+        assert_eq!(classify_escape(b"[1;5C"), Escape::Sequence);
+        assert_eq!(classify_escape(b"["), Escape::Sequence);
+        assert_eq!(classify_escape(b"O"), Escape::Sequence);
+        // A control byte that arrives inside the wait is not text.
+        assert_eq!(classify_escape(&[0x0d]), Escape::Text(Vec::new()));
+    }
+
+    #[test]
+    fn the_reader_keeps_every_byte_it_reads() {
+        // What the fixed reader does with a byte stream, and the assertion that
+        // covers the reported defect: bytes after a bare `Escape` come back as
+        // text instead of being discarded. The old code read two bytes with
+        // `read_exact` and threw them away whatever they were, which ate `et` of
+        // `ethusdt` — and, when Enter was among them, ate the submission too.
+        fn keys(bytes: &[u8]) -> FakeKeys {
+            FakeKeys(std::io::Cursor::new(bytes.to_vec()))
+        }
+
+        // One byte: a person typing again inside the wait. Nothing may be lost.
+        assert_eq!(read_escape(&mut keys(b"e")), Escape::Text(vec![b'e']));
+        assert_eq!(
+            read_escape(&mut keys(b"ethusdt\r")),
+            Escape::Text(b"ethu".to_vec()),
+            "the wait takes at most {} bytes, and keeps every one of them",
+            ESCAPE_TAIL_BYTES
+        );
+
+        // An arrow key, read whole.
+        assert_eq!(read_escape(&mut keys(b"[B")), Escape::Arrow(1));
+        assert_eq!(read_escape(&mut keys(b"[A")), Escape::Arrow(-1));
+
+        // Nothing to read at all. The wait expires instead of blocking, which is
+        // what makes a bare `Escape` reach the draw loop as a key.
+        let mut empty = keys(b"");
+        assert_eq!(read_escape(&mut empty), Escape::Bare);
+    }
+
+    #[test]
+    fn a_prefix_matching_one_symbol_switches_to_it_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("ob-act8-{}", std::process::id()));
+        let (mut w, path, catalog) = watch_at(&dir.join("watch.txt"));
+        assert!(catalog.contains("ETHUSDT"));
+        match act("eth", &catalog, &mut w, &path) {
+            Action::Switched {
+                added,
+                symbol,
+                remark,
+            } => {
+                assert!(added);
+                assert_eq!(symbol, "ETHUSDT", "the completed symbol is displayed");
+                let text = remark.expect("the completion is worth saying");
+                assert!(text.contains("ETHUSDT"), "{text}");
+                assert!(text.contains("only symbol starting with it"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // And the watch file holds the symbol, never the prefix.
+        let written = std::fs::read_to_string(&path).expect("written");
+        assert!(written.contains("ETHUSDT"), "{written}");
+        assert!(!written.contains("\nETH\n"), "{written}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_prefix_matching_several_symbols_is_refused_with_them_named() {
+        let dir = std::env::temp_dir().join(format!("ob-act9-{}", std::process::id()));
+        let (mut w, path, catalog) = watch_at(&dir.join("watch.txt"));
+        // `ET` starts both ETHUSDT and ETCUSDT in the shipped catalog. Counted
+        // rather than assumed, so the test fails on a catalog edit that made the
+        // case disappear rather than passing for the wrong reason.
+        let starts: Vec<&str> = catalog.prefixed("ET", 8);
+        assert!(starts.len() >= 2, "{starts:?}");
+        match act("et", &catalog, &mut w, &path) {
+            Action::Note(text) => {
+                assert!(text.contains("not in config/tickers.txt"), "{text}");
+                for symbol in &starts {
+                    assert!(text.contains(symbol), "{symbol} missing from {text}");
+                }
+                assert!(text.contains("force ET"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(w.symbols(), &["BTCUSDT"], "nothing changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_interior_match_is_never_substituted() {
+        // `usdt` is inside almost every symbol in the catalog and starts none of
+        // them. Substituting the first would answer a request for one thing with
+        // another, so this is refused.
+        let dir = std::env::temp_dir().join(format!("ob-act10-{}", std::process::id()));
+        let (mut w, path, catalog) = watch_at(&dir.join("watch.txt"));
+        assert!(
+            !catalog.suggest("USDT", 1).is_empty(),
+            "the catalog changed"
+        );
+        assert!(
+            catalog.prefixed("USDT", 1).is_empty(),
+            "the catalog changed"
+        );
+        match act("usdt", &catalog, &mut w, &path) {
+            Action::Note(text) => assert!(text.contains("not in config/tickers.txt"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(w.symbols(), &["BTCUSDT"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_goes_through_the_same_catalog_check_as_a_bare_symbol() {
+        // `only SYMBOL` replaces the whole subscription, so it is the form where an
+        // unlisted name does the most damage: one bad stream name in the combined
+        // URL can take the connection down for every symbol. It used to skip the
+        // check entirely and write whatever was typed into the watch file.
+        let dir = std::env::temp_dir().join(format!("ob-act11-{}", std::process::id()));
+        let (mut w, path, catalog) = watch_at(&dir.join("watch.txt"));
+        assert!(!catalog.contains("ZZZTUSDT"));
+        match act("only zzztusdt", &catalog, &mut w, &path) {
+            Action::Note(text) => assert!(text.contains("not in config/tickers.txt"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(w.symbols(), &["BTCUSDT"], "the watch set is untouched");
+
+        // A prefix of a listed symbol is completed here too.
+        match act("only eth", &catalog, &mut w, &path) {
+            Action::Switched { added, symbol, .. } => {
+                assert!(!added, "only replaces the set rather than growing it");
+                assert_eq!(symbol, "ETHUSDT");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(w.symbols(), &["ETHUSDT"]);
+        let written = std::fs::read_to_string(&path).expect("written");
+        assert!(written.contains("ETHUSDT"), "{written}");
+        assert!(!written.contains("\nETH\n"), "{written}");
+
+        // And the explicit way past the check still works.
+        match act("force zzztusdt", &catalog, &mut w, &path) {
+            Action::Switched { symbol, .. } => assert_eq!(symbol, "ZZZTUSDT"),
             other => panic!("{other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);

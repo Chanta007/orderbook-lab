@@ -242,6 +242,35 @@ the size of the subscription, because a book that never updates has three possib
 causes and they are told apart by what is on that line: the wrong symbol selected,
 the symbol not watched, or the feed stalled. §4.4 is how the window says which.
 
+**A name that is most of a listed one** is resolved rather than refused. Exactly
+one listed symbol starting with what was typed is used, and the frame says which
+name it stood for; several are named; none is the refusal below. Only a prefix is
+completed, never an interior match, because `usdt` is inside `BTCUSDT` and
+substituting there would answer a request for one symbol with a different one.
+
+**The refusal** is the one place where a bad value would cost more than a message:
+every watched symbol shares one websocket, so an unlisted stream name in the
+combined URL can take the connection down for all of them. A name matching nothing
+is therefore refused with `force` and its risk named, and `only SYMBOL` — which
+replaces the whole subscription — is checked the same way as a bare symbol.
+
+**The keys.** `Tab` completes the line to the best match, the arrows move the
+picker's highlight, `Enter` submits, `Escape` clears what has been typed, and
+backspace deletes a character. `Escape` is a key with a meaning rather than an
+unhandled byte, and it is the way out of a refusal that has left a partial name on
+the line. Reading it correctly is more delicate than it looks: a terminal sends
+`Escape` alone as one byte and an arrow key as three, so the reader waits 30 ms for
+the rest of a sequence and keeps every byte it reads either way — `OPT-039` in
+`docs/optimization/ledger.jsonl` is what happened when it did not.
+
+**The frame's height** is fixed, and with five levels and a stalled feed it is about
+27 rows: three header rows, the colour key, eleven help rows, the levels line, the
+status line, up to three lines of diagnosis, the price table and the prompt. A
+24-row terminal therefore scrolls the header out of view, which is the line that
+says which symbol is displayed and whether the feed is live. `levels 3` fits today.
+Fitting the frame to the window is a deferred item
+(`docs/deferred/index.md`), because dropping rows needs a rule for which ones go.
+
 ### 4.7 Durability counters
 
 `wal_records`, `wal_rejected`, `wal_torn_bytes` and `ring_published` come out of
