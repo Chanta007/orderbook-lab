@@ -190,7 +190,13 @@ class ViewCli(unittest.TestCase):
         import re
 
         def shape(rows: list[str]) -> list[str]:
-            return [re.sub(r"\d+(\.\d+)?", "N", row).rstrip() for row in rows]
+            # Durations are normalised with their unit, and only then the rest of the
+            # digits: a sub-microsecond age prints as `843ns` on a fast machine and
+            # `1.234us` on a slower one, and the unit is part of the number. Replacing
+            # the digits alone leaves a difference that is not a difference in the
+            # frame, which is how this test failed in CI and not locally.
+            text = [re.sub(r"\d+(\.\d+)?(ns|us|ms|s)\b", "N", row) for row in rows]
+            return [re.sub(r"\d+(\.\d+)?", "N", row).rstrip() for row in text]
 
         self.feed()
         json_rows = self.rows_of(self.view("--once", "--json"))
