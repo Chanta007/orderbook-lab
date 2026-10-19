@@ -188,7 +188,14 @@ terminal can show it, the CLI can emit it, because both call `compose`. It is al
 what makes the panels testable from a shell, and what a future script or dashboard
 would consume.
 
-### 8.3 `web` — the Rust-native page
+### 8.3 `web` — the Rust-native page (designed, not built)
+
+> The routes, the stream and the policy below are specified and not implemented. The
+> composition they render exists and is tested; the server is the next change. It is
+> written down here because the decisions in it are the kind that get made badly under
+> time pressure — a websocket because it is familiar, an unbounded queue because the
+> first version works on a fast machine — and because the layer exists now precisely so
+> that this frontend is a server rather than a rewrite.
 
 | Route | Method | Purpose |
 |-------|--------|---------|
