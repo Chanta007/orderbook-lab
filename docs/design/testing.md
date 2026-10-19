@@ -179,7 +179,34 @@ asserts that the JSON and text renderings of one frame agree row for row, that
 the book the way typing it does, and that a usage error exits 2. That file is the layer's
 contract test: if a second frontend cannot be driven from a shell, the layer is not one.
 
-### 3.7 The soak
+### 3.7 The web frontend, from a socket and from a browser
+
+Two files, because they can fail independently: `python/test_web.py` (8 tests, no
+browser) proves the server — the page is served with nothing fetched from elsewhere,
+`/events` streams composed frames in order, `POST /act` runs a command through the same
+dispatcher the terminal uses and replies with the frame it produced, a refusal reaches
+the page as words, a viewer that stops reading does not slow the feed, and a connection
+past the cap is refused with a readable 503.
+
+`python/test_web_browser.py` (5 tests) drives Chrome over the DevTools protocol, spoken
+from the standard library — a handshake, masked frames out, unmasked frames in, and
+three calls: `Page.navigate`, `Runtime.evaluate`, `Page.captureScreenshot`. Chrome is
+started headless with `--remote-debugging-port=0` and a profile directory of its own,
+so nothing is shared with a browser a person has open and the teardown's kill matches
+that directory and never "every Chrome". It asserts that the page renders the streamed
+frame (header, times, column headers, prices), that the styles are the ones the
+composition names (through the DOM's computed colour, not by reading the stylesheet),
+that typing a command into the input and pressing Enter changes the view, that
+`?cmd=status` runs a command on load, and that a screenshot is a real image — which is
+saved for a person to look at.
+
+That last file found three defects a socket-level test could not see, which is the
+argument for having it: the frame carried a `stdin is not a terminal` prompt row into
+the browser, the page counted the frames published before it connected as dropped, and
+the server's 503 arrived as a connection reset because it closed the socket with the
+request unread. `docs/optimization/ledger.jsonl` OPT-044 and OPT-045.
+
+### 3.8 The soak
 
 `obsoak` drives the cache with a thousand symbols and reports what it cost:
 latency by stage, slippage split into its latency and depth causes, and the

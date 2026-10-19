@@ -27,7 +27,7 @@ slippage and backpressure as first-class reported quantities
 | `rust/ob/src/book.rs`, `cache.rs` | One symbol's prices, and many symbols with subscribers. |
 | `rust/ob/src/latency.rs`, `slippage.rs`, `pressure.rs` | The three measurements. |
 | `rust/ob-cli/src/ingest.rs` | Accepting connections and reading whole records. |
-| `rust/ob-cli/src/bin/` | `feedd`, `tui`, `view`, `headless`, `obsoak`, `vecbench`. |
+| `rust/ob-cli/src/bin/` | `feedd`, `tui`, `view`, `web`, `headless`, `obsoak`, `vecbench`. |
 | `rust/ob-view/src/` | What a frame is: `line.rs` (spans, styles, renderers, the line cache), `snapshot.rs`, `compose.rs` (the composition and the row budget), `report.rs` (the daemon's log lines), `bars.rs`. |
 | `rust/ob-cli/src/actions.rs` | The dispatcher: one function from a typed line to an action, shared by every frontend. |
 | `rust/ob-cli/src/window.rs` | One window on one ring: the cursor, the counters, the tick table, the daemon log, the level buffers. |
@@ -35,6 +35,8 @@ slippage and backpressure as first-class reported quantities
 | `rust/ob-cli/src/daemon.rs` | Tailing the daemon's log for its own report. |
 | `rust/ob-cli/src/screen.rs` | The terminal's size, from `ioctl(TIOCGWINSZ)`. |
 | `python/test_view.py` | The second frontend: the printed frame against the drawn one. |
+| `rust/ob-cli/src/web.rs` | The third frontend's server: HTTP over `std::net`, the frame stream, the per-viewer queue of one, and the page. |
+| `python/test_web.py`, `python/test_web_browser.py` | The server from a socket, and the page in Chrome. |
 | `python/test_tui_input.py` | The terminal test: a pseudo-terminal, keystrokes, and what came back. |
 | `rust/ob-cli/src/tickers.rs` | The ticker catalog and the picker's ranking. |
 | `rust/ob-cli/src/watch.rs` | The watch set, and the atomic write that tells the adapter about it. |
@@ -65,8 +67,8 @@ blocks to read and all of them are in two files.
 
 `ob-view` exists so the interface is not the terminal. It has no I/O and no terminal
 type in it, so its tests are ordinary unit tests, and the same composed frame is
-drawn by `tui`, printed by `view` and (in the next change) streamed by a web
-frontend. `docs/design/view-layer.md` is the argument.
+drawn by `tui`, printed by `view` and streamed to a browser by `web`.
+`docs/design/view-layer.md` is the argument.
 
 ### 3.2 No dependencies, on purpose
 

@@ -210,7 +210,9 @@ fn run() -> CliResult {
                 line: "",
                 suggestions: &[],
                 highlighted: 0,
-                interactive: false,
+                // A printed frame is driven by its arguments, not by a line someone
+                // types into it, so it draws no prompt row.
+                input_mode: ob_view::InputMode::Remote,
             },
         );
         let frame: Frame = compose(&snapshot, &window.view, budget(&options));
@@ -248,11 +250,13 @@ fn bench(
     options: &Options,
 ) -> CliResult {
     let adapter = Adapter::Absent;
+    // The bench composes the same frame a page would get, picker and all, so the
+    // number covers the widest frame this program can produce.
     let prompt = Prompt {
         line: "eth",
         suggestions: &["ETHUSDT", "ETCUSDT"],
         highlighted: 0,
-        interactive: true,
+        input_mode: ob_view::InputMode::Local,
     };
     let budget = budget(options);
     let started = std::time::Instant::now();

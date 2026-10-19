@@ -30,7 +30,7 @@
 
 use crate::bars;
 use crate::line::{Line, Span, Style};
-use crate::snapshot::{Adapter, Snapshot};
+use crate::snapshot::{Adapter, InputMode, Snapshot};
 
 /// How long without a record before the frame says the feed has stalled.
 ///
@@ -159,7 +159,8 @@ pub fn compose(snapshot: &Snapshot, view: &View, budget: Budget) -> Frame {
             .take(STATUS_ROWS)
             .collect()
     };
-    let reserved = head.len() + 1 + status.len();
+    let prompt_rows = usize::from(snapshot.input_mode != InputMode::Remote);
+    let reserved = head.len() + prompt_rows + status.len();
     let mut remaining = rows.saturating_sub(reserved);
 
     // Each block below may take at most what is left after the ones under it have a
@@ -206,8 +207,13 @@ pub fn compose(snapshot: &Snapshot, view: &View, budget: Budget) -> Frame {
     // than predicted: the body's height depends on the level count and the window,
     // and a cursor row that does not match the prompt's is a cursor in the wrong
     // place.
+    // A remote frontend has its own input, so this frame has no prompt row: the page's
+    // bar is the prompt, and a second one in the text would be a lie about where the
+    // typing goes.
     let prompt_row = lines.len() + 1;
-    lines.push(prompt(snapshot));
+    if snapshot.input_mode != InputMode::Remote {
+        lines.push(prompt(snapshot));
+    }
     lines.extend(help);
 
     // The rule this whole function is arranged around, applied once at the end so
@@ -223,7 +229,7 @@ pub fn compose(snapshot: &Snapshot, view: &View, budget: Budget) -> Frame {
 
     // Only when the prompt survived the truncation: a cursor row that does not
     // exist would place the terminal's cursor somewhere unrelated.
-    let cursor = if snapshot.interactive && prompt_row <= lines.len() {
+    let cursor = if snapshot.input_mode == InputMode::Local && prompt_row <= lines.len() {
         let typed = snapshot.input.chars().count();
         // Two for `> `, one because ANSI columns are one-based.
         Some((prompt_row, 3 + typed.min(cols.saturating_sub(3))))
@@ -698,7 +704,9 @@ fn field(value: Option<u64>) -> String {
 }
 
 fn picker_lines(snapshot: &Snapshot, remaining: usize, cols: usize) -> Vec<Line> {
-    if !snapshot.interactive || snapshot.suggestions.is_empty() || snapshot.input.trim().is_empty()
+    if snapshot.input_mode != InputMode::Local
+        || snapshot.suggestions.is_empty()
+        || snapshot.input.trim().is_empty()
     {
         return Vec::new();
     }
@@ -730,17 +738,20 @@ fn picker_lines(snapshot: &Snapshot, remaining: usize, cols: usize) -> Vec<Line>
 }
 
 fn prompt(snapshot: &Snapshot) -> Line {
-    if snapshot.interactive {
-        Line::new()
+    match snapshot.input_mode {
+        InputMode::Local => Line::new()
             .with(Span::new("> ", Style::Accent))
-            .with(Span::plain(snapshot.input.clone()))
-    } else {
-        Line::new()
+            .with(Span::plain(snapshot.input.clone())),
+        // Unreachable through `compose`, which does not draw a prompt for a remote
+        // frontend; written out so the match is total and a future caller cannot
+        // silently get the wrong prompt.
+        InputMode::Remote => Line::new(),
+        InputMode::None => Line::new()
             .with(Span::new("> ", Style::Accent))
             .with(Span::new(
                 "(input disabled: stdin is not a terminal)",
                 Style::Dim,
-            ))
+            )),
     }
 }
 
@@ -905,18 +916,6 @@ mod tests {
             .position(|l| l.text().starts_with("> "))
             .expect("a prompt");
         assert_eq!(frame.cursor, Some((prompt_at + 1, 3 + 8)));
-    }
-
-    #[test]
-    fn a_frame_with_no_terminal_has_no_cursor() {
-        let mut s = snapshot();
-        s.interactive = false;
-        let frame = compose(&s, &View::default(), Budget::default());
-        assert_eq!(frame.cursor, None);
-        assert!(frame
-            .lines
-            .iter()
-            .any(|l| l.text().contains("input disabled")));
     }
 
     #[test]

@@ -153,6 +153,15 @@ consumer assumes.**
 | OPT-041 | The window's level buffers were sized once at startup, so `levels 7` drew four rows while the frame said `Showing 7 levels.` | A command that changes a number has to change every structure sized from it, and a test that asserts the sentence a frame prints can pass over a defect in what it draws. Assert the rendering, not the claim about it. |
 | OPT-042 | Eleven rows of command reference sat between the header and the book. It is behind `help`/`?` now, drawn below the prompt, and the same slot takes the `status` panel: the ring as a bar, the reader's rate, per-symbol ticks with sparklines, the adapter's heartbeat, and the daemon's queues and consumers parsed from the log lines it already writes. | Reference material in a live view costs the thing it is next to. Put it behind a command and spend the slot on something that changes — and show what the programs already publish rather than adding a channel for it. |
 
+### The web frontend
+
+| id | Finding | Lesson |
+|----|---------|--------|
+| OPT-043 | The third frontend over one composition is a server, not a rewrite: `std::net`, SSE, a queue of one frame per viewer with a drop counter, commands over POST through the same dispatcher. A streamed frame is 1,575 bytes of JSON against 851 bytes as ANSI. | SSE against a websocket and a queue of one against a queue are both the cheaper choice for one-way frames to a viewer that may be slow, and both were decided from the research record rather than from familiarity. Streaming the model costs about twice the bytes and buys a renderer with no emulator and no escape parsing. |
+| OPT-044 | The first screenshot of the served page showed `> (input disabled: stdin is not a terminal)` in a browser. One boolean, `interactive`, was answering a question with three answers; the snapshot now carries `input_mode: Local \| Remote \| None`. | A boolean is a claim that a question has two answers. No socket-level test could see this: the bytes were right for a terminal and wrong for a page, and only a render of the actual page showed which. |
+| OPT-045 | The server refused a connection past its cap with a 503 and closed the socket with the request unread, so the kernel sent a reset and the client saw a connection error instead of the reason. | Closing a socket with unread bytes in its receive buffer sends a reset. A server that says no has to read what the connection said before it closes the door — and a test that asserts on half a status line reports the wrong thing. |
+| OPT-046 | The page counted the frames published before it connected as frames it had dropped, so every viewer opened reporting a lag. | A counter that starts at zero on a stream that did not reports the past as a fault. The browser test caught it by asserting `0 dropped` for a viewer on the same host. |
+
 ### Verification habits
 
 | id | Finding | Lesson |

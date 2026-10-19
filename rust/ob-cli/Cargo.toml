@@ -40,6 +40,12 @@ path = "src/bin/vecbench.rs"
 name = "view"
 path = "src/bin/view.rs"
 
+# The same frame, served to a browser: server-sent events out, commands in. The third
+# frontend over one composition.
+[[bin]]
+name = "web"
+path = "src/bin/web.rs"
+
 [lib]
 name = "ob_cli"
 path = "src/lib.rs"

@@ -93,7 +93,22 @@ In the window, type a command and press Enter. The picture refreshes ten times a
 | `watch`, `only SYMBOL`, `unwatch SYMBOL` | What is being watched, and what should be. |
 | `lag`, `staleness`, `age` | The three times, each explained where you are reading it. |
 
-The same frame is available without a terminal, which is what makes it a layer rather than a drawing:
+The same frame is also a web page, which is what makes it a layer rather than a drawing:
+
+```bash
+make web                       # a feed, then the page on http://127.0.0.1:9002/
+```
+
+![the web frontend](docs/images/web-frontend.png)
+
+The page is the frame the terminal draws — same header, same times, same book, same
+dashboard behind `status` — with an input bar where the prompt row would be. It streams
+over server-sent events, one frame every 100 ms, and each viewer has a queue of one
+frame: a viewer that falls behind loses frames rather than delaying the feed. `make web
+WEB_PORT=9003` serves a second one, and `docs/runbooks/web-frontend.md` is what to
+check when the page does not move.
+
+Without a browser at all, the same frame prints:
 
 ```bash
 rust/target/release/view config/dev.json --once              # one frame, as text

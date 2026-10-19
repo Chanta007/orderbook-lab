@@ -44,7 +44,11 @@ CONFIG ?= config/dev.json
 # The test config. Never the live one, for the reason in the header above.
 TEST_CONFIG ?= config/test.json
 
-.PHONY: all test e2e clean setup start stop rust-build rust-test rust-e2e rust-soak rust-interop rust-vec-audit rust-start rust-feed view-check
+# The port the web frontend serves. Its own variable rather than derived from
+# `listen_port`: two ports that move together are two ports that collide together.
+WEB_PORT ?= 9002
+
+.PHONY: all test e2e clean setup start stop rust-build rust-test rust-e2e rust-soak rust-interop rust-vec-audit rust-start rust-feed view-check web web-check
 
 all: $(BUILD)/feedd $(BUILD)/tui $(BUILD)/headless $(BUILD)/test_core
 
@@ -118,6 +122,19 @@ rust-soak: rust-build
 # on the test config, which is why it depends on both builds.
 view-check: all rust-build
 	python3 -m unittest discover -s python -p 'test_view.py'
+
+# The third frontend: the same frame served to a browser. It starts a feed and the
+# server in the foreground, so this is the one command that puts the page on screen.
+web: rust-build
+	python3 python/obctl.py start --config $(CONFIG) --impl rust
+	@echo "open http://127.0.0.1:$(WEB_PORT)/ in a browser; ctrl-c stops the server"
+	$(RUST)/web $(CONFIG) --port $(WEB_PORT)
+
+# The server from a socket, and the page in a browser when one is installed. The
+# browser half skips on a machine with no Chrome, which is what CI is.
+web-check: all rust-build
+	python3 -m unittest discover -s python -p 'test_web.py'
+	python3 -m unittest discover -s python -p 'test_web_browser.py'
 
 # Each half fails the make run when its headless exits non-zero, which is
 # the whole check: a reader that cannot parse the other writer's ring or
