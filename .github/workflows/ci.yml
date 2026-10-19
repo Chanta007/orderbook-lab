@@ -40,5 +40,9 @@ jobs:
       # the ring.
       - name: view cli
         run: make view-check
+      # The web frontend's server, from a socket. The browser half of that check skips
+      # here — a runner has no Chrome — and runs on a machine that has one.
+      - name: web frontend
+        run: make web-check
       - name: vectorization audit
         run: make rust-vec-audit

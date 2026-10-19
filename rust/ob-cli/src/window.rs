@@ -20,7 +20,7 @@ use ob::book::{Book, Level};
 use ob::config::Config;
 use ob::msg::Msg;
 use ob::ring::RingReader;
-use ob_view::{Adapter, Snapshot, View};
+use ob_view::{Adapter, InputMode, Snapshot, View};
 use std::path::Path;
 use std::time::Instant;
 
@@ -149,8 +149,8 @@ pub struct Prompt<'a> {
     pub suggestions: &'a [&'a str],
     /// Which suggestion is highlighted.
     pub highlighted: usize,
-    /// Whether stdin is a terminal.
-    pub interactive: bool,
+    /// Where the person reading this frame types.
+    pub input_mode: InputMode,
 }
 
 impl Window {
@@ -281,7 +281,7 @@ impl Window {
                 .map(|s| (*s).to_string())
                 .collect(),
             highlighted: prompt.highlighted,
-            interactive: prompt.interactive,
+            input_mode: prompt.input_mode,
         }
     }
 }

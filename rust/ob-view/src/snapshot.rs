@@ -35,6 +35,23 @@ pub enum Adapter {
     Absent,
 }
 
+/// Where the person reading this frame types.
+///
+/// Three cases, and they are not the same frame: a terminal owns its input line and
+/// shows what has been typed; a page has an input bar of its own, so the frame needs
+/// no prompt row at all; and a frame printed to a pipe has no input anywhere, which is
+/// worth saying rather than leaving a bare `>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputMode {
+    /// The terminal that draws this frame owns the line.
+    #[default]
+    Local,
+    /// A frontend with its own input: a page, or a CLI driven by its arguments.
+    Remote,
+    /// No input anywhere, and the frame says so.
+    None,
+}
+
 /// One watched symbol's tick rate, and enough history to draw it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tick {
@@ -101,8 +118,8 @@ pub struct Snapshot {
     pub suggestions: Vec<String>,
     /// Which suggestion is highlighted.
     pub highlighted: usize,
-    /// Whether stdin is a terminal, so a reader can be told its input is off.
-    pub interactive: bool,
+    /// Where the person reading this frame types.
+    pub input_mode: InputMode,
 }
 
 impl Default for Snapshot {
@@ -135,7 +152,7 @@ impl Default for Snapshot {
             input: String::new(),
             suggestions: Vec::new(),
             highlighted: 0,
-            interactive: true,
+            input_mode: InputMode::Local,
         }
     }
 }

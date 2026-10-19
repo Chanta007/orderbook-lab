@@ -23,6 +23,7 @@ pub mod screen;
 pub mod stats;
 pub mod tickers;
 pub mod watch;
+pub mod web;
 pub mod window;
 
 /// The result type the binaries use: an error message and an exit code.

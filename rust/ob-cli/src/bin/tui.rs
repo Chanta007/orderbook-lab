@@ -422,6 +422,13 @@ fn run() -> CliResult {
     let input = Arc::new(Mutex::new(Input::default()));
 
     let interactive = stdin_is_tty();
+    let input_mode = if interactive {
+        ob_view::InputMode::Local
+    } else {
+        // A frame with no terminal has no input line, and says so rather than
+        // leaving a bare prompt.
+        ob_view::InputMode::None
+    };
     let _mode = TerminalMode::enter();
     install_signal_handlers()?;
     let reader = spawn_input_thread(Arc::clone(&input));
@@ -585,7 +592,7 @@ fn run() -> CliResult {
                 line: &line,
                 suggestions: &suggestions,
                 highlighted,
-                interactive,
+                input_mode,
             },
         );
         let (rows, cols) = screen::size();

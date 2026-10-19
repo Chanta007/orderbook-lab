@@ -53,4 +53,4 @@ pub use compose::{
 };
 pub use line::{to_html, to_json, to_text, FrameCache, Line, RenderStats, Span, Style};
 pub use report::{parse_report, DaemonReport, Subscriber};
-pub use snapshot::{Adapter, Snapshot, Tick};
+pub use snapshot::{Adapter, InputMode, Snapshot, Tick};
