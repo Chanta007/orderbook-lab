@@ -1,8 +1,8 @@
 ## PR Metadata
 
 - **Type**: feat
-- **PRs**: (filled in after the merge)
-- **Merge commits**: (filled in after the merge)
+- **PRs**: #24 (the frontend), #25 (this archive and the runbook link)
+- **Merge commits**: `49d3b28f`
 - **Research**: docs/research/2026-10-19-view-layer-and-web-frontend.md (the SSE-against-WebSocket and slow-viewer sections, written before this change and used as its design)
 - **Research summary**: no new research. The previous change's record already answered the two questions this one turns on — SSE rather than a websocket for one-way frames, and a bounded per-viewer queue with drop-oldest so a slow browser cannot slow the feed — and this change is the implementation of §8.3 of the design doc.
 - **Evidence**: `make test`, `make rust-test`, `make rust-vec-audit`, `make e2e`, `make rust-e2e`, `make rust-interop`, `make rust-soak`, `make view-check` and `make web-check` all PASS under `set -e -o pipefail`. `make web-check` is 8 socket tests plus 5 browser tests driving Chrome over the DevTools protocol. Measured: a streamed frame is 1,575 bytes of JSON (~1,591 with SSE framing) against 851 bytes as ANSI (OPT-043).
@@ -22,7 +22,7 @@
 | Worktree | .claude/worktrees/web-frontend |
 | Design docs | docs/design/view-layer.md §8.3 |
 | Research | docs/research/2026-10-19-view-layer-and-web-frontend.md |
-| PR | (filled in after the merge) |
+| PR | #24, merged as `49d3b28f` |
 | Goal | smartdeploy-to-dev (ship to dev directly approved by the user this turn) |
 
 ## Context
