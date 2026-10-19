@@ -1,8 +1,8 @@
 ## PR Metadata
 
 - **Type**: feat
-- **PRs**: (filled in after the merge)
-- **Merge commits**: (filled in after the merge)
+- **PRs**: #22
+- **Merge commits**: `d6b41939`
 - **Research**: docs/research/2026-10-19-view-layer-and-web-frontend.md
 - **Research summary**: four searches — ratatui's Buffer/Widget/diff architecture and its per-frame cost numbers, ANSI-to-HTML conversion against streaming the model, SSE against WebSocket for a frame stream, and the backpressure rules for a slow viewer. Plus the block-element technique for text-mode graphs, which is what the status panel draws with.
 - **Evidence**: `make test`, `make rust-test`, `make rust-vec-audit`, `make e2e`, `make rust-e2e`, `make rust-interop`, `make rust-soak` and `make view-check` all PASS, each run directly under `set -e -o pipefail`. 47 tests in `ob-view`, 67 in `ob-cli`, 176 in `ob`, 8 pty tests and 8 `view` tests. Measured: 8 of 11 rows and 707 bytes per frame with the line diff against 11 of 11 and 851 bytes without, and 23.5 KB against 51.8 KB to the terminal over six seconds (OPT-039); composition at 5.3-5.4 microseconds per frame (OPT-040).
@@ -20,7 +20,7 @@
 | Created | 2026-10-19 |
 | Branch | feature/tui-layers |
 | Worktree | .claude/worktrees/tui-layers |
-| PR | (filled in after the merge) |
+| PR | #22, merged as `d6b41939` |
 | Design docs | docs/design/view-layer.md |
 | Research | docs/research/2026-10-19-view-layer-and-web-frontend.md |
 | Goal | smartdeploy-to-dev (ship to dev directly approved by the user this turn) |
