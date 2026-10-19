@@ -188,14 +188,15 @@ terminal can show it, the CLI can emit it, because both call `compose`. It is al
 what makes the panels testable from a shell, and what a future script or dashboard
 would consume.
 
-### 8.3 `web` — the Rust-native page (designed, not built)
+### 8.3 `web` — the Rust-native page
 
-> The routes, the stream and the policy below are specified and not implemented. The
-> composition they render exists and is tested; the server is the next change. It is
-> written down here because the decisions in it are the kind that get made badly under
-> time pressure — a websocket because it is familiar, an unbounded queue because the
-> first version works on a fast machine — and because the layer exists now precisely so
-> that this frontend is a server rather than a rewrite.
+```bash
+make web                      # starts a feed and serves the page on 127.0.0.1:9002
+make web WEB_PORT=9003        # a second one, without a second config
+```
+
+The page is `docs/images/web-frontend.png`: the same frame the terminal draws, in a
+browser, with an input bar where the prompt row would be.
 
 | Route | Method | Purpose |
 |-------|--------|---------|
@@ -224,11 +225,19 @@ Decisions, each argued in the research record:
 - **The server binds `127.0.0.1` only** and has no authentication, matching the rest
   of the lab; `docs/design/security.md` §2 is the reason it refuses anything else.
 
-The HTTP server is hand-written against the same six libc declarations in
-`rust/ob/src/sys.rs` plus `socket`/`bind`/`listen`/`accept`/`setsockopt`/`close`.
-One connection at a time on a small thread pool, one line of request parsing, no
-keep-alive. That is enough for a viewer on loopback and keeps the zero-dependency
-property that is the point of the Rust port.
+The server is written against `std::net`, which is what `feedd` already accepts
+connections with: no new libc declarations, no new `unsafe`, and the zero-crate
+property holds. One thread per connection, capped at 32 and answering 503 past that;
+one line of request parsing; no keep-alive, so a command is one connection. That is
+enough for a viewer on loopback.
+
+Three defects the first browser run found, all fixed and all of a kind that a
+socket-level test cannot see: the frame carried a `stdin is not a terminal` prompt row
+into the browser (the snapshot now says *where* the input is rather than *whether*
+there is one), the page counted the frames published before it connected as frames it
+had dropped, and the server's 503 was delivered as a connection reset because it closed
+the socket with the request still unread. `docs/optimization/ledger.jsonl` OPT-044 and
+OPT-045.
 
 ## 9. What this costs, measured
 
@@ -245,6 +254,7 @@ from running the terminal in a pty against a socket feed whose top of book moves
 | rows written per frame | **8 of 11**, 707 bytes | `tui --stats` in a pty, 5 levels, live feed |
 | rows written, diff disabled | 11 of 11, 851 bytes | the same, `--no-diff` |
 | terminal bytes over 6 s | **23.5 KB with the diff, 51.8 KB without** | the same two runs |
+| a streamed frame, over the wire | **1,575 bytes** of JSON, ~1,591 with SSE framing | 40 events from `GET /events`, 5-level book at 110 columns |
 
 Three readings from that:
 
@@ -258,6 +268,10 @@ Three readings from that:
   model, because 5 µs is three orders of magnitude below the write it feeds.
 - **The `--bench` number is a measurement, not a budget.** It is here so a future
   change that makes composition ten times slower has something to fail against.
+- **The web frame costs about twice the ANSI frame** (1,591 bytes against 851), and
+  buys a renderer that needs no terminal emulator and no escape parsing on either side.
+  At 10 frames a second that is 16 KB/s to one viewer on loopback, and a viewer that
+  cannot keep up loses frames rather than delaying them.
 
 ## 10. Cross-references
 
