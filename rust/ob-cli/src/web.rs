@@ -126,7 +126,10 @@ function show(next) {
   else if (next > seq + 1) dropped += next - seq - 1;
   seq = next;
   frames += 1;
-  stats.textContent = "seq " + seq + " · " + frames + " frames · " +
+  // Named apart on purpose: the frame's own header carries `seq=`, which is the ring's
+  // record sequence, and this is the server's frame number. Two numbers called `seq`
+  // on one screen is the same confusion as printing one of them under the other's name.
+  stats.textContent = "server frame " + seq + " · " + frames + " drawn · " +
                       dropped + " dropped · " + (bytes / 1024).toFixed(1) + " KB";
   stats.className = dropped > 0 ? "behind" : "";
 }

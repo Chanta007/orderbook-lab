@@ -368,10 +368,10 @@ class WebBrowser(unittest.TestCase):
         # The server's sequence and this page's own frame count are different numbers
         # and the line says both: a page that had drawn two frames once reported
         # `4671 frames · 3.1 KB`, which cannot both be true.
-        self.assertRegex(stats, r"seq \d+")
-        self.assertRegex(stats, r"\d+ frames")
+        self.assertRegex(stats, r"server frame \d+")
+        self.assertRegex(stats, r"\d+ drawn")
         self.assertIn("0 dropped", stats, "a viewer on this host is not behind")
-        frames = int(re.search(r"(\d+) frames", stats).group(1))
+        frames = int(re.search(r"(\d+) drawn", stats).group(1))
         self.assertGreaterEqual(frames, 1)
         self.assertLess(frames, 1000, f"this page drew its own frames, not the server's: {stats}")
         rows = self.evaluate("document.querySelectorAll('#screen .row').length")
