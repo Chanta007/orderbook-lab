@@ -48,7 +48,26 @@ TEST_CONFIG ?= config/test.json
 # `listen_port`: two ports that move together are two ports that collide together.
 WEB_PORT ?= 9002
 
-.PHONY: all test e2e clean setup start stop rust-build rust-test rust-e2e rust-soak rust-interop rust-vec-audit rust-start rust-feed view-check web web-check
+# cargo, found the way `python/obctl.py` finds it: PATH first, then the places a
+# toolchain is usually installed. rustup reaches PATH through a line in a shell
+# profile, so a terminal opened before that line was added has a working toolchain
+# that `make` cannot see — and the failure reads `make: cargo: command not found`,
+# which names nothing a reader can act on. The resolution lives here rather than in
+# each recipe for the same reason it lives in obctl at all (OPT-030).
+CARGO ?= $(shell command -v cargo 2>/dev/null || ls $$HOME/.cargo/bin/cargo /opt/homebrew/bin/cargo /usr/local/bin/cargo 2>/dev/null | head -1)
+
+# Say what is wrong and what to do, rather than letting a recipe fail on a missing
+# command halfway through a build.
+check-cargo:
+	@test -n "$(CARGO)" || { \
+		echo "cargo was not found."; \
+		echo "  Looked on PATH and in ~/.cargo/bin, /opt/homebrew/bin and /usr/local/bin."; \
+		echo "  Install Rust from https://rustup.rs, or open a new terminal: rustup adds"; \
+		echo "  ~/.cargo/env to a shell profile, and a shell started before that cannot see it."; \
+		exit 1; \
+	}
+
+.PHONY: all test e2e clean setup start stop rust-build rust-test rust-e2e rust-soak rust-interop rust-vec-audit rust-start rust-feed view-check web web-check check-cargo
 
 all: $(BUILD)/feedd $(BUILD)/tui $(BUILD)/headless $(BUILD)/test_core
 
@@ -97,13 +116,13 @@ rust-start:
 rust-feed:
 	python3 python/obctl.py start --config $(CONFIG) --impl rust
 
-rust-build:
-	cargo build --release --manifest-path rust/Cargo.toml
+rust-build: check-cargo
+	$(CARGO) build --release --manifest-path rust/Cargo.toml
 
 rust-test: rust-build
-	cargo test --manifest-path rust/Cargo.toml
-	cargo fmt --all --manifest-path rust/Cargo.toml --check
-	cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+	$(CARGO) test --manifest-path rust/Cargo.toml
+	$(CARGO) fmt --all --manifest-path rust/Cargo.toml --check
+	$(CARGO) clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
 	python3 -m unittest python.test_tui_input
 
 rust-e2e: rust-build

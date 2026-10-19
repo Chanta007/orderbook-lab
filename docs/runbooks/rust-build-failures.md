@@ -2,6 +2,8 @@
 
 ## Symptoms
 
+- A build appears to do nothing, or a binary the docs name is not there:
+  `rust/target/release/web: No such file or directory`.
 - `make rust-build` prints `cargo: command not found`.
 - A Rust binary exits with `bus: ring magic 0x00000000 is not 0x4f424c42`.
 - A Rust binary exits with `bus: ring file is N bytes, header says M`.
@@ -11,24 +13,53 @@
 
 ## What it means
 
+0. **The change you are building was never pulled.** Check before anything else:
+   `git log --oneline -1` against `gh api repos/Chanta007/orderbook-lab/commits/dev
+   --jq '.sha[0:8]'`. A checkout that is behind builds the code it has, so a binary
+   added by a newer change simply does not exist and the build looks broken when it
+   is not. A `git pull` that hangs is the usual reason: this repository's `origin`
+   has been an SSH URL, and the SSH key on this machine belongs to an account
+   without access to the repository, so the fetch waits rather than failing. Pull
+   over HTTPS with the `gh` token instead:
+
+   ```bash
+   git -c credential.helper= -c credential.helper='!gh auth git-credential' \
+       pull --ff-only https://github.com/Chanta007/orderbook-lab.git dev
+   ```
+
+   To make plain `git pull` work from then on:
+
+   ```bash
+   git remote set-url origin https://github.com/Chanta007/orderbook-lab.git
+   ```
+
+   (`git remote set-url origin git@github.com:Chanta007/orderbook-lab.git` puts it
+   back. Pushing over SSH never worked either; the HTTPS remote is the one the
+   credential helper can authenticate.)
+
 1. **`cargo` cannot be found.** The Rust path needs a toolchain of at least
-   1.80, which is the `rust-version` in `rust/Cargo.toml`. `make rust-build`
-   runs `cargo` from PATH, so a shell that has never sourced the rustup
-   environment, or a machine without Rust, fails before anything compiles.
+   1.80, which is the `rust-version` in `rust/Cargo.toml`.
 
-   `python/obctl.py` is stricter about this than `make` is: it looks on PATH and
-   then in `$HOME/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` and
-   `/usr/bin`, and if the tool is in none of them it exits with a message naming
-   the tool, what it was needed for, and where it looked. That matters because
-   rustup reaches PATH through `~/.cargo/env`, which a shell reads only if its
-   profile has loaded — so a terminal opened before that line existed, or an IDE
-   that does not read the profile, has no `cargo` on PATH while having a perfectly
-   good toolchain installed. `make rust-start` works in that environment.
+   Both the Makefile and `python/obctl.py` look for it on PATH and then in
+   `$HOME/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`, and
+   `make rust-build` says what it looked for and what to do when it finds none:
 
-   If you see a message rather than a traceback, the toolchain really is absent
-   and step 1 of the fix applies. A Python traceback ending
-   `FileNotFoundError: ... 'cargo'` from `obctl` was the older behaviour and is
-   now fixed.
+   ```text
+   cargo was not found.
+     Looked on PATH and in ~/.cargo/bin, /opt/homebrew/bin and /usr/local/bin.
+     Install Rust from https://rustup.rs, or open a new terminal: rustup adds
+     ~/.cargo/env to a shell profile, and a shell started before that cannot see it.
+   ```
+
+   The resolution matters because rustup reaches PATH through `~/.cargo/env`,
+   which a shell reads only if its profile has loaded — so a terminal opened
+   before that line existed, or an IDE that does not read the profile, has no
+   `cargo` on PATH while having a perfectly good toolchain installed. That shell
+   used to fail in the Makefile while `make rust-start` worked, because only
+   `obctl` resolved the tool (OPT-030, then OPT-047 for the Makefile).
+
+   A Python traceback ending `FileNotFoundError: ... 'cargo'` was the older
+   behaviour of `obctl` and is fixed.
 2. **A stale ring file.** `var/dev/bus` (or `var/prod/bus`) is a file that
    survives between runs. The reader refuses a file whose first four bytes are
    not `0x4F424C42` (ASCII `OBLB`). That happens when the path holds a file

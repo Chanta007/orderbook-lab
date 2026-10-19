@@ -162,6 +162,12 @@ consumer assumes.**
 | OPT-045 | The server refused a connection past its cap with a 503 and closed the socket with the request unread, so the kernel sent a reset and the client saw a connection error instead of the reason. | Closing a socket with unread bytes in its receive buffer sends a reset. A server that says no has to read what the connection said before it closes the door — and a test that asserts on half a status line reports the wrong thing. |
 | OPT-046 | The page counted the frames published before it connected as frames it had dropped, so every viewer opened reporting a lag. | A counter that starts at zero on a stream that did not reports the past as a fault. The browser test caught it by asserting `0 dropped` for a viewer on the same host. |
 
+### Tooling
+
+| id | Finding | Lesson |
+|----|---------|--------|
+| OPT-047 | Every rust target in the Makefile called bare `cargo`, while `obctl` had resolved the tool since OPT-030: a shell that predates the `~/.cargo/env` line saw `cargo: command not found` from `make rust-build` and a working `make rust-start`. The Makefile now resolves it the same way and a `check-cargo` prerequisite says where it looked and what to do. | A tool resolution fixed in one place is fixed in one place. When a lookup is added for a tool, grep for every other caller of that tool in the same commit — the failure survived the first fix by moving to the entry point a person is more likely to use. |
+
 ### Verification habits
 
 | id | Finding | Lesson |
