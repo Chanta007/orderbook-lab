@@ -1198,6 +1198,80 @@ class TuiInput(unittest.TestCase):
         derive it."""
         return self.workdir / "watch.txt"
 
+    def test_tab_completes_a_command_as_well_as_a_symbol(self):
+        """The picker offers commands now, not only symbols.
+
+        It used to be a symbol lookup: `bo` offered nothing, so `book` had to be typed
+        in full even though the reference lists it. The vocabulary the reference is
+        built from is what the completion matches against now, so the list under the
+        prompt and the list in `help` are the same list in the same order.
+        """
+        name, binary = TERMINALS[0]
+        reason = skip_reason(binary)
+        if reason is not None:
+            self.skipTest(reason)
+        self.start_feeder(name)
+        self.feed_fixture()
+        self.reset_screen()
+
+        master, slave = pty.openpty()
+        initial = termios.tcgetattr(slave)
+        initial[3] |= termios.ICANON | termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, initial)
+        child = subprocess.Popen(
+            [str(binary), str(self.config)],
+            cwd=str(ROOT),
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+        )
+        os.close(slave)
+        try:
+            deadline = time.monotonic() + FRAME_DEADLINE
+            screen_now = self.drain(master, time.monotonic() + 0.4)
+            while time.monotonic() < deadline and "BID PX" not in screen_now:
+                screen_now = self.drain(master, time.monotonic() + 0.4)
+
+            # `sta` is ambiguous — status and staleness — and the reference's order
+            # decides: the panel first.
+            os.write(master, b"sta")
+            offered = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                offered = self.drain(master, time.monotonic() + 0.4)
+                if "status" in offered:
+                    break
+            self.assertIn("status", offered, f"{name}: the picker does not offer commands")
+            self.assertIn("staleness", offered, "and lists the other match too")
+
+            os.write(master, b"\t")
+            typed = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                typed = self.drain(master, time.monotonic() + 0.4)
+                if "> status" in typed:
+                    break
+            self.assertIn(
+                "> status",
+                typed,
+                f"{name}: Tab did not complete to the highlighted entry. Got: "
+                f"{typed[-300:]!r}",
+            )
+
+            os.write(master, b"\r")
+            panel = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                panel = self.drain(master, time.monotonic() + 0.4)
+                if "slots," in panel:
+                    break
+            self.assertIn("slots,", panel, f"{name}: the completed command did not run")
+        finally:
+            if child.poll() is None:
+                child.send_signal(signal.SIGKILL)
+                child.wait(timeout=EXIT_DEADLINE)
+            os.close(master)
+
     def test_the_reference_is_below_the_prompt_and_the_status_panel_is_a_command(self):
         """The command reference and the dashboard, both behind commands.
 

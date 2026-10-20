@@ -114,8 +114,8 @@ pub struct Snapshot {
     pub status: String,
     /// What has been typed and not submitted.
     pub input: String,
-    /// What the picker is offering for the input line.
-    pub suggestions: Vec<String>,
+    /// What the picker is offering for the input line, best first.
+    pub suggestions: Vec<crate::command::Suggestion>,
     /// Which suggestion is highlighted.
     pub highlighted: usize,
     /// Where the person reading this frame types.

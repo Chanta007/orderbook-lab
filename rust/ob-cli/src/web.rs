@@ -71,6 +71,17 @@ pub const PAGE: &str = r#"<!doctype html>
   .accent { color: #4dabf7; }
   #bar { display: flex; gap: 12px; align-items: center; padding: 8px 14px;
          border-top: 1px solid #22262b; background: #16191c; position: sticky; bottom: 0; }
+  /* The dropdown sits above the bar rather than below it: the bar is the bottom of
+     the page, and a list under it would be off the screen. */
+  #list { position: fixed; left: 14px; right: 14px; bottom: 48px; margin: 0; padding: 4px;
+          list-style: none; background: #1b1f23; border: 1px solid #2b3036;
+          border-radius: 6px; max-height: 45vh; overflow-y: auto; }
+  #list li { padding: 4px 8px; border-radius: 4px; cursor: pointer;
+             display: flex; gap: 10px; align-items: baseline; }
+  #list li[aria-selected="true"] { background: #24303c; }
+  #list .label { color: #ffffff; font-weight: 600; }
+  #list .detail { color: #8b939c; }
+  #list .kind { color: #4dabf7; margin-left: auto; font-size: 11px; text-transform: uppercase; }
   #cmd { flex: 1; background: #101214; color: #d6d9dd; border: 1px solid #2b3036;
          border-radius: 4px; padding: 6px 8px; font: inherit; }
   #cmd:focus { outline: 1px solid #4dabf7; }
@@ -80,10 +91,12 @@ pub const PAGE: &str = r#"<!doctype html>
 </head>
 <body>
 <pre id="screen">connecting…</pre>
+<ul id="list" role="listbox" aria-label="completions" hidden></ul>
 <div id="bar">
   <span>&gt;</span>
-  <input id="cmd" autocomplete="off" spellcheck="false"
-         placeholder="levels 7 · status · book · ETHUSDT · help">
+  <input id="cmd" role="combobox" aria-expanded="false" aria-controls="list"
+         aria-autocomplete="list" aria-label="command" autocomplete="off"
+         spellcheck="false" placeholder="levels 7 · status · book · ETHUSDT · help">
   <span id="stats">…</span>
 </div>
 <script>
@@ -151,12 +164,140 @@ async function send(text) {
   } catch (e) { stats.textContent = "command failed: " + e; }
 }
 
-cmd.addEventListener("keydown", (event) => {
-  if (event.key !== "Enter") return;
-  const text = cmd.value.trim();
+// --- completion ---------------------------------------------------------
+//
+// The list comes from the server, which runs the same completion the terminal's
+// picker uses. Completing in JavaScript would mean a second implementation of what a
+// prefix means, in a second language, and the two would drift.
+//
+// The interaction is the shell's, which is what the terminal does and what a person
+// who types in one expects: Tab inserts the highlighted entry, the arrows move the
+// highlight, Escape closes the list (and clears the line on a second press), Enter
+// runs the line. Clicking an entry inserts it and runs it, because that is what
+// clicking a suggestion means in a page.
+const list = document.getElementById("list");
+let items = [], selected = 0, controller = null, timer = null;
+
+function closeList() {
+  items = [];
+  selected = 0;
+  list.hidden = true;
+  list.replaceChildren();
+  cmd.setAttribute("aria-expanded", "false");
+  cmd.removeAttribute("aria-activedescendant");
+}
+
+function paint() {
+  for (const [i, node] of Array.from(list.children).entries()) {
+    const chosen = i === selected;
+    node.setAttribute("aria-selected", chosen ? "true" : "false");
+    if (chosen) {
+      cmd.setAttribute("aria-activedescendant", node.id);
+      node.scrollIntoView({ block: "nearest" });
+    }
+  }
+}
+
+function openList(suggestions) {
+  items = suggestions;
+  selected = 0;
+  if (suggestions.length === 0) { closeList(); return; }
+  const frag = document.createDocumentFragment();
+  suggestions.forEach((s, i) => {
+    const li = document.createElement("li");
+    li.id = "opt-" + i;
+    li.setAttribute("role", "option");
+    li.setAttribute("aria-selected", i === 0 ? "true" : "false");
+    const label = document.createElement("span");
+    label.className = "label";
+    label.textContent = s.label;
+    const detail = document.createElement("span");
+    detail.className = "detail";
+    detail.textContent = s.detail;
+    const kind = document.createElement("span");
+    kind.className = "kind";
+    kind.textContent = s.kind;
+    li.append(label, detail, kind);
+    // A click inserts the entry and runs it: a suggestion in a page is a button.
+    // The text is read before `accept`, which empties the list it came from.
+    li.addEventListener("click", () => {
+      const text = items[i].insert;
+      accept(i);
+      submit(text);
+    });
+    frag.appendChild(li);
+  });
+  list.replaceChildren(frag);
+  list.hidden = false;
+  cmd.setAttribute("aria-expanded", "true");
+  paint();
+}
+
+async function refresh() {
+  const line = cmd.value;
+  if (!line.trim()) { closeList(); return; }
+  // Debounced and aborted: a completion that takes longer than the typing would
+  // otherwise land after a newer one and show the answer to a line that is gone.
+  if (controller) controller.abort();
+  controller = new AbortController();
+  try {
+    const res = await fetch("/complete?line=" + encodeURIComponent(line),
+                            { signal: controller.signal });
+    const data = await res.json();
+    if (cmd.value !== line) return;
+    openList(data.suggestions || []);
+  } catch (e) {
+    if (e.name !== "AbortError") closeList();
+  }
+}
+
+function move(delta) {
+  if (items.length === 0) return;
+  selected = (selected + delta + items.length) % items.length;
+  paint();
+}
+
+function accept(i) {
+  if (i < 0 || i >= items.length) return;
+  cmd.value = items[i].insert;
+  closeList();
+  cmd.focus();
+}
+
+function submit(text) {
+  const trimmed = (text || "").trim();
+  closeList();
   cmd.value = "";
-  if (text) send(text);
+  if (trimmed) send(trimmed);
+}
+
+cmd.addEventListener("input", () => {
+  clearTimeout(timer);
+  timer = setTimeout(refresh, 120);
 });
+
+cmd.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    if (items.length === 0) { clearTimeout(timer); refresh(); }
+    else move(event.key === "ArrowDown" ? 1 : -1);
+    event.preventDefault();
+    return;
+  }
+  if (event.key === "Tab") {
+    // Tab completes rather than moving focus. The page has one focusable control, so
+    // there is nowhere to tab to, and the convention for a line you type is the
+    // shell's.
+    if (items.length > 0) { accept(selected); event.preventDefault(); }
+    return;
+  }
+  if (event.key === "Escape") {
+    if (!list.hidden) closeList();
+    else cmd.value = "";
+    return;
+  }
+  if (event.key === "Enter") submit(cmd.value);
+});
+cmd.addEventListener("blur", () => closeList());
 cmd.focus();
 
 // `?cmd=status` runs one command as soon as the first frame is on screen, so a view
@@ -220,6 +361,12 @@ pub struct App {
     refused: AtomicU64,
     /// When the server started, for the page's status line.
     started: Instant,
+    /// The symbols a completion may offer, from the catalog the daemon watches.
+    ///
+    /// Held here rather than looked up per request: the catalog is read once at
+    /// startup, and a completion that re-read a file per keystroke would be a
+    /// completion with a file read in it.
+    symbols: Vec<String>,
 }
 
 impl Default for App {
@@ -240,7 +387,22 @@ impl App {
             clients: AtomicUsize::new(0),
             refused: AtomicU64::new(0),
             started: Instant::now(),
+            symbols: Vec::new(),
         }
+    }
+
+    /// The same server, with the symbols a completion may offer.
+    pub fn with_symbols(mut self, symbols: Vec<String>) -> Self {
+        self.symbols = symbols;
+        self
+    }
+
+    /// What the line could become, from the shared vocabulary.
+    ///
+    /// The same function the terminal's picker calls, so a prefix means the same
+    /// thing in a browser and in a window.
+    pub fn complete(&self, line: &str, limit: usize) -> Vec<ob_view::Suggestion> {
+        ob_view::complete(line, &self.symbols, limit)
     }
 
     /// Publish a frame, replacing whatever the last one was.
@@ -413,6 +575,17 @@ fn handle(mut stream: TcpStream, app: &App) {
             };
             let _ = respond(&mut stream, 200, "application/json", body.as_bytes());
         }
+        Route::Complete => {
+            // A GET, because completing a line changes nothing: the page asks about
+            // a line it has not sent, and a browser may repeat the request freely.
+            let line = query_field(&request.path, "line").unwrap_or_default();
+            let limit = query_field(&request.path, "limit")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(8)
+                .min(32);
+            let body = ob_view::command::suggestions_json(&app.complete(&line, limit));
+            let _ = respond(&mut stream, 200, "application/json", body.as_bytes());
+        }
         Route::Events => stream_events(stream, app),
         Route::NotFound => {
             let _ = respond(
@@ -490,6 +663,8 @@ pub enum Route {
     Act,
     /// `GET /health` — the counters, as text.
     Health,
+    /// `GET /complete` — what the line could become.
+    Complete,
     /// Anything else.
     NotFound,
 }
@@ -503,6 +678,7 @@ impl Route {
             ("GET", "/events") => Route::Events,
             ("POST", "/act") => Route::Act,
             ("GET", "/health") => Route::Health,
+            ("GET", "/complete") => Route::Complete,
             _ => Route::NotFound,
         }
     }
@@ -557,6 +733,15 @@ pub fn read_request(stream: &mut TcpStream) -> std::io::Result<Request> {
         body = String::from_utf8_lossy(&buf).into_owned();
     }
     Ok(Request { method, path, body })
+}
+
+/// One field out of a request's query string, percent-decoded.
+///
+/// A query string and a form body are the same encoding, so this is [`form_field`]
+/// over the part after the `?`.
+pub fn query_field(path: &str, key: &str) -> Option<String> {
+    let (_, query) = path.split_once('?')?;
+    form_field(query, key)
 }
 
 /// One field out of a form-encoded body, percent-decoded.

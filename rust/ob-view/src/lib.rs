@@ -42,14 +42,16 @@
 #![forbid(unsafe_code)]
 
 pub mod bars;
+pub mod command;
 pub mod compose;
 pub mod line;
 pub mod report;
 pub mod snapshot;
 
+pub use command::{complete, help_lines, Kind, Suggestion, COMMANDS, REFERENCE};
 pub use compose::{
-    compose, Budget, Frame, Panel, View, DIAGNOSTIC_ROWS, HELP, MIN_BODY, REMEDY_ROWS,
-    STALL_AFTER_NS, STATUS_ROWS,
+    compose, Budget, Frame, Panel, View, DIAGNOSTIC_ROWS, MIN_BODY, REMEDY_ROWS, STALL_AFTER_NS,
+    STATUS_ROWS,
 };
 pub use line::{to_html, to_json, to_text, FrameCache, Line, RenderStats, Span, Style};
 pub use report::{parse_report, DaemonReport, Subscriber};

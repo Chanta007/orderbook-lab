@@ -362,6 +362,62 @@ class WebServer(unittest.TestCase):
         time.sleep(0.3)
         self.assertGreaterEqual(int(self.health()["refused"]), 1)
 
+    def complete(self, line: str) -> list[dict]:
+        import urllib.parse
+
+        status, body, _ = self.get("/complete?line=" + urllib.parse.quote(line))
+        self.assertEqual(status, 200, body)
+        return json.loads(body)["suggestions"]
+
+    def test_a_symbol_prefix_completes_from_the_shared_vocabulary(self) -> None:
+        # The same function the terminal's picker calls, so a prefix means the same
+        # thing in a browser and in a window. The catalog here is the repository's
+        # own `config/tickers.txt`.
+        got = self.complete("eth")
+        self.assertTrue(got, "no suggestions for a listed symbol")
+        self.assertEqual(got[0]["label"], "ETHUSDT")
+        self.assertEqual(got[0]["kind"], "symbol")
+        self.assertEqual(got[0]["insert"], "ETHUSDT")
+        self.assertTrue(got[0]["detail"], "a suggestion carries its explanation")
+
+    def test_a_command_prefix_completes_and_takes_a_space(self) -> None:
+        got = self.complete("bo")
+        labels = [s["label"] for s in got]
+        # Commands first, then the symbols that match: `bo` is also the start of
+        # BONKUSDT in the repository's catalog, and both are things you could mean.
+        self.assertEqual(labels[0], "book", "{labels}")
+        self.assertEqual(got[0]["kind"], "command")
+        self.assertEqual(got[0]["insert"], "book")
+        self.assertIn("BONKUSDT", labels)
+
+        levels = self.complete("lev")
+        self.assertEqual(levels[0]["insert"], "levels ", "so the argument comes next")
+
+    def test_an_argument_position_offers_symbols(self) -> None:
+        got = self.complete("only eth")
+        self.assertTrue(got)
+        self.assertEqual(got[0]["label"], "only ETHUSDT")
+        self.assertEqual(got[0]["insert"], "only ETHUSDT")
+
+    def test_the_three_times_are_commands_and_complete(self) -> None:
+        # They were in the reference from the start and the dispatcher answered them
+        # as symbols until the vocabulary cross-check found it.
+        got = self.complete("age")
+        self.assertEqual([s["label"] for s in got], ["age"])
+        rows = self.act("age")
+        joined = " ".join(rows)
+        self.assertIn("age:", joined, joined)
+        self.assertIn("applied a record", joined, joined)
+
+    def test_nothing_typed_and_nothing_matching_both_offer_nothing(self) -> None:
+        self.assertEqual(self.complete(""), [])
+        self.assertEqual(self.complete("zzzz"), [])
+
+    def test_the_limit_is_a_parameter(self) -> None:
+        status, body, _ = self.get("/complete?line=e&limit=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(json.loads(body)["suggestions"]), 2)
+
     def test_an_unknown_path_is_a_404_and_a_get_cannot_run_a_command(self) -> None:
         status, _, _ = self.get("/nope")
         self.assertEqual(status, 404)

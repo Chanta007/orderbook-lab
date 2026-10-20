@@ -50,6 +50,8 @@ pub enum Action {
     Panel(Panel),
     /// Show or hide the command reference.
     ToggleHelp,
+    /// Explain one of the three times in the header, with its current value.
+    Explain(ob_view::command::Explain),
 }
 
 /// Act on a submitted line.
@@ -74,6 +76,11 @@ pub fn act(text: &str, catalog: &Catalog, watch: &mut Watch, watch_path: &Path) 
     }
     if line == "book" {
         return Action::Panel(Panel::Book);
+    }
+    // The three times in the header, asked about: they were in the reference from the
+    // start and were answered as symbols until the vocabulary cross-check found it.
+    if let Some(topic) = ob_view::command::Explain::of(line) {
+        return Action::Explain(topic);
     }
     if let Some(n) = parse_levels(line) {
         return Action::Depth(n);
@@ -260,6 +267,62 @@ pub const LEVELS_MAX: usize = 64;
 
 #[cfg(test)]
 mod tests {
+    /// Every command the reference offers is one the dispatcher accepts.
+    ///
+    /// The reference, the terminal's picker and the page's dropdown are all built
+    /// from `ob_view::COMMANDS`, and this is the other direction: a command added to
+    /// that list and not to the dispatcher would be offered by every frontend and
+    /// refused by the thing that runs it. The refusal is a `Note` that says so, which
+    /// is what this looks for.
+    #[test]
+    fn every_command_in_the_vocabulary_is_one_the_dispatcher_accepts() {
+        let dir = std::env::temp_dir().join(format!("ob-vocab-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("watch.txt");
+        let catalog = repo_catalog();
+        for command in ob_view::COMMANDS {
+            let line = match command.takes {
+                ob_view::command::Takes::None => command.name.to_string(),
+                ob_view::command::Takes::Symbol => format!("{} ETHUSDT", command.name),
+                ob_view::command::Takes::Number => format!("{} 3", command.name),
+            };
+            let mut watch = watch_at(&path).0;
+            let action = act(&line, &catalog, &mut watch, &path);
+            if let Action::Note(text) = &action {
+                assert!(
+                    !text.contains("is not a command")
+                        && !text.contains("not in config/tickers.txt"),
+                    "the reference offers `{line}` and the dispatcher refuses it: {text}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And every alias the reference shows is one the dispatcher answers to.
+    #[test]
+    fn every_alias_in_the_vocabulary_works() {
+        let dir = std::env::temp_dir().join(format!("ob-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("watch.txt");
+        let catalog = repo_catalog();
+        for command in ob_view::COMMANDS {
+            for alias in command.aliases {
+                let mut watch = watch_at(&path).0;
+                let action = act(alias, &catalog, &mut watch, &path);
+                if let Action::Note(text) = &action {
+                    assert!(
+                        !text.contains("is not a command"),
+                        "the reference shows `{alias}` for {} and the dispatcher does \
+                         not know it: {text}",
+                        command.name
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use std::path::PathBuf;
 

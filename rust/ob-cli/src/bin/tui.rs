@@ -75,7 +75,7 @@
 
 use ob::book::Book;
 use ob::ring::RingReader;
-use ob_cli::actions::{act, first_token, Action, SUGGESTIONS};
+use ob_cli::actions::{act, Action, SUGGESTIONS};
 use ob_cli::screen;
 use ob_cli::tickers::Catalog;
 use ob_cli::watch::Watch;
@@ -459,12 +459,15 @@ fn run() -> CliResult {
             let pending = guard.pending.take();
             (guard.line.clone(), guard.highlighted, pending)
         };
+        // One completion, shared with the browser's dropdown: the commands and the
+        // symbols, in the order the catalog would match them. The terminal used to
+        // offer symbols only, so `bo` had to be typed in full.
+        let suggestions = ob_view::complete(&line, catalog.symbols(), SUGGESTIONS);
         if let Some(command) = pending {
             match command {
                 Command::MoveHighlight(delta) => {
-                    let matches = catalog.suggest(&first_token(&line), SUGGESTIONS);
-                    if !matches.is_empty() {
-                        let n = matches.len() as isize;
+                    if !suggestions.is_empty() {
+                        let n = suggestions.len() as isize;
                         let next = (highlighted as isize + delta).rem_euclid(n);
                         if let Ok(mut guard) = input.lock() {
                             guard.highlighted = next as usize;
@@ -472,9 +475,17 @@ fn run() -> CliResult {
                     }
                 }
                 Command::Complete => {
-                    if let Some(best) = catalog.complete(&first_token(&line)) {
+                    // Tab inserts the highlighted entry rather than the best guess:
+                    // a prefix with several matches is only reachable if the arrows
+                    // and Tab agree about which one is selected. A shell does the
+                    // same, and so does the page's dropdown.
+                    if let Some(best) = suggestions
+                        .get(highlighted)
+                        .or_else(|| suggestions.first())
+                        .cloned()
+                    {
                         if let Ok(mut guard) = input.lock() {
-                            guard.line = best.to_string();
+                            guard.line = best.insert;
                             guard.highlighted = 0;
                         }
                     }
@@ -482,6 +493,9 @@ fn run() -> CliResult {
                 Command::Submit(text) => {
                     match act(&text, &catalog, &mut watch, &watch_path) {
                         Action::Quit => break,
+                        Action::Explain(topic) => {
+                            window.status = topic.render(&window.times(&ring));
+                        }
                         Action::Depth(n) => {
                             window.levels = n;
                             level_count.store(n, Ordering::Relaxed);
@@ -578,7 +592,6 @@ fn run() -> CliResult {
         // lines that changed. The composition is pure, so what the frame says is
         // decided here and drawn by `ob-view`, which is what lets the same frame be
         // a terminal, a page or a JSON document.
-        let suggestions = catalog.suggest(&first_token(&line), SUGGESTIONS);
         window.daemon.poll();
         window.ticks.fold_if_due();
         let adapter = adapter_state(&heartbeat_path);

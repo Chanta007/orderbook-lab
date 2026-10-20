@@ -113,27 +113,14 @@ impl Frame {
     }
 }
 
-/// The reference shown by `help`, below the prompt.
+/// How many rows the reference may take.
 ///
-/// One line per command, in the order a person needs them: leaving first, then the
-/// two commands that change what the window shows, then the rest. It lives here
-/// rather than in the terminal binary because the web frontend shows the same
-/// reference, and two copies of it would drift.
-pub const HELP: [&str; 13] = [
-    "  q | quit        leave this window",
-    "  help | ?        show or hide this reference",
-    "  status          the feed, the queues and the ticks, as a dashboard",
-    "  book            back to the price table",
-    "  levels N        show N price levels, from 1 to 64",
-    "  SYMBOL          switch and watch; a unique prefix works; Tab, then arrows",
-    "  Escape          clear what you have typed",
-    "  watch           list what is being watched",
-    "  only SYMBOL     watch just that one",
-    "  unwatch SYMBOL  stop watching one",
-    "  lag             records behind you, and the span of feed time that is",
-    "  staleness       how old the newest published record is",
-    "  age             how long since this window applied a record",
-];
+/// Its length is the vocabulary's, not a constant: a command added to
+/// [`crate::command::COMMANDS`] lengthens the reference, and a window with no room
+/// shows the head of it. Fourteen today.
+pub fn reference_len() -> usize {
+    crate::command::REFERENCE.len()
+}
 
 /// Compose one frame.
 pub fn compose(snapshot: &Snapshot, view: &View, budget: Budget) -> Frame {
@@ -183,9 +170,9 @@ pub fn compose(snapshot: &Snapshot, view: &View, budget: Budget) -> Frame {
     remaining = remaining.saturating_sub(picker.len());
 
     let mut help: Vec<Line> = if view.help {
-        HELP.iter()
+        crate::command::help_lines()
+            .into_iter()
             .take(remaining.saturating_sub(1))
-            .map(|l| help_line(l))
             .collect()
     } else {
         Vec::new()
@@ -712,27 +699,24 @@ fn picker_lines(snapshot: &Snapshot, remaining: usize, cols: usize) -> Vec<Line>
     }
     let room = remaining.saturating_sub(MIN_BODY);
     let shown = snapshot.suggestions.len().min(8).min(room);
+    let selected = snapshot.highlighted.min(shown.saturating_sub(1));
     let mut out = Vec::with_capacity(shown);
-    for (i, symbol) in snapshot.suggestions.iter().take(shown).enumerate() {
-        let style = if i == snapshot.highlighted.min(shown.saturating_sub(1)) {
-            Style::Bold
-        } else {
-            Style::Dim
-        };
-        out.push(Line::new().with(Span::new(
-            truncate(
-                &format!(
-                    "  {}{symbol}",
-                    if i == snapshot.highlighted.min(shown.saturating_sub(1)) {
-                        "> "
-                    } else {
-                        "  "
-                    }
-                ),
-                cols,
-            ),
-            style,
-        )));
+    for (i, suggestion) in snapshot.suggestions.iter().take(shown).enumerate() {
+        let chosen = i == selected;
+        let label = format!("  {}{}", if chosen { "> " } else { "  " }, suggestion.label);
+        // The detail is what the entry means, so a list of symbols and a list of
+        // commands are told apart without a second column of type names.
+        let detail = format!("  {}", suggestion.detail);
+        let mut line = Line::new()
+            .with(Span::new(
+                label,
+                if chosen { Style::Bold } else { Style::Dim },
+            ))
+            .with(Span::new(detail, Style::Dim));
+        if line.width() > cols {
+            line = line.truncated(cols);
+        }
+        out.push(line);
     }
     out
 }
@@ -753,22 +737,6 @@ fn prompt(snapshot: &Snapshot) -> Line {
                 Style::Dim,
             )),
     }
-}
-
-fn help_line(text: &str) -> Line {
-    // The command name is the first two words after the two-space indent; the
-    // rest is the description. Colouring them apart is what makes thirteen lines
-    // scannable rather than a paragraph.
-    let trimmed = text.trim_start();
-    let indent = text.len() - trimmed.len();
-    let (cmd, rest) = match trimmed.find("  ") {
-        Some(at) => (&trimmed[..at], &trimmed[at..]),
-        None => (trimmed, ""),
-    };
-    Line::new()
-        .with(Span::plain(" ".repeat(indent)))
-        .with(Span::new(cmd.to_string(), Style::Accent))
-        .with(Span::new(rest.to_string(), Style::Dim))
 }
 
 /// A rate, in the units a rate is read in.
@@ -852,7 +820,11 @@ mod tests {
         for rows in [4, 5, 8, 12, 24, 60] {
             for help in [false, true] {
                 let mut s = snapshot();
-                s.suggestions = vec!["ETHUSDT".into(), "ETCUSDT".into()];
+                s.suggestions = crate::command::complete(
+                    "et",
+                    &["ETHUSDT".to_string(), "ETCUSDT".to_string()],
+                    8,
+                );
                 s.input = "ET".into();
                 s.levels = 40;
                 let view = View {
@@ -902,7 +874,7 @@ mod tests {
             help_at > prompt_at,
             "the reference is below the prompt: prompt {prompt_at}, reference {help_at}"
         );
-        assert!(text[help_at].contains("q | quit"));
+        assert!(text[help_at].contains("quit | q"), "{}", text[help_at]);
     }
 
     #[test]
@@ -1104,7 +1076,14 @@ mod tests {
     fn the_picker_never_takes_the_body_s_room() {
         let mut s = snapshot();
         s.input = "e".into();
-        s.suggestions = (0..8).map(|i| format!("E{i}USDT")).collect();
+        s.suggestions = (0..8)
+            .map(|i| crate::command::Suggestion {
+                label: format!("E{i}USDT"),
+                insert: format!("E{i}USDT"),
+                kind: crate::command::Kind::Symbol,
+                detail: "switch to it and watch it".to_string(),
+            })
+            .collect();
         let frame = compose(&s, &View::default(), Budget { rows: 10, cols: 60 });
         let joined = frame
             .lines
