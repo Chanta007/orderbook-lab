@@ -173,7 +173,11 @@ depends on another process — the daemon accepting a socket and publishing reco
 restarted feed coming back. Both now drain until the condition holds, with the deadline
 as a bound rather than as the wait: a fixed window is a test that measures the machine
 rather than the program. The same rule applies to the `view` test, which normalises
-durations away including their unit — `843ns` and `1.234us` are the same frame.
+durations away including their unit — `843ns` and `1.234us` are the same frame. And a
+third failure came from the other direction: `the_shipped_files_load_from_disk` reads
+`ORDERBOOK_ALLOW_PROD` and then calls a loader that reads it again, while another test
+sets and removes that variable — Rust runs tests in parallel threads, so the two reads
+can disagree. The three tests that touch the variable share a mutex (OPT-052).
 
 The tests that matter most are the ones about *fitting*: a frame that writes one row
 past the bottom of the terminal scrolls it, and a scrolled screen makes every later

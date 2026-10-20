@@ -367,8 +367,26 @@ mod tests {
         assert_eq!(c.ring_capacity, crate::ring::DEFAULT_CAPACITY);
     }
 
+    /// Serialises the tests that read or write `ALLOW_PROD_ENV`.
+    ///
+    /// `set_var` changes the whole process, and Rust runs tests in parallel threads:
+    /// a test that sets the variable while another is deciding whether a prod config
+    /// should load makes an assertion that contradicts itself. It did, in CI — the
+    /// variable was read by the assertion and read again by the loader underneath it,
+    /// and a flip in between made `true == false` in a test that had passed a minute
+    /// earlier. The lock is what makes "the environment" something these three tests
+    /// can reason about.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The lock, ignoring poisoning: a test that panicked while holding it has
+    /// already reported, and the next one should still run.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn a_prod_config_is_refused_without_the_environment_variable() {
+        let _env = env_lock();
         // The test process does not set it; if the surrounding environment does,
         // the assertion below is the other branch and both are correct.
         let allowed = std::env::var(ALLOW_PROD_ENV).as_deref() == Ok("1");
@@ -465,6 +483,9 @@ mod tests {
         );
         // The shipped prod config's bus is in var/prod, so its watch file is too.
         let prod = r#"{"env": "prod", "bus_path": "var/prod/bus"}"#;
+        // Held across the set, the parse and the removal, so no other test can see
+        // the variable set or unset halfway through.
+        let _env = env_lock();
         std::env::set_var(ALLOW_PROD_ENV, "1");
         let parsed = Config::from_str(prod).expect("prod");
         std::env::remove_var(ALLOW_PROD_ENV);
@@ -520,6 +541,10 @@ mod tests {
 
     #[test]
     fn the_shipped_files_load_from_disk() {
+        // Held because the prod branch below reads the environment twice: once to
+        // decide what to expect and once inside the loader. Without the lock, a test
+        // that sets the variable in between makes the two answers disagree.
+        let _env = env_lock();
         // The test runs from the workspace root, where `config/` lives.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
