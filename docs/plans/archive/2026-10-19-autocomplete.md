@@ -1,8 +1,8 @@
 ## PR Metadata
 
 - **Type**: feat
-- **PRs**: (filled in after the merge)
-- **Merge commits**: (filled in after the merge)
+- **PRs**: #29
+- **Merge commits**: `9034b073`
 - **Research**: three searches on the interaction rather than the code — the W3C ARIA combobox pattern (roles, `aria-activedescendant`, and what Tab/Escape/Enter each mean), the debounce-plus-`AbortController` rule for server-side completion, and the shell completion conventions (Tab inserts the highlighted entry, Enter runs the line).
 - **Research summary**: the pattern and the shell agree on everything except Tab, which the pattern sends to the next control and a shell uses to complete. The page has one focusable control, so Tab completes — a deliberate, documented deviation. The debounce rule is "both, not either": a pause before the request *and* abort the in-flight one, because debouncing alone lets a slow answer overwrite a newer one.
 - **Evidence**: `make test`, `rust-test`, `view-check`, `web-check` all PASS under `set -e -o pipefail`; 14 socket tests (six about completion), 9 browser tests (four about the dropdown), and a pty test that completes a command with Tab in the terminal.
@@ -21,7 +21,7 @@
 | Branch | feature/autocomplete |
 | Worktree | .claude/worktrees/autocomplete |
 | Design docs | docs/design/view-layer.md |
-| PR | (filled in after the merge) |
+| PR | #29, merged as `9034b073` |
 | Goal | smartdeploy-to-dev (ship to dev directly approved by the user this turn) |
 
 ## Context
