@@ -102,7 +102,11 @@ make web                       # a feed, then the page on http://127.0.0.1:9002/
 ![the web frontend](docs/images/web-frontend.png)
 
 The page is the frame the terminal draws — same header, same times, same book, same
-dashboard behind `status` — with an input bar where the prompt row would be. It streams
+dashboard behind `status` — with an input bar where the prompt row would be. Typing
+opens a dropdown of what the line could become: symbols, commands, and the arguments a
+command takes, completed by the same function the terminal's picker uses. Tab inserts
+the highlighted entry, the arrows move the highlight, Escape closes the list, Enter
+runs the line, and clicking an entry inserts and runs it. It streams
 over server-sent events, one frame every 100 ms, and each viewer has a queue of one
 frame: a viewer that falls behind loses frames rather than delaying the feed. `make web
 WEB_PORT=9003` serves a second one, and `docs/runbooks/web-frontend.md` is what to

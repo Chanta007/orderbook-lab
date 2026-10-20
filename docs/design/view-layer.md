@@ -203,6 +203,7 @@ browser, with an input bar where the prompt row would be.
 | `/` | GET | the page: a `<pre>` region, a prompt input, and the stylesheet inline |
 | `/events` | GET | the frame stream, as SSE, one event per composed frame |
 | `/act?cmd=…` | POST | run a command through the shared dispatcher, reply with the next frame |
+| `/complete?line=…&limit=…` | GET | what the line could become, from the same completion the terminal's picker uses |
 
 Decisions, each argued in the research record:
 
@@ -222,6 +223,16 @@ Decisions, each argued in the research record:
 - **Cadence.** Frames are composed at the same 10 Hz the terminal uses, and the page
   flushes on `requestAnimationFrame`, which the sources give as the client-side
   rule (the perception floor for a live number is ~200 ms).
+- **The completion is the server's, and it is debounced and aborted.** Typing pauses
+  for 120 ms, then one `GET /complete`; the in-flight request is aborted when the line
+  moves on, because debouncing alone lets a slow answer overwrite a newer one. The
+  interaction is the shell's — Tab inserts the highlighted entry, the arrows move the
+  highlight, Escape closes the list and then clears the line, Enter runs the line, a
+  click inserts and runs — with the ARIA combobox roles the pattern calls for
+  (`role="combobox"`, `aria-expanded`, `aria-activedescendant`, a listbox of options).
+  Tab completing rather than moving focus is a deliberate deviation from the pattern:
+  the bar is the page's only focusable control, so there is nowhere to tab to, and the
+  convention for a line you type is a shell's.
 - **The server binds `127.0.0.1` only** and has no authentication, matching the rest
   of the lab; `docs/design/security.md` §2 is the reason it refuses anything else.
 

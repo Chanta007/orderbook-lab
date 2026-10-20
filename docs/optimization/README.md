@@ -169,6 +169,14 @@ consumer assumes.**
 |----|---------|--------|
 | OPT-047 | Every rust target in the Makefile called bare `cargo`, while `obctl` had resolved the tool since OPT-030: a shell that predates the `~/.cargo/env` line saw `cargo: command not found` from `make rust-build` and a working `make rust-start`. The Makefile now resolves it the same way and a `check-cargo` prerequisite says where it looked and what to do. | A tool resolution fixed in one place is fixed in one place. When a lookup is added for a tool, grep for every other caller of that tool in the same commit — the failure survived the first fix by moving to the entry point a person is more likely to use. |
 
+### Completion
+
+| id | Finding | Lesson |
+|----|---------|--------|
+| OPT-049 | The reference, the terminal's picker and the browser's input were three lists of what can be typed. There is one vocabulary now, and the reference, the picker, the dropdown and the terminal's Tab are all built from it; the page asks the server (`GET /complete`) rather than completing in JavaScript. The dropdown lists what the reference lists, in the reference's order. | One vocabulary, one order. A completion that answers a prefix with an entry the reference lists twelfth makes Tab and the reference disagree about the same keystroke. Completion over the wire costs a loopback round trip and buys the property that a prefix means the same thing everywhere. |
+| OPT-050 | `lag`, `staleness` and `age` were in the reference for days and the dispatcher answered them as symbols: `AGE is not in config/tickers.txt`. They are commands now, and a cross-check test walks the reference and asks the dispatcher about every entry — it found the three on its first run. | A list of commands in a document is a promise, and nothing was checking it. The test that makes the class impossible is one that walks the list and asks the thing that implements it. |
+| OPT-051 | Clicking a suggestion filled the line in and ran nothing: the handler read the text after the call that empties the list. | Two input paths into one action need two tests. The keyboard path passed while the pointer path silently did nothing, and a mouse is how most people will use a dropdown. |
+
 ### Verification habits
 
 | id | Finding | Lesson |

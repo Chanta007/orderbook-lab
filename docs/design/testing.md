@@ -208,6 +208,11 @@ that typing a command into the input and pressing Enter changes the view, that
 `?cmd=status` runs a command on load, and that a screenshot is a real image — which is
 saved for a person to look at.
 
+Four of the browser tests are about the completion, because a dropdown has two input
+paths — a keyboard and a pointer — and two paths into one action need two tests: the
+click test found a handler reading a value after the call that cleared it, while the
+keyboard path was passing (OPT-051).
+
 That last file found three defects a socket-level test could not see, which is the
 argument for having it: the frame carried a `stdin is not a terminal` prompt row into
 the browser, the page counted the frames published before it connected as dropped, and
