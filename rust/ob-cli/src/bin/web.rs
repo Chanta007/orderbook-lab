@@ -123,7 +123,10 @@ fn run() -> CliResult {
         );
     }
 
-    let app = Arc::new(App::new());
+    // The symbols the completion may offer come from the catalog the daemon watches,
+    // read once: a completion that re-read the file per keystroke would be a
+    // completion with a file read in it.
+    let app = Arc::new(App::new().with_symbols(catalog.symbols().to_vec()));
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let server = Server::bind(addr, Arc::clone(&app)).map_err(|e| {
         CliError::failed(format!(
@@ -242,6 +245,9 @@ fn apply(
                     "status: the feed, the queues, the consumers and the ticks".to_string()
                 }
             };
+        }
+        Action::Explain(topic) => {
+            window.status = topic.render(&window.times(ring));
         }
         Action::ToggleHelp => {
             window.view.help = !window.view.help;

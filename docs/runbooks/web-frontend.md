@@ -64,6 +64,24 @@ More than 32 connections are being served. Each viewer is one connection, so thi
 than queueing, so that a misbehaving client cannot make it allocate threads without
 limit; the counters in `/health` say how many were refused.
 
+### The dropdown does not appear
+
+Typing in the bar asks the server (`GET /complete?line=…`). If the list never opens,
+check the endpoint by hand:
+
+```bash
+curl -s 'http://127.0.0.1:9002/complete?line=eth' | head -c 200
+```
+
+An empty `{"suggestions":[]}` for a symbol that is listed means the catalog the server
+loaded is not the one you think: it is `config/tickers.txt` from the directory the
+server was started in, and it is read once at startup, so a symbol added to the file
+needs a restart. A `404` means an older binary: the endpoint arrived with the
+completion, and `make rust-build` is what puts it there.
+
+The list is deliberately absent for an empty line, for `levels` after the space (a
+number is typed, not chosen), and for anything no entry starts with.
+
 ### The counters say frames are being dropped
 
 `dropped` in `/health`, or `N dropped` in the page's status line, means a viewer was

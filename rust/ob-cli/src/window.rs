@@ -145,8 +145,8 @@ pub struct Window {
 pub struct Prompt<'a> {
     /// What has been typed and not submitted.
     pub line: &'a str,
-    /// What the picker is offering.
-    pub suggestions: &'a [&'a str],
+    /// What the picker is offering, from the shared completion.
+    pub suggestions: &'a [ob_view::Suggestion],
     /// Which suggestion is highlighted.
     pub highlighted: usize,
     /// Where the person reading this frame types.
@@ -214,6 +214,20 @@ impl Window {
         n
     }
 
+    /// The three times, as the explanation needs them.
+    pub fn times(&self, ring: &RingReader) -> ob_view::command::Times {
+        ob_view::command::Times {
+            lag: ring.lag(self.cursor),
+            backlog_ns: backlog_ns(ring, self.cursor),
+            staleness_ns: staleness_ns(ring),
+            age_ns: self
+                .last_record
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64,
+        }
+    }
+
     /// Compose everything this frame needs into a snapshot.
     #[allow(clippy::too_many_arguments)]
     pub fn snapshot(
@@ -275,11 +289,7 @@ impl Window {
             daemon_log: self.daemon.path().display().to_string(),
             status: self.status.clone(),
             input: prompt.line.to_string(),
-            suggestions: prompt
-                .suggestions
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect(),
+            suggestions: prompt.suggestions.to_vec(),
             highlighted: prompt.highlighted,
             input_mode: prompt.input_mode,
         }

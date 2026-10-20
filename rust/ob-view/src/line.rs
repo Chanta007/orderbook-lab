@@ -390,7 +390,7 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn escape_json(text: &str, out: &mut String) {
+pub(crate) fn escape_json(text: &str, out: &mut String) {
     for c in text.chars() {
         match c {
             '"' => out.push_str("\\\""),

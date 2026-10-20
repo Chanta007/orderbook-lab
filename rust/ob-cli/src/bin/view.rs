@@ -166,6 +166,9 @@ fn run() -> CliResult {
             Action::Quit => return Ok(()),
             Action::Panel(panel) => window.view.panel = panel,
             Action::ToggleHelp => window.view.help = !window.view.help,
+            Action::Explain(topic) => {
+                window.status = topic.render(&window.times(&ring));
+            }
             Action::Depth(n) => window.levels = n,
             Action::Switched { symbol, .. } => {
                 window.displayed = symbol;
@@ -254,7 +257,7 @@ fn bench(
     // number covers the widest frame this program can produce.
     let prompt = Prompt {
         line: "eth",
-        suggestions: &["ETHUSDT", "ETCUSDT"],
+        suggestions: &[],
         highlighted: 0,
         input_mode: ob_view::InputMode::Local,
     };
@@ -333,6 +336,7 @@ fn dispatch(
         Action::Panel(Panel::Book) => "the price table".to_string(),
         Action::Panel(Panel::Status) => "the status panel".to_string(),
         Action::ToggleHelp => "the command reference".to_string(),
+        Action::Explain(topic) => format!("{} explained in the status line", topic.name()),
         Action::Quit => String::new(),
     };
     Ok((action, note))

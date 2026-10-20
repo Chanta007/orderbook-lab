@@ -109,30 +109,19 @@ impl Catalog {
     /// and substring second, so `ET` offers `ETCUSDT` before `BETACOIN`, and ties
     /// keep the file's order.
     pub fn suggest(&self, query: &str, limit: usize) -> Vec<&str> {
-        let query = query.trim().to_ascii_uppercase();
-        if query.is_empty() {
-            return self
-                .symbols
-                .iter()
-                .take(limit)
-                .map(String::as_str)
-                .collect();
-        }
-        let mut prefix = Vec::new();
-        let mut interior = Vec::new();
-        for symbol in &self.symbols {
-            if symbol.starts_with(&query) {
-                prefix.push(symbol.as_str());
-            } else if symbol.contains(&query) {
-                interior.push(symbol.as_str());
-            }
-            if prefix.len() >= limit {
-                break;
+        // The matcher lives in `ob_view::command`, because the browser's dropdown
+        // needs the same order the terminal's picker shows: a symbol that starts with
+        // what was typed before one that merely contains it, ties in file order. Two
+        // implementations of that rule would be two answers to "which symbol did you
+        // mean", and the frontends would disagree about the same keystroke.
+        let matched = ob_view::command::match_symbols(&self.symbols, query, limit);
+        let mut out: Vec<&str> = Vec::with_capacity(matched.len());
+        for symbol in matched {
+            if let Some(found) = self.symbols.iter().find(|s| **s == symbol) {
+                out.push(found.as_str());
             }
         }
-        prefix.extend(interior);
-        prefix.truncate(limit);
-        prefix
+        out
     }
 
     /// The single best completion for what has been typed, for the Tab key.

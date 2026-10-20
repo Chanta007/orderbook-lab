@@ -437,6 +437,135 @@ class WebBrowser(unittest.TestCase):
             f"?cmd=status did not run: {self.screen_text()[:300]!r}",
         )
 
+    def type_line(self, text: str) -> None:
+        """Put `text` in the input the way typing does, and let the page react."""
+        self.evaluate(
+            "(() => { const i = document.getElementById('cmd');"
+            f" i.focus(); i.value = {json.dumps(text)};"
+            " i.dispatchEvent(new Event('input', {bubbles: true})); })()"
+        )
+
+    def press(self, key: str) -> None:
+        """One key, as the browser delivers it."""
+        self.evaluate(
+            "document.getElementById('cmd')"
+            f".dispatchEvent(new KeyboardEvent('keydown', {{key: {json.dumps(key)}, bubbles: true}}))"
+        )
+
+    def labels_in_the_dropdown(self) -> list[str]:
+        return (
+            self.evaluate(
+                "Array.from(document.querySelectorAll('#list li .label'))"
+                ".map((e) => e.textContent)"
+            )
+            or []
+        )
+
+    def test_typing_a_symbol_shows_a_dropdown_and_tab_completes_it(self) -> None:
+        # The completion comes from the server, which runs the same function the
+        # terminal's picker runs. This is the whole path: a keystroke, the round trip,
+        # the list, Tab, Enter, and a frame that changed.
+        self.navigate(f"http://127.0.0.1:{self.web_port}/")
+        self.assertTrue(self.wait_until("document.querySelectorAll('#screen .row').length > 5"))
+        self.type_line("eth")
+        self.assertTrue(
+            self.wait_until("!document.getElementById('list').hidden"),
+            "typing a prefix did not open the dropdown",
+        )
+        labels = self.labels_in_the_dropdown()
+        self.assertIn("ETHUSDT", labels, f"the dropdown offers {labels}")
+        # The ARIA wiring the pattern calls for: the input says the list is open and
+        # which option is active, and the list is a listbox of options.
+        self.assertEqual(self.evaluate("document.getElementById('cmd').getAttribute('aria-expanded')"), "true")
+        self.assertIn(
+            self.evaluate("document.getElementById('cmd').getAttribute('aria-activedescendant')"),
+            self.evaluate("Array.from(document.querySelectorAll('#list li')).map((e) => e.id)"),
+        )
+
+        self.press("Tab")
+        self.assertEqual(
+            self.evaluate("document.getElementById('cmd').value"),
+            "ETHUSDT",
+            "Tab did not insert the highlighted entry",
+        )
+        self.assertTrue(self.evaluate("document.getElementById('list').hidden"), "and closed the list")
+
+        self.press("Enter")
+        self.assertTrue(
+            self.wait_until("document.getElementById('screen').innerText.includes('ETHUSDT')"),
+            f"the switch did not happen: {self.screen_text()[:200]!r}",
+        )
+        header = self.screen_text().split("\n")[0]
+        self.assertIn("ETHUSDT", header)
+        self.assertIn("watching 2", header, "switching watches the new symbol too")
+
+    def test_a_command_prefix_completes_the_same_way(self) -> None:
+        # Commands and symbols are one vocabulary, so `sta` completes to `status` and
+        # the frame becomes the dashboard.
+        self.navigate(f"http://127.0.0.1:{self.web_port}/")
+        self.assertTrue(self.wait_until("document.querySelectorAll('#screen .row').length > 5"))
+        self.type_line("sta")
+        self.assertTrue(self.wait_until("!document.getElementById('list').hidden"))
+        self.assertIn("status", self.labels_in_the_dropdown())
+        self.press("Tab")
+        self.assertEqual(self.evaluate("document.getElementById('cmd').value"), "status")
+        self.press("Enter")
+        self.assertTrue(
+            self.wait_until("document.getElementById('screen').innerText.includes('slots,')"),
+            f"`status` from the dropdown did not run: {self.screen_text()[:200]!r}",
+        )
+
+    def test_the_arrows_move_the_highlight_and_escape_closes_the_list(self) -> None:
+        self.navigate(f"http://127.0.0.1:{self.web_port}/")
+        self.assertTrue(self.wait_until("document.querySelectorAll('#screen .row').length > 5"))
+        self.type_line("e")
+        self.assertTrue(self.wait_until("document.querySelectorAll('#list li').length > 1"))
+        first = self.evaluate(
+            "document.querySelector('#list li[aria-selected=\"true\"] .label').textContent"
+        )
+        self.press("ArrowDown")
+        second = self.evaluate(
+            "document.querySelector('#list li[aria-selected=\"true\"] .label').textContent"
+        )
+        self.assertNotEqual(first, second, "the arrow did not move the highlight")
+        self.assertEqual(
+            self.evaluate(
+                "document.getElementById('cmd').getAttribute('aria-activedescendant')"
+            ),
+            self.evaluate(
+                "document.querySelector('#list li[aria-selected=\"true\"]').id"
+            ),
+            "the input points at the highlighted option",
+        )
+
+        self.press("Escape")
+        self.assertTrue(self.evaluate("document.getElementById('list').hidden"))
+        self.assertEqual(
+            self.evaluate("document.getElementById('cmd').value"),
+            "e",
+            "the first Escape closes the list and keeps what was typed",
+        )
+        self.press("Escape")
+        self.assertEqual(
+            self.evaluate("document.getElementById('cmd').value"),
+            "",
+            "the second clears the line, as it does in the terminal",
+        )
+
+    def test_clicking_a_suggestion_runs_it(self) -> None:
+        # The web affordance: a suggestion in a page is a button, so clicking it does
+        # the thing rather than only filling the line in.
+        self.navigate(f"http://127.0.0.1:{self.web_port}/")
+        self.assertTrue(self.wait_until("document.querySelectorAll('#screen .row').length > 5"))
+        self.type_line("eth")
+        self.assertTrue(self.wait_until("document.querySelectorAll('#list li').length > 0"))
+        self.evaluate("document.querySelector('#list li').click()")
+        self.assertTrue(
+            self.wait_until("document.getElementById('screen').innerText.includes('ETHUSDT')"),
+            f"clicking did not switch: {self.screen_text()[:200]!r}",
+        )
+        self.assertTrue(self.evaluate("document.getElementById('list').hidden"))
+
     def test_a_screenshot_of_the_page_is_a_real_image(self) -> None:
         # Not an assertion about pixels — an assertion that the page is a page: a
         # blank or single-colour shot means the script threw or the styles did not
