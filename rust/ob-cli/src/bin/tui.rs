@@ -374,18 +374,30 @@ struct Input {
     /// Which suggestion is highlighted.
     highlighted: usize,
     /// A request from the input thread for the loop to act on.
-    pending: Option<Command>,
+    pending: Vec<Command>,
 }
 
-/// A command the input thread parsed, to be run by the draw loop.
+/// One key, as an event for the frame loop to apply.
 ///
-/// The thread that reads keystrokes does not touch the book or the watch file: it
-/// records an intent and the loop performs it. One thread owns the state, which is
-/// why none of it needs a lock beyond the small one around this struct.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The thread that reads keystrokes does not touch the book, the watch file or the
+/// line: it queues an event and the loop applies it. One thread owns the state, which
+/// is why none of it needs a lock beyond the small one around this struct.
+///
+/// The reader queues these and the loop applies them in order, rather than each
+/// thread writing the line. Two writers of one string cannot preserve an order that
+/// matters: `sta`, Tab and Enter in one burst arrived as a line the reader had already
+/// finished editing plus two actions, so the completion was applied to the wrong text
+/// or dropped entirely. As events, the sequence is exactly what was typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
-    /// A line the user submitted.
-    Submit(String),
+    /// A character to append.
+    Type(char),
+    /// Remove the last character.
+    Backspace,
+    /// Forget the line.
+    ClearLine,
+    /// Submit what is in the box now.
+    Submit,
     /// Replace the line with the completion of what is on it.
     Complete,
     /// Move the highlight by this much, wrapping.
@@ -452,25 +464,45 @@ fn run() -> CliResult {
     let mut screen = stdout.lock();
     while RUNNING.load(Ordering::Relaxed) {
         // Take whatever the input thread has asked for.
-        let (line, highlighted, pending) = {
+        let (mut line, mut highlighted, pending) = {
             let mut guard = input.lock().map_err(|_| {
                 CliError::failed("the input lock was poisoned by a panic in the reader")
             })?;
-            let pending = guard.pending.take();
+            let pending = std::mem::take(&mut guard.pending);
             (guard.line.clone(), guard.highlighted, pending)
         };
-        // One completion, shared with the browser's dropdown: the commands and the
-        // symbols, in the order the catalog would match them. The terminal used to
-        // offer symbols only, so `bo` had to be typed in full.
-        let suggestions = ob_view::complete(&line, catalog.symbols(), SUGGESTIONS);
-        if let Some(command) = pending {
+        // A queue, applied in order. A burst of bytes — a paste, or Tab and Enter
+        // pressed faster than a frame — used to keep only its last action, so a
+        // completion was silently dropped by the submission behind it.
+        //
+        // `quit` is a flag rather than a `break` inside an arm: an arm is now inside
+        // this `for`, so a `break` there would leave the frame loop running and the
+        // window would never close.
+        let mut quitting = false;
+        for command in pending {
             match command {
+                Command::Type(c) => {
+                    if line.chars().count() < INPUT_LIMIT {
+                        line.push(c);
+                        highlighted = 0;
+                    }
+                }
+                Command::Backspace => {
+                    line.pop();
+                    highlighted = 0;
+                }
+                Command::ClearLine => {
+                    line.clear();
+                    highlighted = 0;
+                }
                 Command::MoveHighlight(delta) => {
+                    let suggestions = ob_view::complete(&line, catalog.symbols(), SUGGESTIONS);
                     if !suggestions.is_empty() {
                         let n = suggestions.len() as isize;
                         let next = (highlighted as isize + delta).rem_euclid(n);
+                        highlighted = next as usize;
                         if let Ok(mut guard) = input.lock() {
-                            guard.highlighted = next as usize;
+                            guard.highlighted = highlighted;
                         }
                     }
                 }
@@ -479,20 +511,35 @@ fn run() -> CliResult {
                     // a prefix with several matches is only reachable if the arrows
                     // and Tab agree about which one is selected. A shell does the
                     // same, and so does the page's dropdown.
+                    let suggestions = ob_view::complete(&line, catalog.symbols(), SUGGESTIONS);
                     if let Some(best) = suggestions
                         .get(highlighted)
                         .or_else(|| suggestions.first())
                         .cloned()
                     {
+                        line = best.insert.clone();
+                        highlighted = 0;
                         if let Ok(mut guard) = input.lock() {
                             guard.line = best.insert;
                             guard.highlighted = 0;
                         }
                     }
                 }
-                Command::Submit(text) => {
+                Command::Submit => {
+                    // What is in the box now, which is after any completion above, and
+                    // then the box is emptied.
+                    let text = line.clone();
+                    line.clear();
+                    highlighted = 0;
+                    if let Ok(mut guard) = input.lock() {
+                        guard.line.clear();
+                        guard.highlighted = 0;
+                    }
                     match act(&text, &catalog, &mut watch, &watch_path) {
-                        Action::Quit => break,
+                        Action::Quit => {
+                            quitting = true;
+                            break;
+                        }
                         Action::Explain(topic) => {
                             window.status = topic.render(&window.times(&ring));
                         }
@@ -584,17 +631,32 @@ fn run() -> CliResult {
                 );
             }
         }
+        if quitting {
+            break;
+        }
 
         // Drain the ring, applying only the displayed symbol's records.
         window.drain(&ring, &mut book, &mut out);
 
+        // Write the line back: the reader queued events rather than editing it, so
+        // this is the one place the box is updated, and a completion and the keys
+        // around it land in the order they were typed.
+        if let Ok(mut guard) = input.lock() {
+            if guard.line != line {
+                guard.line = line.clone();
+            }
+            guard.highlighted = highlighted;
+        }
+        window.daemon.poll();
+        window.ticks.fold_if_due();
+        let adapter = adapter_state(&heartbeat_path);
+        // The list the frame shows, from the line as it is *now* — after any
+        // completion in this frame's burst of keystrokes.
         // One frame: gather what was observed, compose it into lines, and write the
         // lines that changed. The composition is pure, so what the frame says is
         // decided here and drawn by `ob-view`, which is what lets the same frame be
         // a terminal, a page or a JSON document.
-        window.daemon.poll();
-        window.ticks.fold_if_due();
-        let adapter = adapter_state(&heartbeat_path);
+        let suggestions = ob_view::complete(&line, catalog.symbols(), SUGGESTIONS);
         let snapshot = window.snapshot(
             &ring,
             &book,
@@ -719,20 +781,12 @@ fn spawn_input_thread(input: Arc<Mutex<Input>>) -> std::thread::JoinHandle<()> {
                     }
                     0x20..=0x7e => {
                         if guard.line.len() < INPUT_LIMIT {
-                            guard.line.push(byte[0] as char);
+                            guard.pending.push(Command::Type(byte[0] as char));
                         }
-                        guard.highlighted = 0;
                     }
-                    0x7f | 0x08 => {
-                        guard.line.pop();
-                        guard.highlighted = 0;
-                    }
-                    b'\r' | b'\n' => {
-                        let line = std::mem::take(&mut guard.line);
-                        guard.highlighted = 0;
-                        guard.pending = Some(Command::Submit(line));
-                    }
-                    b'\t' => guard.pending = Some(Command::Complete),
+                    0x7f | 0x08 => guard.pending.push(Command::Backspace),
+                    b'\r' | b'\n' => guard.pending.push(Command::Submit),
+                    b'\t' => guard.pending.push(Command::Complete),
                     // The escape key reads more bytes, so the lock is released
                     // first: the draw loop must not wait on this thread. Every
                     // other control byte is ignored, which is what it was before.
@@ -749,24 +803,22 @@ fn spawn_input_thread(input: Arc<Mutex<Input>>) -> std::thread::JoinHandle<()> {
                             // what has been typed, and the help block says so.
                             Escape::Bare => {
                                 if let Ok(mut g) = input.lock() {
-                                    g.line.clear();
-                                    g.highlighted = 0;
+                                    g.pending.push(Command::ClearLine);
                                 }
                             }
                             Escape::Arrow(delta) => {
                                 if let Ok(mut g) = input.lock() {
-                                    g.pending = Some(Command::MoveHighlight(delta));
+                                    g.pending.push(Command::MoveHighlight(delta));
                                 }
                             }
                             Escape::Sequence => {}
                             Escape::Text(bytes) => {
                                 if let Ok(mut g) = input.lock() {
                                     for b in bytes {
-                                        if g.line.len() < INPUT_LIMIT {
-                                            g.line.push(b as char);
+                                        if g.line.len() + g.pending.len() < INPUT_LIMIT {
+                                            g.pending.push(Command::Type(b as char));
                                         }
                                     }
-                                    g.highlighted = 0;
                                 }
                             }
                         }

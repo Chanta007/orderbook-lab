@@ -1272,6 +1272,140 @@ class TuiInput(unittest.TestCase):
                 child.wait(timeout=EXIT_DEADLINE)
             os.close(master)
 
+    def test_a_burst_of_keys_keeps_every_action_in_it(self):
+        """Tab and Enter in one write: the completion must survive the submission.
+
+        The input thread reads bytes one at a time and the loop acts on what it finds
+        once per frame, so two keys that arrive together are two actions in one frame.
+        They were kept in a single slot, and the second overwrote the first: `sta`,
+        Tab and Enter in one burst ran `sta` and answered "STA is not in
+        config/tickers.txt". The tests that passed had sent the keys in separate
+        writes with a drain between, which is not what a paste or a fast typist does.
+        """
+        name, binary = TERMINALS[0]
+        reason = skip_reason(binary)
+        if reason is not None:
+            self.skipTest(reason)
+        self.start_feeder(name)
+        self.feed_fixture()
+        self.reset_screen()
+
+        master, slave = pty.openpty()
+        initial = termios.tcgetattr(slave)
+        initial[3] |= termios.ICANON | termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, initial)
+        child = subprocess.Popen(
+            [str(binary), str(self.config)],
+            cwd=str(ROOT),
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+        )
+        os.close(slave)
+        try:
+            deadline = time.monotonic() + FRAME_DEADLINE
+            screen_now = self.drain(master, time.monotonic() + 0.4)
+            while time.monotonic() < deadline and "BID PX" not in screen_now:
+                screen_now = self.drain(master, time.monotonic() + 0.4)
+
+            # One write: the prefix, the completion and the submission, together.
+            os.write(master, b"sta\t\r")
+            panel = ""
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                panel = self.drain(master, time.monotonic() + 0.4)
+                if "slots," in panel or "not in config/tickers.txt" in panel:
+                    break
+            self.assertIn(
+                "slots,",
+                panel,
+                f"{name}: the burst did not complete to `status` before submitting it. "
+                f"Got: {panel[-400:]!r}",
+            )
+            self.assertNotIn(
+                "not in config/tickers.txt",
+                panel,
+                f"{name}: the burst submitted the prefix instead of the completion",
+            )
+        finally:
+            if child.poll() is None:
+                child.send_signal(signal.SIGKILL)
+                child.wait(timeout=EXIT_DEADLINE)
+            os.close(master)
+
+    def test_a_completion_with_an_argument_in_the_same_burst(self):
+        """`lev`, Tab, `7`, Enter: the completion is applied where it was typed.
+
+        The reader used to edit the line itself and queue only the actions, so the `7`
+        was appended to `lev` before the completion ran: the command executed was
+        `LEV7`, and the answer was "LEV7 is not in config/tickers.txt". Every key is an
+        event now and the frame loop applies them in order, so the completion sees the
+        text that was on the line when Tab was pressed.
+        """
+        name, binary = TERMINALS[0]
+        reason = skip_reason(binary)
+        if reason is not None:
+            self.skipTest(reason)
+        self.start_feeder(name)
+        self.feed_fixture()
+        self.reset_screen()
+
+        master, slave = pty.openpty()
+        initial = termios.tcgetattr(slave)
+        initial[3] |= termios.ICANON | termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, initial)
+        child = subprocess.Popen(
+            [str(binary), str(self.config)],
+            cwd=str(ROOT),
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+        )
+        os.close(slave)
+        sock = None
+        try:
+            deadline = time.monotonic() + FRAME_DEADLINE
+            screen_now = self.drain(master, time.monotonic() + 0.4)
+            while time.monotonic() < deadline and "BID PX" not in screen_now:
+                screen_now = self.drain(master, time.monotonic() + 0.4)
+
+            # A book deeper than the window's three levels, so seven rows are
+            # distinguishable from three.
+            sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            rows: list[str] = []
+            for _ in range(40):
+                sock.sendall(depth_picture("BTCUSDT", 65000.0, levels=9))
+                time.sleep(0.05)
+                rows = prices_on_screen(self.drain(master, time.monotonic() + 0.2))
+                if len(rows) >= 3:
+                    break
+
+            # One write: prefix, completion, argument, submission.
+            os.write(master, b"lev\t7\r")
+            deadline = time.monotonic() + FRAME_DEADLINE
+            while time.monotonic() < deadline:
+                screen_now = self.drain(master, time.monotonic() + 0.3)
+                rows = prices_on_screen(screen_now)
+                if len(rows) == 7 or "not in config/tickers.txt" in screen_now:
+                    break
+            self.assertNotIn(
+                "not in config/tickers.txt",
+                screen_now,
+                f"{name}: the burst submitted the text from before the completion",
+            )
+            self.assertEqual(
+                len(rows),
+                7,
+                f"{name}: `lev` Tab `7` Enter did not ask for seven levels. Got {rows}",
+            )
+        finally:
+            if sock is not None:
+                sock.close()
+            if child.poll() is None:
+                child.send_signal(signal.SIGKILL)
+                child.wait(timeout=EXIT_DEADLINE)
+            os.close(master)
+
     def test_the_reference_is_below_the_prompt_and_the_status_panel_is_a_command(self):
         """The command reference and the dashboard, both behind commands.
 
